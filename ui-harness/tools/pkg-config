@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+# The verification container has the fontconfig runtime library but does not
+# ship pkg-config or development metadata. Slint only needs the normal dynamic
+# linker flags when compiling the headless software-renderer harness.
+for argument in "$@"; do
+    if [ "$argument" = "--modversion" ]; then
+        echo "2.14.1"
+        exit 0
+    fi
+done
+
+echo "-L/tmp/araseo-fontconfig -lfontconfig"

@@ -1,0 +1,30 @@
+[package]
+name = "araseo"
+version = "0.1.0"
+edition = "2024"
+description = "Araseo, a lightweight Windows editor for WSL workspaces"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+portable-pty = "0.9"
+slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "unstable-winit-030"] }
+swash = "0.2"
+vt100 = "0.16"
+
+[build-dependencies]
+slint-build = "1.17"
+
+[patch.crates-io]
+# Cargo resolves this optional Slint package when the software renderer is
+# enabled, even though Araseo never uses the testing backend.
+i-slint-backend-testing = { path = "ui-harness/vendor/i-slint-backend-testing" }
+# Slint 1.17 converts off-screen glyph coordinates to i16 before clipping.
+# Keep a narrowly patched copy so large documents cannot overflow the renderer.
+i-slint-renderer-software = { path = "vendor/i-slint-renderer-software" }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

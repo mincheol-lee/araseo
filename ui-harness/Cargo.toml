@@ -1,0 +1,20 @@
+[package]
+name = "araseo-ui-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[dependencies]
+slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "renderer-software"] }
+swash = "0.2"
+
+[build-dependencies]
+slint-build = "1.17"
+
+[patch.crates-io]
+# Cargo resolves this optional Slint package even though the software-window
+# harness never enables it. Keep an inert local package so verification remains
+# fully offline in the WSL development environment.
+i-slint-backend-testing = { path = "vendor/i-slint-backend-testing" }
+i-slint-renderer-software = { path = "../vendor/i-slint-renderer-software" }

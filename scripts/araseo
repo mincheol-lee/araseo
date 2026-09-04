@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+script_path=$(readlink -f "$0")
+repository_root=$(dirname "$(dirname "$script_path")")
+araseo_executable=${ARASEO_EXE:-${AIDE_EXE:-$repository_root/dist/araseo.exe}}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    printf '%s\n' 'Usage: araseo [PATH]'
+    exit 0
+fi
+
+if [ ! -f "$araseo_executable" ]; then
+    printf 'Araseo executable not found: %s\n' "$araseo_executable" >&2
+    exit 1
+fi
+
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
+    exec "$araseo_executable" --version
+fi
+
+target=${1:-.}
+absolute=$(realpath "$target")
+distro=${WSL_DISTRO_NAME:-Ubuntu}
+
+if [ -f "$absolute" ]; then
+    root=$(dirname "$absolute")
+    exec "$araseo_executable" --distro "$distro" --root "$root" --file "$absolute"
+fi
+
+exec "$araseo_executable" --distro "$distro" --root "$absolute"

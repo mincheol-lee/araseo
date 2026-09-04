@@ -1,0 +1,16 @@
+[package]
+name = "i-slint-backend-testing"
+version = "1.17.1"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+internal = []
+mcp = []
+renderer-skia = []
+renderer-software = []
+system-testing = []
+
+[lib]
+path = "lib.rs"

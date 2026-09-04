@@ -1,0 +1,3 @@
+#!/bin/sh
+# Backward-compatible alias. New installations should expose scripts/araseo.
+exec "$(dirname "$(readlink -f "$0")")/araseo" "$@"
