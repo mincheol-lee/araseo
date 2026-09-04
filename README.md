@@ -1,6 +1,36 @@
 # Araseo
 
-Araseo is a lightweight Windows desktop editor for WSL workspaces. It combines a file tree, a basic tabbed editor, Git status markers, and an interactive WSL terminal in one Slint window.
+**A lightweight, Rust-native code editor built for WSL.**
+
+Araseo brings the essentials of a coding IDE into one fast, focused desktop
+application: browse a workspace, open and edit files, inspect Git changes, and
+run WSL commands or coding agents without leaving the window.
+
+Araseo is built from the ground up in **Rust**. It favors a small native
+application and a focused feature set over the memory and complexity of a
+full-scale IDE.
+
+## Built with Rust
+
+- **Rust application core** for workspace, document, Git, and terminal logic
+- **Slint native UI** instead of a browser-based desktop shell
+- **Real PTY and VT100 rendering** for interactive WSL terminal applications
+- **Single Windows executable** with a WSL-aware command-line launcher
+
+## Current Features
+
+- Lazy, expandable file tree with context-aware icons
+- Git status detection across multiple nested repositories
+- Tabbed UTF-8 editor with syntax highlighting, undo/redo, and conflict detection
+- Interactive WSL terminal with ANSI colors, Korean text, and IME input
+- WSL-aware CLI arguments and Linux-to-UNC path mapping
+- Headless behavioral Harness for editor, terminal, Git, and UI regressions
+
+## Actively Evolving
+
+Araseo is an active personal project. More editor, terminal, Git, workspace,
+and quality-of-life features will continue to be added while keeping startup,
+resource usage, and the overall interface lightweight.
 
 The product specification is in [docs/PRD.md](docs/PRD.md).
 
@@ -34,13 +64,6 @@ Ubuntu development builds require Fontconfig and pkg-config headers:
 ```bash
 sudo apt install pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev
 ```
-
-## Current MVP
-
-- Lazy, expandable file tree with Git porcelain-v2 `M` and `?` markers
-- UTF-8 files up to 2 MiB, tabbed editing, line numbers, dirty state, save conflict detection
-- A real PTY parsed into a VT100 screen, suitable for bash and interactive tools
-- WSL-aware CLI arguments and Linux-to-UNC path mapping
 
 Run the headless verification harness after a change:
 
