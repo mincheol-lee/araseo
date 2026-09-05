@@ -106,7 +106,6 @@ If `PATH` is omitted, the launcher uses the current directory. It converts relat
 - Support at most two tab groups. Each group may display either a file or terminal, and multiple file and terminal tabs may coexist in either group.
 - With one group, its tab bar and active content shall fill the entire workspace area. No space shall be reserved for an empty second group.
 - Show a live target preview while a pane-local tab is dragged. Dropping at a workspace edge creates or repositions a split; dropping on the body of the other pane moves the tab into that pane.
-- Allow either tab group to fill the work area and restore the previous split layout afterward.
 - Place a draggable splitter between the two tab groups in both horizontal and vertical layouts, preserving its ratio during the current application session.
 - Give keyboard focus to the clicked panel. Indicate focus through a border or header state.
 - Use one dark theme and a system monospace font in the first release.

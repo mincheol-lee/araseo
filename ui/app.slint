@@ -61,6 +61,8 @@ component WorkspaceGroup inherits Rectangle {
     out property <length> editor-surface-height: file-layer.height;
     out property <length> terminal-surface-width: terminal-scroll.width;
     out property <length> terminal-surface-height: terminal-scroll.height;
+    out property <length> terminal-canvas-width: terminal-canvas.width;
+    out property <length> terminal-canvas-height: terminal-canvas.height;
     out property <int> editor-selection-length: self.editor-selection-cursor >= self.editor-selection-anchor
         ? self.editor-selection-cursor - self.editor-selection-anchor
         : self.editor-selection-anchor - self.editor-selection-cursor;
@@ -251,7 +253,6 @@ component WorkspaceGroup inherits Rectangle {
                                 background: #202329;
                                 blank-tab-bar-touch := TouchArea {
                                     clicked => { root.group-focused(root.group-id); }
-                                    double-clicked => { root.toggle-maximize(root.group-id); }
                                     scroll-event(event) => {
                                         root.scroll-tabs(event.delta-x, event.delta-y);
                                         return accept;
@@ -282,21 +283,6 @@ component WorkspaceGroup inherits Rectangle {
                     }
                 }
 
-                Rectangle {
-                    width: 34px;
-                    background: group-maximize-touch.has-hover ? #343943 : transparent;
-                    Text {
-                        text: "□";
-                        color: #d7dae0;
-                        font-family: "Segoe UI Symbol";
-                        font-size: 17px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    group-maximize-touch := TouchArea {
-                        clicked => { root.toggle-maximize(root.group-id); }
-                    }
-                }
             }
         }
 
@@ -520,9 +506,10 @@ component WorkspaceGroup inherits Rectangle {
                         self.viewport-y = max(self.visible-height - self.viewport-height, min(0px, self.viewport-y));
                     }
                 }
-                Rectangle {
-                    width: root.terminal-grid-columns * 8px;
-                    height: root.terminal-grid-rows * 18px;
+                terminal-canvas := Rectangle {
+                    width: terminal-scroll.viewport-width;
+                    height: terminal-scroll.viewport-height;
+                    background: #111318;
                     for cell[index] in root.terminal-cells: Rectangle {
                         x: Math.mod(index, max(1, root.terminal-grid-columns)) * 8px;
                         y: floor(index / max(1, root.terminal-grid-columns)) * 18px;
@@ -676,6 +663,8 @@ export component AppWindow inherits Window {
     out property <length> primary-editor-surface-height: primary-view.editor-surface-height;
     out property <length> primary-terminal-surface-width: primary-view.terminal-surface-width;
     out property <length> primary-terminal-surface-height: primary-view.terminal-surface-height;
+    out property <length> primary-terminal-canvas-width: primary-view.terminal-canvas-width;
+    out property <length> primary-terminal-canvas-height: primary-view.terminal-canvas-height;
     in property <int> primary-active-tab-id: -1;
     in property <string> primary-active-kind: "";
     in property <string> primary-active-title: "";

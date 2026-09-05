@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 #[cfg(not(target_os = "windows"))]
-use portable_pty::{CommandBuilder, native_pty_system};
-use portable_pty::{MasterPty, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, mpsc};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 #[cfg(windows)]
@@ -14,6 +15,111 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(target_os = "windows")]
+static NEXT_WINDOWS_TERMINAL_ID: AtomicU32 = AtomicU32::new(1);
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Default)]
+struct ResizeDebouncer {
+    requested: Option<(u16, u16)>,
+    stable_polls: u8,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl ResizeDebouncer {
+    fn observe(&mut self, rows: u16, columns: u16) -> bool {
+        let requested = (rows, columns);
+        if self.requested != Some(requested) {
+            self.requested = Some(requested);
+            self.stable_polls = 0;
+            return false;
+        }
+        self.stable_polls = self.stable_polls.saturating_add(1);
+        self.stable_polls >= 2
+    }
+
+    fn retry_later(&mut self) {
+        self.stable_polls = 0;
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsPtyResize {
+    request_sender: mpsc::SyncSender<(u16, u16)>,
+    result_receiver: mpsc::Receiver<((u16, u16), bool)>,
+    in_flight: Option<(u16, u16)>,
+    debouncer: ResizeDebouncer,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsPtyResize {
+    fn new(distro: String, tty_path_file: String) -> Self {
+        let (request_sender, request_receiver) = mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(size @ (rows, columns)) = request_receiver.recv() {
+                let resized = resize_windows_pty(&distro, &tty_path_file, rows, columns);
+                if result_sender.send((size, resized)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            request_sender,
+            result_receiver,
+            in_flight: None,
+            debouncer: ResizeDebouncer::default(),
+        }
+    }
+
+    fn apply(&mut self, rows: u16, columns: u16) -> Option<(u16, u16)> {
+        if let Ok((completed, resized)) = self.result_receiver.try_recv() {
+            self.in_flight = None;
+            if resized {
+                return Some(completed);
+            }
+            self.debouncer.retry_later();
+        }
+
+        if self.in_flight.is_some() || !self.debouncer.observe(rows, columns) {
+            return None;
+        }
+
+        let requested = (rows, columns);
+        if self.request_sender.try_send(requested).is_ok() {
+            self.in_flight = Some(requested);
+        } else {
+            self.debouncer.retry_later();
+        }
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn resize_windows_pty(distro: &str, tty_path_file: &str, rows: u16, columns: u16) -> bool {
+    let mut command = std::process::Command::new(r"C:\Windows\System32\wsl.exe");
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.args([
+        "-d",
+        distro,
+        "--exec",
+        "/bin/sh",
+        "-c",
+        "araseo_tty=$(cat \"$1\") && exec /usr/bin/stty -F \"$araseo_tty\" rows \"$2\" cols \"$3\"",
+        "araseo-resize",
+    ]);
+    command
+        .arg(tty_path_file)
+        .arg(rows.to_string())
+        .arg(columns.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    command.status().is_ok_and(|status| status.success())
+}
 
 pub struct DisplayCell {
     pub glyph: String,
@@ -25,12 +131,15 @@ pub struct DisplayCell {
 }
 
 pub struct TerminalSession {
-    master: Option<Box<dyn MasterPty + Send>>,
+    #[cfg(not(target_os = "windows"))]
+    master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     receiver: mpsc::Receiver<Vec<u8>>,
     parser: vt100::Parser,
     _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     _pipe_child: Option<std::process::Child>,
+    #[cfg(target_os = "windows")]
+    windows_resize: WindowsPtyResize,
 }
 
 impl TerminalSession {
@@ -46,6 +155,16 @@ impl TerminalSession {
 
     #[cfg(target_os = "windows")]
     fn spawn_windows(distro: &str, linux_root: &Path) -> Result<Self> {
+        let terminal_id = NEXT_WINDOWS_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
+        let tty_path_file = format!(
+            "/tmp/araseo-pty-{}-{terminal_id}",
+            std::process::id()
+        );
+        let shell_command = format!(
+            "stty rows 24 cols 80; tty > {tty_path_file}; \
+             /usr/bin/env TERM=xterm-256color COLORTERM=truecolor /bin/bash --login -i; \
+             araseo_status=$?; rm -f {tty_path_file}; exit $araseo_status"
+        );
         let mut command = std::process::Command::new(r"C:\Windows\System32\wsl.exe");
         command.creation_flags(CREATE_NO_WINDOW);
         command
@@ -55,9 +174,9 @@ impl TerminalSession {
                 "--exec",
                 "/usr/bin/script",
                 "-qfec",
-                "stty rows 24 cols 80; exec /usr/bin/env TERM=xterm-256color COLORTERM=truecolor /bin/bash --login -i",
-                "/dev/null",
             ])
+            .arg(shell_command)
+            .arg("/dev/null")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -72,7 +191,6 @@ impl TerminalSession {
         spawn_reader(stderr, sender);
 
         Ok(Self {
-            master: None,
             writer: Arc::new(Mutex::new(Box::new(stdin))),
             receiver,
             // util-linux `script` allocates an 80x24 Unix PTY by default.
@@ -81,6 +199,7 @@ impl TerminalSession {
             parser: vt100::Parser::new(24, 80, 10_000),
             _pty_child: None,
             _pipe_child: Some(child),
+            windows_resize: WindowsPtyResize::new(distro.to_string(), tty_path_file),
         })
     }
 
@@ -109,7 +228,7 @@ impl TerminalSession {
         spawn_reader(reader, sender);
 
         Ok(Self {
-            master: Some(pair.master),
+            master: pair.master,
             writer,
             receiver,
             parser: vt100::Parser::new(24, 100, 10_000),
@@ -194,22 +313,22 @@ impl TerminalSession {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
-        // The Windows backend uses a pipe to a fixed 80x24 Unix PTY created by
-        // `script`; resizing only the parser would desynchronize the two ends.
-        if self.master.is_none() {
-            return false;
-        }
         if self.parser.screen().size() == (rows, cols) {
             return false;
         }
-        if let Some(master) = self.master.as_ref() {
-            let _ = master.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
-        }
+
+        #[cfg(target_os = "windows")]
+        let Some((rows, cols)) = self.windows_resize.apply(rows, cols) else {
+            return false;
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let _ = self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
         self.parser.screen_mut().set_size(rows, cols);
         true
     }
@@ -355,5 +474,20 @@ mod tests {
         assert_eq!(cell_column_span(screen.cell(0, 0)), 2);
         assert_eq!(cell_column_span(screen.cell(0, 1)), 0);
         assert_eq!(cell_column_span(screen.cell(0, 2)), 1);
+    }
+
+    #[test]
+    fn waits_for_a_stable_terminal_size_before_resizing() {
+        let mut debouncer = ResizeDebouncer::default();
+
+        assert!(!debouncer.observe(40, 120));
+        assert!(!debouncer.observe(40, 120));
+        assert!(debouncer.observe(40, 120));
+
+        assert!(!debouncer.observe(50, 160));
+        assert!(!debouncer.observe(50, 160));
+        debouncer.retry_later();
+        assert!(!debouncer.observe(50, 160));
+        assert!(debouncer.observe(50, 160));
     }
 }

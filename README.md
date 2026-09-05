@@ -23,7 +23,7 @@ full-scale IDE.
 - Git status detection across multiple nested repositories
 - Unified file and terminal tabs, organized in Orca-style pane-local tab bars
 - Multiple independent WSL terminals with ANSI colors, Korean text, IME input, and visible start paths
-- Up to two drag-and-dock tab groups with independent tabs, resizable splits, and maximized views
+- Up to two drag-and-dock tab groups with independent tabs and resizable splits
 - WSL-aware CLI arguments and Linux-to-UNC path mapping
 - Headless behavioral Harness for editor isolation, multiple terminals, docking layouts, Git, and UI regressions
 

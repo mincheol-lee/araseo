@@ -313,7 +313,7 @@ mod tests {
             "mouse wheel over the tab strip did not scroll hidden tabs into reach"
         );
 
-        dispatch_click(&ui, 1146.0, 51.0);
+        dispatch_click(&ui, 1182.0, 51.0);
         assert_eq!(
             terminal_groups.borrow().as_slice(),
             &[0],
@@ -453,7 +453,7 @@ mod tests {
             Some(&(51, "둘".to_string())),
             "terminal text was routed to the wrong tab"
         );
-        dispatch_click(&ui, 1146.0, 528.0);
+        dispatch_click(&ui, 1182.0, 528.0);
         assert_eq!(
             terminal_groups.borrow().as_slice(),
             &[0, 1],
@@ -895,6 +895,13 @@ mod tests {
             ui.get_primary_terminal_surface_width() > 900.0
                 && ui.get_primary_terminal_surface_height() > 650.0,
             "the terminal surface remained a small intrinsic-size window instead of filling its pane"
+        );
+        assert!(
+            ui.get_primary_terminal_canvas_width()
+                >= ui.get_primary_terminal_surface_width()
+                && ui.get_primary_terminal_canvas_height()
+                    >= ui.get_primary_terminal_surface_height(),
+            "the terminal canvas remained centered at its intrinsic grid size"
         );
         assert!(
             ui.get_terminal_columns() > 100.0 && ui.get_terminal_rows() > 30.0,
