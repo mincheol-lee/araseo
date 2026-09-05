@@ -12,7 +12,12 @@ export struct TreeEntry {
 }
 
 export struct TabEntry {
+    id: int,
     title: string,
+    detail: string,
+    kind: string,
+    group: int,
+    active: bool,
     dirty: bool,
 }
 
@@ -23,6 +28,442 @@ export struct TerminalCell {
     bold: bool,
     cursor: bool,
     column-span: int,
+}
+
+component WorkspaceGroup inherits Rectangle {
+    in property <int> group-id: 0;
+    in property <int> active-tab-id: -1;
+    in property <string> active-kind: "";
+    in property <string> active-title: "";
+    in property <string> active-detail: "";
+    in-out property <string> editor-text;
+    in property <styled-text> highlighted-text;
+    in property <bool> syntax-highlight-enabled: false;
+    in property <int> editor-cursor-offset: 0;
+    in-out property <int> editor-cursor-generation: 0;
+    in property <string> line-numbers: "1";
+    in property <bool> find-visible: false;
+    in property <[TerminalCell]> terminal-cells;
+    in property <int> terminal-grid-columns: 80;
+    in property <int> terminal-grid-rows: 24;
+    in property <int> terminal-cursor-row: -1;
+    in property <int> terminal-cursor-column: -1;
+    in-out property <int> terminal-update-generation: 0;
+    out property <float> terminal-columns: terminal-focus.width / 8px;
+    out property <float> terminal-rows: terminal-focus.height / 18px;
+    out property <length> terminal-scroll-offset: terminal-scroll.viewport-y;
+    out property <bool> terminal-ime-active: terminal-ime-input.has-focus;
+    out property <string> terminal-ime-buffer: terminal-ime-input.text;
+    out property <int> editor-selection-length: self.editor-selection-cursor >= self.editor-selection-anchor
+        ? self.editor-selection-cursor - self.editor-selection-anchor
+        : self.editor-selection-anchor - self.editor-selection-cursor;
+    out property <bool> copy-feedback-active: false;
+    private property <int> editor-selection-anchor: 0;
+    private property <int> editor-selection-cursor: 0;
+
+    callback editor-edited(string, int);
+    callback editor-selection-changed(int, int, int);
+    callback undo-requested(int);
+    callback redo-requested(int);
+    callback save-requested(int);
+    callback find-requested(int, string);
+    callback find-visibility-requested(int, bool);
+    callback terminal-key(int, string, bool, bool, bool);
+    callback terminal-text(int, string);
+    callback group-focused(int);
+    callback toggle-maximize(int);
+    callback tab-drag-moved(int, length, length);
+    callback tab-drag-released(int);
+    callback tab-drag-cancelled();
+
+    public function focus-terminal() {
+        terminal-ime-input.focus();
+    }
+
+    function show-copy-feedback() {
+        self.copy-feedback-active = true;
+        copy-feedback-timer.restart();
+    }
+
+    copy-feedback-timer := Timer {
+        interval: 1200ms;
+        running: false;
+        triggered => {
+            root.copy-feedback-active = false;
+            self.stop();
+        }
+    }
+
+    background: #181a1f;
+    clip: true;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 30px;
+            background: group-header-drag.pressed ? #343944
+                : (group-header-drag.has-hover ? #2b2f37 : #24272e);
+            Text {
+                x: 9px;
+                width: parent.width - 52px;
+                text: root.active-kind == "terminal"
+                    ? ">_  " + root.active-detail
+                    : (root.active-kind == "file" ? "FILE  ·  " + root.active-title : "EMPTY GROUP");
+                color: root.active-kind == "terminal" ? #82c7ff : #bbc0ca;
+                font-family: root.active-kind == "terminal" ? "Cascadia Mono" : "Geist";
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            group-header-drag := TouchArea {
+                private property <length> press-x: 0px;
+                private property <length> press-y: 0px;
+                width: parent.width - 38px;
+                enabled: root.active-tab-id >= 0;
+                mouse-cursor: move;
+                moved => {
+                    if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
+                        && abs(self.mouse-y - self.press-y) < 5px)) {
+                        return;
+                    }
+                    root.tab-drag-moved(
+                        root.active-tab-id,
+                        self.absolute-position.x + self.mouse-x,
+                        self.absolute-position.y + self.mouse-y
+                    );
+                }
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down) {
+                        self.press-x = self.mouse-x;
+                        self.press-y = self.mouse-y;
+                        root.group-focused(root.group-id);
+                    } else if (event.kind == PointerEventKind.up) {
+                        root.tab-drag-released(root.active-tab-id);
+                    } else if (event.kind == PointerEventKind.cancel) {
+                        root.tab-drag-cancelled();
+                    }
+                }
+                double-clicked => { root.toggle-maximize(root.group-id); }
+            }
+            Rectangle {
+                x: parent.width - 36px;
+                width: 36px;
+                height: parent.height;
+                border-radius: 3px;
+                background: group-maximize-touch.has-hover ? #3a3f48 : transparent;
+                Text {
+                    text: "□";
+                    color: #d7dae0;
+                    font-family: "Segoe UI Symbol";
+                    font-size: 17px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                group-maximize-touch := TouchArea {
+                    clicked => { root.toggle-maximize(root.group-id); }
+                }
+            }
+        }
+
+        if root.active-kind == "file": Rectangle {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            background: #1e1e1e;
+
+            VerticalLayout {
+                spacing: 0px;
+                Rectangle {
+                    height: root.find-visible ? 36px : 0px;
+                    background: #24272e;
+                    clip: true;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 6px;
+                        find-input := LineEdit {
+                            placeholder-text: "Find in current file";
+                            edited(text) => { root.find-requested(root.active-tab-id, text); }
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: "Close";
+                            clicked => { root.find-visibility-requested(root.group-id, false); }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 0px;
+                    Rectangle {
+                        width: 48px;
+                        background: #1e1e1e;
+                        clip: true;
+                        Text {
+                            text: root.line-numbers;
+                            color: #858585;
+                            font-family: "Cascadia Mono";
+                            font-size: 14px;
+                            horizontal-alignment: right;
+                            vertical-alignment: top;
+                            x: 4px;
+                            width: parent.width - 10px;
+                            y: 6px + editor-scroll.viewport-y;
+                        }
+                    }
+                    editor-pane := Rectangle {
+                        private property <length> cursor-x: 0px;
+                        private property <length> cursor-y: 0px;
+                        horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        background: #1e1e1e;
+                        clip: true;
+
+                        editor-scroll := ScrollView {
+                            x: 10px;
+                            y: 6px;
+                            width: parent.width - 10px;
+                            height: parent.height - 6px;
+                            viewport-width: max(self.visible-width, code-input.preferred-width + 2px);
+                            viewport-height: max(self.visible-height, code-input.preferred-height + 4px);
+
+                            if root.syntax-highlight-enabled: StyledText {
+                                width: editor-scroll.viewport-width;
+                                height: editor-scroll.viewport-height;
+                                text: root.highlighted-text;
+                                default-color: #d4d4d4;
+                                default-font-family: "Cascadia Mono";
+                                default-font-size: 14px;
+                                vertical-alignment: top;
+                            }
+
+                            code-input := TextInput {
+                                private property <int> requested-cursor-generation: root.editor-cursor-generation;
+                                width: editor-scroll.viewport-width;
+                                height: editor-scroll.viewport-height;
+                                text <=> root.editor-text;
+                                single-line: false;
+                                wrap: no-wrap;
+                                font-family: "Cascadia Mono";
+                                font-size: 14px;
+                                color: root.syntax-highlight-enabled && self.preedit-text == "" ? transparent : #d4d4d4;
+                                selection-background-color: #264f78;
+                                selection-foreground-color: #ffffff;
+                                page-height: editor-scroll.visible-height;
+                                text-cursor-width: 0px;
+                                changed requested-cursor-generation => {
+                                    self.set-selection-offsets(root.editor-cursor-offset, root.editor-cursor-offset);
+                                }
+                                edited => {
+                                    root.group-focused(root.group-id);
+                                    root.editor-edited(self.text, root.active-tab-id);
+                                }
+                                key-pressed(event) => {
+                                    root.group-focused(root.group-id);
+                                    if (event.modifiers.control && (event.text == "c" || event.text == "C")) {
+                                        self.copy(); return accept;
+                                    }
+                                    if (event.modifiers.control && (event.text == "x" || event.text == "X")) {
+                                        self.cut(); return accept;
+                                    }
+                                    if (event.modifiers.control && (event.text == "a" || event.text == "A")) {
+                                        self.select-all(); return accept;
+                                    }
+                                    if (event.modifiers.control && (event.text == "z" || event.text == "Z")) {
+                                        if (event.modifiers.shift) { root.redo-requested(root.active-tab-id); }
+                                        else { root.undo-requested(root.active-tab-id); }
+                                        return accept;
+                                    }
+                                    if (event.modifiers.control && (event.text == "y" || event.text == "Y")) {
+                                        root.redo-requested(root.active-tab-id); return accept;
+                                    }
+                                    if (event.modifiers.control && (event.text == "s" || event.text == "S")) {
+                                        root.save-requested(root.active-tab-id); return accept;
+                                    }
+                                    if (event.modifiers.control && (event.text == "f" || event.text == "F")) {
+                                        root.find-visibility-requested(root.group-id, true); return accept;
+                                    }
+                                    return reject;
+                                }
+                                cursor-position-changed(position) => {
+                                    root.group-focused(root.group-id);
+                                    root.editor-selection-anchor = self.anchor-position-byte-offset;
+                                    root.editor-selection-cursor = self.cursor-position-byte-offset;
+                                    root.copy-feedback-active = false;
+                                    copy-feedback-timer.stop();
+                                    root.editor-selection-changed(
+                                        root.active-tab-id,
+                                        self.anchor-position-byte-offset,
+                                        self.cursor-position-byte-offset
+                                    );
+                                    editor-pane.cursor-x = position.x;
+                                    editor-pane.cursor-y = position.y;
+                                    if (position.x + editor-scroll.viewport-x < 0px) {
+                                        editor-scroll.viewport-x = max(editor-scroll.visible-width - self.width, -position.x);
+                                    } else if (position.x + editor-scroll.viewport-x > editor-scroll.visible-width - 2px) {
+                                        editor-scroll.viewport-x = min(0px, max(editor-scroll.visible-width - self.width, editor-scroll.visible-width - position.x - 2px));
+                                    }
+                                    if (position.y + editor-scroll.viewport-y < 0px) {
+                                        editor-scroll.viewport-y = max(editor-scroll.visible-height - self.height, -position.y);
+                                    } else if (position.y + editor-scroll.viewport-y > editor-scroll.visible-height - 20px) {
+                                        editor-scroll.viewport-y = min(0px, max(editor-scroll.visible-height - self.height, editor-scroll.visible-height - position.y - 20px));
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                x: editor-pane.cursor-x;
+                                y: editor-pane.cursor-y;
+                                width: 2px;
+                                height: 18px;
+                                background: #f0f0f0;
+                                visible: code-input.has-focus
+                                    && code-input.preedit-text == ""
+                                    && code-input.cursor-position-byte-offset == code-input.anchor-position-byte-offset;
+                            }
+                        }
+
+                        if root.editor-selection-length > 0: Rectangle {
+                            x: parent.width - 92px;
+                            y: 8px;
+                            width: 78px;
+                            height: 28px;
+                            border-radius: 4px;
+                            background: root.copy-feedback-active ? #2e7d4f
+                                : (copy-selection-touch.has-hover ? #3a3d43 : #292c32);
+                            border-width: 1px;
+                            border-color: root.copy-feedback-active ? #55b979 : #555960;
+                            Text {
+                                text: root.copy-feedback-active ? "Copied!" : "Copy";
+                                color: #f0f0f0;
+                                font-family: "Geist";
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            copy-selection-touch := TouchArea {
+                                clicked => { code-input.copy(); root.show-copy-feedback(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        terminal-focus := FocusScope {
+            visible: root.active-kind == "terminal";
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            focus-on-click: true;
+            terminal-scroll := ScrollView {
+                viewport-width: max(self.visible-width, root.terminal-grid-columns * 8px);
+                viewport-height: max(self.visible-height, root.terminal-grid-rows * 18px);
+                viewport-x: 0px;
+                viewport-y: 0px;
+                private property <int> follow-generation: root.terminal-update-generation;
+                private property <length> cursor-top: max(0, root.terminal-cursor-row) * 18px;
+                private property <length> cursor-bottom: self.cursor-top + 18px;
+                changed follow-generation => {
+                    if (root.terminal-cursor-row >= 0) {
+                        if (self.cursor-top + self.viewport-y < 0px) {
+                            self.viewport-y = -self.cursor-top;
+                        } else if (self.cursor-bottom + self.viewport-y > self.visible-height) {
+                            self.viewport-y = self.visible-height - self.cursor-bottom;
+                        }
+                        self.viewport-y = max(self.visible-height - self.viewport-height, min(0px, self.viewport-y));
+                    }
+                }
+                Rectangle {
+                    width: root.terminal-grid-columns * 8px;
+                    height: root.terminal-grid-rows * 18px;
+                    for cell[index] in root.terminal-cells: Rectangle {
+                        x: Math.mod(index, max(1, root.terminal-grid-columns)) * 8px;
+                        y: floor(index / max(1, root.terminal-grid-columns)) * 18px;
+                        width: cell.column-span * 8px;
+                        height: 18px;
+                        visible: cell.column-span > 0;
+                        background: cell.cursor ? cell.foreground : cell.background;
+                        Text {
+                            text: cell.glyph;
+                            color: cell.cursor ? cell.background : cell.foreground;
+                            font-family: "Cascadia Mono";
+                            font-size: 14px;
+                            font-weight: cell.bold ? 700 : 500;
+                            width: parent.width;
+                            height: parent.height;
+                            vertical-alignment: center;
+                            wrap: no-wrap;
+                        }
+                    }
+                }
+            }
+            terminal-ime-input := TextInput {
+                x: max(0px, root.terminal-cursor-column * 8px + terminal-scroll.viewport-x);
+                y: max(0px, root.terminal-cursor-row * 18px + terminal-scroll.viewport-y);
+                width: max(18px, terminal-focus.width - self.x);
+                height: 18px;
+                text: "";
+                single-line: true;
+                wrap: no-wrap;
+                font-family: "Cascadia Mono";
+                font-size: 14px;
+                font-weight: 500;
+                color: #d8dee9;
+                selection-background-color: #264f78;
+                selection-foreground-color: #ffffff;
+                text-cursor-width: 0px;
+                edited => {
+                    root.group-focused(root.group-id);
+                    if (self.text != "") {
+                        root.terminal-text(root.active-tab-id, self.text);
+                        self.text = "";
+                        self.set-selection-offsets(0, 0);
+                    }
+                }
+                key-pressed(event) => {
+                    root.group-focused(root.group-id);
+                    if (event.text == Key.Shift || event.text == Key.ShiftR
+                        || event.text == Key.Control || event.text == Key.ControlR
+                        || event.text == Key.Alt || event.text == Key.AltGr
+                        || event.text == Key.Meta || event.text == Key.MetaR
+                        || event.text == Key.CapsLock) { return accept; }
+                    if (event.text == Key.UpArrow) { root.terminal-key(root.active-tab-id, "<UP>", event.modifiers.control, event.modifiers.alt, event.modifiers.shift); return accept; }
+                    if (event.text == Key.DownArrow) { root.terminal-key(root.active-tab-id, "<DOWN>", event.modifiers.control, event.modifiers.alt, event.modifiers.shift); return accept; }
+                    if (event.text == Key.LeftArrow) { root.terminal-key(root.active-tab-id, "<LEFT>", event.modifiers.control, event.modifiers.alt, event.modifiers.shift); return accept; }
+                    if (event.text == Key.RightArrow) { root.terminal-key(root.active-tab-id, "<RIGHT>", event.modifiers.control, event.modifiers.alt, event.modifiers.shift); return accept; }
+                    if (event.text == Key.Home) { root.terminal-key(root.active-tab-id, "<HOME>", false, false, false); return accept; }
+                    if (event.text == Key.End) { root.terminal-key(root.active-tab-id, "<END>", false, false, false); return accept; }
+                    if (event.text == Key.PageUp) { root.terminal-key(root.active-tab-id, "<PAGEUP>", false, false, false); return accept; }
+                    if (event.text == Key.PageDown) { root.terminal-key(root.active-tab-id, "<PAGEDOWN>", false, false, false); return accept; }
+                    if (event.text == Key.Delete) { root.terminal-key(root.active-tab-id, "<DELETE>", false, false, false); return accept; }
+                    if (event.text == Key.Backspace) { root.terminal-key(root.active-tab-id, "<BACKSPACE>", false, false, false); return accept; }
+                    if (event.text == Key.Return) { root.terminal-key(root.active-tab-id, "<ENTER>", false, false, false); return accept; }
+                    if (event.text == Key.Backtab) { root.terminal-key(root.active-tab-id, "<BACKTAB>", false, false, false); return accept; }
+                    if (event.text == Key.Tab) { root.terminal-key(root.active-tab-id, "<TAB>", false, false, false); return accept; }
+                    if (event.text == Key.Escape) { root.terminal-key(root.active-tab-id, "<ESCAPE>", false, false, false); return accept; }
+                    if (event.modifiers.control || event.modifiers.alt) {
+                        root.terminal-key(root.active-tab-id, event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            terminal-click := TouchArea {
+                clicked => { root.group-focused(root.group-id); root.focus-terminal(); }
+            }
+        }
+
+        if root.active-kind == "": Rectangle {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            background: #181a1f;
+            Text {
+                text: "Drop a file or terminal tab here";
+                color: #737985;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -57,37 +498,62 @@ export component AppWindow inherits Window {
     in property <int> terminal-cursor-row: -1;
     in property <int> terminal-cursor-column: -1;
     in-out property <int> terminal-update-generation: 0;
-    out property <float> terminal-columns: terminal-focus.width / 8px;
-    out property <float> terminal-rows: terminal-focus.height / 18px;
-    out property <length> terminal-scroll-offset: terminal-scroll.viewport-y;
-    out property <bool> terminal-ime-active: terminal-ime-input.has-focus;
-    out property <string> terminal-ime-buffer: terminal-ime-input.text;
+    out property <float> terminal-columns: primary-view.terminal-columns;
+    out property <float> terminal-rows: primary-view.terminal-rows;
+    out property <length> terminal-scroll-offset: primary-view.terminal-scroll-offset;
+    out property <bool> terminal-ime-active: primary-view.terminal-ime-active;
+    out property <string> terminal-ime-buffer: primary-view.terminal-ime-buffer;
+    in-out property <string> secondary-editor-text;
+    in property <styled-text> secondary-highlighted-text;
+    in property <bool> secondary-syntax-highlight-enabled: false;
+    in property <int> secondary-editor-cursor-offset: 0;
+    in-out property <int> secondary-editor-cursor-generation: 0;
+    in property <string> secondary-line-numbers: "1";
+    in property <[TerminalCell]> secondary-terminal-cells;
+    in property <int> secondary-terminal-grid-columns: 80;
+    in property <int> secondary-terminal-grid-rows: 24;
+    in property <int> secondary-terminal-cursor-row: -1;
+    in property <int> secondary-terminal-cursor-column: -1;
+    in-out property <int> secondary-terminal-update-generation: 0;
+    out property <float> secondary-terminal-columns: secondary-view.terminal-columns;
+    out property <float> secondary-terminal-rows: secondary-view.terminal-rows;
+    out property <length> secondary-terminal-scroll-offset: secondary-view.terminal-scroll-offset;
+    out property <bool> secondary-terminal-ime-active: secondary-view.terminal-ime-active;
+    out property <string> secondary-terminal-ime-buffer: secondary-view.terminal-ime-buffer;
     out property <length> tab-scroll-offset: tabs-flickable.viewport-x;
     in property <int> active-tab: -1;
+    in property <int> primary-active-tab-id: -1;
+    in property <string> primary-active-kind: "";
+    in property <string> primary-active-title: "";
+    in property <string> primary-active-detail: "";
+    in property <int> secondary-active-tab-id: -1;
+    in property <string> secondary-active-kind: "";
+    in property <string> secondary-active-title: "";
+    in property <string> secondary-active-detail: "";
+    in-out property <int> focused-group: 0;
     in-out property <bool> tab-list-visible: false;
     in-out property <bool> find-visible: false;
-    out property <int> editor-selection-length: root.editor-selection-cursor >= root.editor-selection-anchor
-        ? root.editor-selection-cursor - root.editor-selection-anchor
-        : root.editor-selection-anchor - root.editor-selection-cursor;
-    out property <bool> copy-feedback-active: false;
+    out property <int> editor-selection-length: root.focused-group == 1
+        ? secondary-view.editor-selection-length : primary-view.editor-selection-length;
+    out property <bool> copy-feedback-active: root.focused-group == 1
+        ? secondary-view.copy-feedback-active : primary-view.copy-feedback-active;
     in-out property <int> workspace-layout: 0;
     in-out property <float> panel-split-ratio: 0.64;
-    out property <length> editor-panel-x: editor-panel.x;
-    out property <length> editor-panel-y: editor-panel.y;
-    out property <length> editor-panel-width: editor-panel.width;
-    out property <length> editor-panel-height: editor-panel.height;
-    out property <bool> editor-panel-visible: editor-panel.visible;
-    out property <length> terminal-panel-x: terminal-panel.x;
-    out property <length> terminal-panel-y: terminal-panel.y;
-    out property <length> terminal-panel-width: terminal-panel.width;
-    out property <length> terminal-panel-height: terminal-panel.height;
-    out property <bool> terminal-panel-visible: terminal-panel.visible;
-    private property <int> editor-selection-anchor: 0;
-    private property <int> editor-selection-cursor: 0;
+    out property <length> primary-group-x: primary-view.x;
+    out property <length> primary-group-y: primary-view.y;
+    out property <length> primary-group-width: primary-view.width;
+    out property <length> primary-group-height: primary-view.height;
+    out property <bool> primary-group-visible: primary-view.visible;
+    out property <length> secondary-group-x: secondary-view.x;
+    out property <length> secondary-group-y: secondary-view.y;
+    out property <length> secondary-group-width: secondary-view.width;
+    out property <length> secondary-group-height: secondary-view.height;
+    out property <bool> secondary-group-visible: secondary-view.visible;
     private property <length> sidebar-width: 250px;
-    private property <int> dragging-panel: -1;
+    private property <int> dragging-tab: -1;
     private property <int> dock-preview: -1;
     private property <int> restore-layout: 0;
+    private property <bool> has-secondary-group: root.secondary-active-tab-id >= 0;
 
     callback tree-activated(int);
     callback tab-activated(int);
@@ -97,19 +563,17 @@ export component AppWindow inherits Window {
     callback editor-selection-changed(int, int);
     callback undo-requested(int);
     callback redo-requested(int);
-    callback save-requested();
+    callback save-requested(int);
     callback force-save-requested();
     callback reload-requested();
-    callback find-requested(string);
-    callback terminal-key(string, bool, bool, bool);
-    callback terminal-text(string);
+    callback find-requested(int, string);
+    callback terminal-key(int, string, bool, bool, bool);
+    callback terminal-text(int, string);
     callback terminal-paste(string);
+    callback new-terminal-requested(int);
+    callback tab-dock-requested(int, int);
+    callback focused-group-changed(int);
     callback window-drag-requested();
-
-    function show-copy-feedback() {
-        root.copy-feedback-active = true;
-        copy-feedback-timer.restart();
-    }
 
     function reveal-tab(tab-x: length, tab-width: length) {
         if (tab-x + tabs-flickable.viewport-x < 0px) {
@@ -130,26 +594,11 @@ export component AppWindow inherits Window {
     }
 
     public function focus-terminal() {
-        terminal-ime-input.focus();
-    }
-
-    public function dock-panel(panel: int, zone: int) {
-        if (zone == 0) {
-            root.workspace-layout = panel == 1 ? 2 : 3;
-        } else if (zone == 1) {
-            root.workspace-layout = panel == 1 ? 3 : 2;
-        } else if (zone == 2) {
-            root.workspace-layout = panel == 1 ? 1 : 0;
-        } else if (zone == 3) {
-            root.workspace-layout = panel == 1 ? 0 : 1;
-        } else if (zone == 4) {
-            if (root.workspace-layout <= 3) {
-                root.restore-layout = root.workspace-layout;
-            }
-            root.workspace-layout = panel == 1 ? 5 : 4;
+        if (root.focused-group == 1) {
+            secondary-view.focus-terminal();
+        } else {
+            primary-view.focus-terminal();
         }
-        root.dragging-panel = -1;
-        root.dock-preview = -1;
     }
 
     public function toggle-panel-maximize(panel: int) {
@@ -164,28 +613,40 @@ export component AppWindow inherits Window {
         }
     }
 
-    function update-dock-preview(panel: int, x: length, y: length) {
-        root.dragging-panel = panel;
-        if (x < workspace-area.width * 0.25) {
+    function update-dock-preview(tab-id: int, x: length, y: length) {
+        root.dragging-tab = tab-id;
+        let local-x = x - workspace-area.absolute-position.x;
+        let local-y = y - workspace-area.absolute-position.y;
+        if (local-x < workspace-area.width * 0.25) {
             root.dock-preview = 0;
-        } else if (x > workspace-area.width * 0.75) {
+        } else if (local-x > workspace-area.width * 0.75) {
             root.dock-preview = 1;
-        } else if (y < workspace-area.height * 0.25) {
+        } else if (local-y < workspace-area.height * 0.25) {
             root.dock-preview = 2;
-        } else if (y > workspace-area.height * 0.75) {
+        } else if (local-y > workspace-area.height * 0.75) {
             root.dock-preview = 3;
         } else {
             root.dock-preview = 4;
         }
     }
 
-    copy-feedback-timer := Timer {
-        interval: 1200ms;
-        running: false;
-        triggered => {
-            root.copy-feedback-active = false;
-            self.stop();
+    function finish-tab-drag(tab-id: int) {
+        if (root.dragging-tab != tab-id || root.dock-preview < 0) {
+            return;
         }
+        let zone = root.dock-preview;
+        if (zone == 0) { root.workspace-layout = 2; }
+        else if (zone == 1) { root.workspace-layout = 3; }
+        else if (zone == 2) { root.workspace-layout = 1; }
+        else if (zone == 3) { root.workspace-layout = 0; }
+        root.tab-dock-requested(tab-id, zone);
+        root.dragging-tab = -1;
+        root.dock-preview = -1;
+    }
+
+    function cancel-tab-drag() {
+        root.dragging-tab = -1;
+        root.dock-preview = -1;
     }
 
     shortcut-scope := FocusScope {
@@ -256,38 +717,70 @@ export component AppWindow inherits Window {
                             spacing: 1px;
 
                             for tab[index] in root.tabs: Rectangle {
-                                private property <bool> active: index == root.active-tab;
-                                width: min(190px, max(96px, tab-title.preferred-width + 52px));
-                                background: self.active ? #20232a
-                                    : (tab-touch.has-hover || tab-close-touch.has-hover ? #292d35 : #181a1f);
-                                changed active => {
-                                    if (self.active) {
+                                private property <bool> active: tab.active;
+                                private property <bool> focused: index == root.active-tab;
+                                width: min(210px, max(110px, tab-title.preferred-width + 52px));
+                                background: self.focused ? #27313d
+                                    : (self.active ? #20232a
+                                    : (tab-touch.has-hover || tab-close-touch.has-hover ? #292d35 : #181a1f));
+                                changed focused => {
+                                    if (self.focused) {
                                         root.reveal-tab(self.x, self.width);
                                     }
                                 }
                                 changed x => {
-                                    if (self.active) {
+                                    if (self.focused) {
                                         root.reveal-tab(self.x, self.width);
                                     }
                                 }
                                 changed width => {
-                                    if (self.active) {
+                                    if (self.focused) {
                                         root.reveal-tab(self.x, self.width);
                                     }
                                 }
                                 tab-title := Text {
                                     x: 10px;
                                     width: parent.width - 48px;
-                                    text: tab.title + (tab.dirty ? " ●" : "");
-                                    color: parent.active ? #f1f1f1 : #aeb4bf;
-                                    font-family: "Geist";
+                                    text: (tab.kind == "terminal" ? ">_ " : "") + tab.title
+                                        + (root.has-secondary-group ? (tab.group == 0 ? "  ①" : "  ②") : "")
+                                        + (tab.dirty ? " ●" : "");
+                                    color: tab.kind == "terminal" ? #82c7ff
+                                        : (parent.active ? #f1f1f1 : #aeb4bf);
+                                    font-family: tab.kind == "terminal" ? "Cascadia Mono" : "Geist";
                                     font-size: 12px;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
                                 tab-touch := TouchArea {
+                                    private property <length> press-x: 0px;
+                                    private property <length> press-y: 0px;
                                     width: parent.width - 34px;
-                                    clicked => { root.tab-activated(index); }
+                                    mouse-cursor: move;
+                                    moved => {
+                                        if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
+                                            && abs(self.mouse-y - self.press-y) < 5px)) {
+                                            return;
+                                        }
+                                        root.update-dock-preview(
+                                            tab.id,
+                                            self.absolute-position.x + self.mouse-x,
+                                            self.absolute-position.y + self.mouse-y
+                                        );
+                                    }
+                                    pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down) {
+                                            self.press-x = self.mouse-x;
+                                            self.press-y = self.mouse-y;
+                                        } else if (event.kind == PointerEventKind.up) {
+                                            if (root.dragging-tab == tab.id) {
+                                                root.finish-tab-drag(tab.id);
+                                            } else {
+                                                root.tab-activated(tab.id);
+                                            }
+                                        } else if (event.kind == PointerEventKind.cancel) {
+                                            root.cancel-tab-drag();
+                                        }
+                                    }
                                     scroll-event(event) => {
                                         root.scroll-tabs(event.delta-x, event.delta-y);
                                         return accept;
@@ -310,7 +803,7 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     tab-close-touch := TouchArea {
-                                        clicked => { root.tab-close(index); }
+                                        clicked => { root.tab-close(tab.id); }
                                         scroll-event(event) => {
                                             root.scroll-tabs(event.delta-x, event.delta-y);
                                             return accept;
@@ -332,6 +825,23 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                }
+
+                Rectangle {
+                    width: 48px;
+                    background: new-terminal-touch.has-hover ? #30333a : transparent;
+                    Text {
+                        text: ">_+";
+                        color: #82c7ff;
+                        font-family: "Cascadia Mono";
+                        font-size: 13px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    new-terminal-touch := TouchArea {
+                        clicked => { root.new-terminal-requested(root.focused-group); }
                     }
                 }
 
@@ -489,591 +999,199 @@ export component AppWindow inherits Window {
                 max-width: 100000px;
                 clip: true;
                 private property <length> divider-size: 6px;
-                private property <bool> vertical-split: root.workspace-layout == 0 || root.workspace-layout == 1;
-                private property <bool> horizontal-split: root.workspace-layout == 2 || root.workspace-layout == 3;
-                private property <length> editor-split-width: (self.width - self.divider-size) * root.panel-split-ratio;
-                private property <length> terminal-split-width: self.width - self.divider-size - self.editor-split-width;
-                private property <length> editor-split-height: (self.height - self.divider-size) * root.panel-split-ratio;
-                private property <length> terminal-split-height: self.height - self.divider-size - self.editor-split-height;
+                private property <bool> vertical-split: root.has-secondary-group
+                    && (root.workspace-layout == 0 || root.workspace-layout == 1);
+                private property <bool> horizontal-split: root.has-secondary-group
+                    && (root.workspace-layout == 2 || root.workspace-layout == 3);
+                private property <length> primary-split-width: (self.width - self.divider-size) * root.panel-split-ratio;
+                private property <length> secondary-split-width: self.width - self.divider-size - self.primary-split-width;
+                private property <length> primary-split-height: (self.height - self.divider-size) * root.panel-split-ratio;
+                private property <length> secondary-split-height: self.height - self.divider-size - self.primary-split-height;
 
-                editor-panel := Rectangle {
-                    x: root.workspace-layout == 2 ? workspace-area.terminal-split-width + workspace-area.divider-size : 0px;
-                    y: root.workspace-layout == 1 ? workspace-area.terminal-split-height + workspace-area.divider-size : 0px;
-                    width: workspace-area.horizontal-split ? workspace-area.editor-split-width : workspace-area.width;
-                    height: workspace-area.vertical-split ? workspace-area.editor-split-height : workspace-area.height;
-                    visible: root.workspace-layout != 5;
-                    background: #181a1f;
-                    clip: true;
+                primary-view := WorkspaceGroup {
+                    group-id: 0;
+                    active-tab-id: root.primary-active-tab-id;
+                    active-kind: root.primary-active-kind;
+                    active-title: root.primary-active-title;
+                    active-detail: root.primary-active-detail;
+                    editor-text <=> root.editor-text;
+                    highlighted-text: root.highlighted-text;
+                    syntax-highlight-enabled: root.syntax-highlight-enabled;
+                    editor-cursor-offset: root.editor-cursor-offset;
+                    editor-cursor-generation <=> root.editor-cursor-generation;
+                    line-numbers: root.line-numbers;
+                    find-visible: root.find-visible && root.focused-group == 0;
+                    terminal-cells: root.terminal-cells;
+                    terminal-grid-columns: root.terminal-grid-columns;
+                    terminal-grid-rows: root.terminal-grid-rows;
+                    terminal-cursor-row: root.terminal-cursor-row;
+                    terminal-cursor-column: root.terminal-cursor-column;
+                    terminal-update-generation <=> root.terminal-update-generation;
+                    x: root.workspace-layout == 2 && root.has-secondary-group
+                        ? workspace-area.secondary-split-width + workspace-area.divider-size : 0px;
+                    y: root.workspace-layout == 1 && root.has-secondary-group
+                        ? workspace-area.secondary-split-height + workspace-area.divider-size : 0px;
+                    width: workspace-area.horizontal-split ? workspace-area.primary-split-width : workspace-area.width;
+                    height: workspace-area.vertical-split ? workspace-area.primary-split-height : workspace-area.height;
+                    visible: !root.has-secondary-group || root.workspace-layout != 5;
 
-                    VerticalLayout {
-                        width: parent.width;
-                        height: parent.height;
-                        spacing: 0px;
-                        Rectangle {
-                            height: 28px;
-                            background: editor-drag-touch.pressed ? #343944
-                                : (editor-drag-touch.has-hover ? #2b2f37 : #24272e);
-                            Text {
-                                text: "EDITOR  ·  DRAG TO DOCK";
-                                color: #bbc0ca;
-                                font-size: 11px;
-                                x: 9px;
-                                width: parent.width - 48px;
-                                vertical-alignment: center;
-                            }
-                            editor-drag-touch := TouchArea {
-                                private property <length> press-x: 0px;
-                                private property <length> press-y: 0px;
-                                width: parent.width - 38px;
-                                mouse-cursor: move;
-                                moved => {
-                                    if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
-                                        && abs(self.mouse-y - self.press-y) < 5px)) {
-                                        return;
-                                    }
-                                    root.update-dock-preview(
-                                        0,
-                                        self.absolute-position.x + self.mouse-x - workspace-area.absolute-position.x,
-                                        self.absolute-position.y + self.mouse-y - workspace-area.absolute-position.y
-                                    );
-                                }
-                                pointer-event(event) => {
-                                    if (event.kind == PointerEventKind.down) {
-                                        self.press-x = self.mouse-x;
-                                        self.press-y = self.mouse-y;
-                                    } else if (event.kind == PointerEventKind.up && root.dragging-panel == 0) {
-                                        root.dock-panel(0, root.dock-preview);
-                                    } else if (event.kind == PointerEventKind.cancel) {
-                                        root.dragging-panel = -1;
-                                        root.dock-preview = -1;
-                                    }
-                                }
-                                double-clicked => {
-                                    root.toggle-panel-maximize(0);
-                                }
-                            }
-                            Rectangle {
-                                x: parent.width - 36px;
-                                width: 36px;
-                                height: parent.height;
-                                border-radius: 3px;
-                                background: editor-maximize-touch.has-hover ? #3a3f48 : transparent;
-                                Text {
-                                    text: root.workspace-layout == 4 ? "❐" : "□";
-                                    color: #d7dae0;
-                                    font-family: "Segoe UI Symbol";
-                                    font-size: 17px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                editor-maximize-touch := TouchArea {
-                                    clicked => { root.toggle-panel-maximize(0); }
-                                }
-                            }
-                        }
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        max-width: 100000px;
-                        height: root.find-visible ? 36px : 0px;
-                        background: #24272e;
-                        clip: true;
-                        HorizontalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            spacing: 6px;
-                            find-input := LineEdit {
-                                placeholder-text: "Find in current file";
-                                edited(text) => { root.find-requested(text); }
-                                horizontal-stretch: 1;
-                            }
-                            Button { text: "Close"; clicked => { root.find-visible = false; } }
-                        }
+                    editor-edited(text, tab-id) => { root.editor-edited(text, tab-id); }
+                    editor-selection-changed(tab-id, anchor, cursor) => {
+                        if (root.focused-group == 0) { root.editor-selection-changed(anchor, cursor); }
                     }
-
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        max-width: 100000px;
-                        vertical-stretch: 2;
-                        background: #181a1f;
-                        if root.active-tab < 0: Rectangle {
-                            Image {
-                                x: (parent.width - self.width) / 2;
-                                y: max(36px, (parent.height - 150px) / 2);
-                                width: 88px;
-                                height: 88px;
-                                source: @image-url("../assets/araseo-app-icon.png");
-                                image-fit: contain;
-                            }
-                            Text {
-                                x: 0px;
-                                y: max(132px, (parent.height - 150px) / 2 + 101px);
-                                width: parent.width;
-                                text: "Araseo";
-                                color: #d9dce2;
-                                font-size: 18px;
-                                font-weight: 700;
-                                horizontal-alignment: center;
-                            }
-                            Text {
-                                x: 0px;
-                                y: max(160px, (parent.height - 150px) / 2 + 132px);
-                                width: parent.width;
-                                text: "Open a file from the tree";
-                                color: #737985;
-                                horizontal-alignment: center;
-                            }
-                        }
-                        if root.active-tab >= 0: HorizontalLayout {
-                            width: parent.width;
-                            height: parent.height;
-                            spacing: 0px;
-                            Rectangle {
-                                width: 48px;
-                                background: #1e1e1e;
-                                clip: true;
-                                Text {
-                                    text: root.line-numbers;
-                                    color: #858585;
-                                    font-family: "Cascadia Mono";
-                                    font-size: 14px;
-                                    font-weight: 400;
-                                    horizontal-alignment: right;
-                                    vertical-alignment: top;
-                                    x: 4px;
-                                    width: parent.width - 10px;
-                                    y: 6px + editor-scroll.viewport-y;
-                                }
-                            }
-                            editor-pane := Rectangle {
-                                private property <length> cursor-x: 0px;
-                                private property <length> cursor-y: 0px;
-                                horizontal-stretch: 1;
-                                vertical-stretch: 1;
-                                background: #1e1e1e;
-                                clip: true;
-
-                                editor-scroll := ScrollView {
-                                    x: 10px;
-                                    y: 6px;
-                                    width: parent.width - 10px;
-                                    height: parent.height - 6px;
-                                    viewport-width: max(self.visible-width, code-input.preferred-width + 2px);
-                                    viewport-height: max(self.visible-height, code-input.preferred-height + 4px);
-
-                                    if root.syntax-highlight-enabled: StyledText {
-                                        width: editor-scroll.viewport-width;
-                                        height: editor-scroll.viewport-height;
-                                        text: root.highlighted-text;
-                                        default-color: #d4d4d4;
-                                        default-font-family: "Cascadia Mono";
-                                        default-font-size: 14px;
-                                        vertical-alignment: top;
-                                    }
-
-                                    code-input := TextInput {
-                                        private property <int> requested-cursor-generation: root.editor-cursor-generation;
-                                        width: editor-scroll.viewport-width;
-                                        height: editor-scroll.viewport-height;
-                                        text <=> root.editor-text;
-                                        single-line: false;
-                                        wrap: no-wrap;
-                                        font-family: "Cascadia Mono";
-                                        font-size: 14px;
-                                        font-weight: 400;
-                                        color: root.syntax-highlight-enabled && self.preedit-text == "" ? transparent : #d4d4d4;
-                                        // Render selection colors in TextInput itself. Keeping the
-                                        // foreground transparent can make the entire selection pass
-                                        // disappear with some Windows GPU renderers.
-                                        selection-background-color: #264f78;
-                                        selection-foreground-color: #ffffff;
-                                        page-height: editor-scroll.visible-height;
-                                        text-cursor-width: 0px;
-                                        changed requested-cursor-generation => {
-                                            self.set-selection-offsets(root.editor-cursor-offset, root.editor-cursor-offset);
-                                        }
-                                        edited => {
-                                            root.editor-edited(self.text, root.active-tab);
-                                        }
-                                        key-pressed(event) => {
-                                            if (event.modifiers.control && (event.text == "c" || event.text == "C")) {
-                                                self.copy();
-                                                return accept;
-                                            }
-                                            if (event.modifiers.control && (event.text == "x" || event.text == "X")) {
-                                                self.cut();
-                                                return accept;
-                                            }
-                                            if (event.modifiers.control && (event.text == "a" || event.text == "A")) {
-                                                self.select-all();
-                                                return accept;
-                                            }
-                                            if (event.modifiers.control && (event.text == "z" || event.text == "Z")) {
-                                                if (event.modifiers.shift) {
-                                                    root.redo-requested(root.active-tab);
-                                                } else {
-                                                    root.undo-requested(root.active-tab);
-                                                }
-                                                return accept;
-                                            }
-                                            if (event.modifiers.control && (event.text == "y" || event.text == "Y")) {
-                                                root.redo-requested(root.active-tab);
-                                                return accept;
-                                            }
-                                            if (event.modifiers.control && event.text == "s") {
-                                                root.save-requested();
-                                                return accept;
-                                            }
-                                            if (event.modifiers.control && event.text == "f") {
-                                                root.find-visible = true;
-                                                return accept;
-                                            }
-                                            return reject;
-                                        }
-                                        cursor-position-changed(position) => {
-                                            root.editor-selection-anchor = self.anchor-position-byte-offset;
-                                            root.editor-selection-cursor = self.cursor-position-byte-offset;
-                                            root.copy-feedback-active = false;
-                                            copy-feedback-timer.stop();
-                                            root.editor-selection-changed(
-                                                self.anchor-position-byte-offset,
-                                                self.cursor-position-byte-offset
-                                            );
-                                            editor-pane.cursor-x = position.x;
-                                            editor-pane.cursor-y = position.y;
-                                            if (position.x + editor-scroll.viewport-x < 0px) {
-                                                editor-scroll.viewport-x = max(editor-scroll.visible-width - self.width, -position.x);
-                                            } else if (position.x + editor-scroll.viewport-x > editor-scroll.visible-width - 2px) {
-                                                editor-scroll.viewport-x = min(0px, max(editor-scroll.visible-width - self.width, editor-scroll.visible-width - position.x - 2px));
-                                            }
-                                            if (position.y + editor-scroll.viewport-y < 0px) {
-                                                editor-scroll.viewport-y = max(editor-scroll.visible-height - self.height, -position.y);
-                                            } else if (position.y + editor-scroll.viewport-y > editor-scroll.visible-height - 20px) {
-                                                editor-scroll.viewport-y = min(0px, max(editor-scroll.visible-height - self.height, editor-scroll.visible-height - position.y - 20px));
-                                            }
-                                        }
-                                    }
-
-                                    Rectangle {
-                                        x: editor-pane.cursor-x;
-                                        y: editor-pane.cursor-y;
-                                        width: 2px;
-                                        height: 18px;
-                                        background: #f0f0f0;
-                                        visible: code-input.has-focus
-                                            && code-input.preedit-text == ""
-                                            && code-input.cursor-position-byte-offset == code-input.anchor-position-byte-offset;
-                                    }
-                                }
-
-                                if root.editor-selection-length > 0: Rectangle {
-                                    x: parent.width - 92px;
-                                    y: 8px;
-                                    width: 78px;
-                                    height: 28px;
-                                    border-radius: 4px;
-                                    background: root.copy-feedback-active ? #2e7d4f
-                                        : (copy-selection-touch.has-hover ? #3a3d43 : #292c32);
-                                    border-width: 1px;
-                                    border-color: root.copy-feedback-active ? #55b979 : #555960;
-                                    Text {
-                                        text: root.copy-feedback-active ? "Copied!" : "Copy";
-                                        color: #f0f0f0;
-                                        font-family: "Geist";
-                                        font-size: 12px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                    copy-selection-touch := TouchArea {
-                                        clicked => {
-                                            code-input.copy();
-                                            root.show-copy-feedback();
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    undo-requested(tab-id) => { root.undo-requested(tab-id); }
+                    redo-requested(tab-id) => { root.redo-requested(tab-id); }
+                    save-requested(tab-id) => { root.save-requested(tab-id); }
+                    find-requested(tab-id, query) => { root.find-requested(tab-id, query); }
+                    find-visibility-requested(group, visible) => {
+                        root.focused-group = group;
+                        root.find-visible = visible;
+                        root.focused-group-changed(group);
                     }
+                    terminal-key(tab-id, text, control, alt, shift) => {
+                        root.terminal-key(tab-id, text, control, alt, shift);
+                    }
+                    terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
+                    group-focused(group) => {
+                        root.focused-group = group;
+                        root.focused-group-changed(group);
+                    }
+                    toggle-maximize(group) => { root.toggle-panel-maximize(group); }
+                    tab-drag-moved(tab-id, x, y) => { root.update-dock-preview(tab-id, x, y); }
+                    tab-drag-released(tab-id) => { root.finish-tab-drag(tab-id); }
+                    tab-drag-cancelled => { root.cancel-tab-drag(); }
+                }
+
+                secondary-view := WorkspaceGroup {
+                    group-id: 1;
+                    active-tab-id: root.secondary-active-tab-id;
+                    active-kind: root.secondary-active-kind;
+                    active-title: root.secondary-active-title;
+                    active-detail: root.secondary-active-detail;
+                    editor-text <=> root.secondary-editor-text;
+                    highlighted-text: root.secondary-highlighted-text;
+                    syntax-highlight-enabled: root.secondary-syntax-highlight-enabled;
+                    editor-cursor-offset: root.secondary-editor-cursor-offset;
+                    editor-cursor-generation <=> root.secondary-editor-cursor-generation;
+                    line-numbers: root.secondary-line-numbers;
+                    find-visible: root.find-visible && root.focused-group == 1;
+                    terminal-cells: root.secondary-terminal-cells;
+                    terminal-grid-columns: root.secondary-terminal-grid-columns;
+                    terminal-grid-rows: root.secondary-terminal-grid-rows;
+                    terminal-cursor-row: root.secondary-terminal-cursor-row;
+                    terminal-cursor-column: root.secondary-terminal-cursor-column;
+                    terminal-update-generation <=> root.secondary-terminal-update-generation;
+                    x: root.workspace-layout == 3
+                        ? workspace-area.primary-split-width + workspace-area.divider-size : 0px;
+                    y: root.workspace-layout == 0
+                        ? workspace-area.primary-split-height + workspace-area.divider-size : 0px;
+                    width: workspace-area.horizontal-split ? workspace-area.secondary-split-width : workspace-area.width;
+                    height: workspace-area.vertical-split ? workspace-area.secondary-split-height : workspace-area.height;
+                    visible: root.has-secondary-group && root.workspace-layout != 4;
+
+                    editor-edited(text, tab-id) => { root.editor-edited(text, tab-id); }
+                    editor-selection-changed(tab-id, anchor, cursor) => {
+                        if (root.focused-group == 1) { root.editor-selection-changed(anchor, cursor); }
+                    }
+                    undo-requested(tab-id) => { root.undo-requested(tab-id); }
+                    redo-requested(tab-id) => { root.redo-requested(tab-id); }
+                    save-requested(tab-id) => { root.save-requested(tab-id); }
+                    find-requested(tab-id, query) => { root.find-requested(tab-id, query); }
+                    find-visibility-requested(group, visible) => {
+                        root.focused-group = group;
+                        root.find-visible = visible;
+                        root.focused-group-changed(group);
+                    }
+                    terminal-key(tab-id, text, control, alt, shift) => {
+                        root.terminal-key(tab-id, text, control, alt, shift);
+                    }
+                    terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
+                    group-focused(group) => {
+                        root.focused-group = group;
+                        root.focused-group-changed(group);
+                    }
+                    toggle-maximize(group) => { root.toggle-panel-maximize(group); }
+                    tab-drag-moved(tab-id, x, y) => { root.update-dock-preview(tab-id, x, y); }
+                    tab-drag-released(tab-id) => { root.finish-tab-drag(tab-id); }
+                    tab-drag-cancelled => { root.cancel-tab-drag(); }
+                }
+
+                panel-divider := Rectangle {
+                    visible: workspace-area.vertical-split || workspace-area.horizontal-split;
+                    x: workspace-area.horizontal-split
+                        ? (root.workspace-layout == 2
+                            ? workspace-area.secondary-split-width
+                            : workspace-area.primary-split-width)
+                        : 0px;
+                    y: workspace-area.vertical-split
+                        ? (root.workspace-layout == 1
+                            ? workspace-area.secondary-split-height
+                            : workspace-area.primary-split-height)
+                        : 0px;
+                    width: workspace-area.horizontal-split ? workspace-area.divider-size : workspace-area.width;
+                    height: workspace-area.vertical-split ? workspace-area.divider-size : workspace-area.height;
+                    background: divider-touch.pressed || divider-touch.has-hover ? #5686b3 : #313640;
+
+                    divider-touch := TouchArea {
+                        mouse-cursor: workspace-area.horizontal-split ? ew-resize : ns-resize;
+                        moved => {
+                            if (!self.pressed) { return; }
+                            if (workspace-area.horizontal-split) {
+                                let pointer-x = self.absolute-position.x + self.mouse-x
+                                    - workspace-area.absolute-position.x;
+                                root.panel-split-ratio = max(0.2, min(0.8,
+                                    root.workspace-layout == 2
+                                        ? (workspace-area.width - workspace-area.divider-size - pointer-x)
+                                            / (workspace-area.width - workspace-area.divider-size)
+                                        : pointer-x / (workspace-area.width - workspace-area.divider-size)
+                                ));
+                            } else {
+                                let pointer-y = self.absolute-position.y + self.mouse-y
+                                    - workspace-area.absolute-position.y;
+                                root.panel-split-ratio = max(0.2, min(0.8,
+                                    root.workspace-layout == 1
+                                        ? (workspace-area.height - workspace-area.divider-size - pointer-y)
+                                            / (workspace-area.height - workspace-area.divider-size)
+                                        : pointer-y / (workspace-area.height - workspace-area.divider-size)
+                                ));
+                            }
+                        }
                     }
                 }
 
-                terminal-panel := Rectangle {
-                        x: root.workspace-layout == 3 ? workspace-area.editor-split-width + workspace-area.divider-size : 0px;
-                        y: root.workspace-layout == 0 ? workspace-area.editor-split-height + workspace-area.divider-size : 0px;
-                        width: workspace-area.horizontal-split ? workspace-area.terminal-split-width : workspace-area.width;
-                        height: workspace-area.vertical-split ? workspace-area.terminal-split-height : workspace-area.height;
-                        visible: root.workspace-layout != 4;
-                        background: #111318;
-                        clip: true;
-                        VerticalLayout {
-                            width: parent.width;
-                            height: parent.height;
-                            spacing: 0px;
-                            Rectangle {
-                                horizontal-stretch: 1;
-                                max-width: 100000px;
-                                height: 28px;
-                                background: terminal-drag-touch.pressed ? #343944
-                                    : (terminal-drag-touch.has-hover ? #2b2f37 : #24272e);
-                                Text {
-                                    text: "TERMINAL — WSL  ·  DRAG TO DOCK";
-                                    color: #bbc0ca;
-                                    font-size: 11px;
-                                    x: 9px;
-                                    width: parent.width - 48px;
-                                    vertical-alignment: center;
-                                }
-                                terminal-drag-touch := TouchArea {
-                                    private property <length> press-x: 0px;
-                                    private property <length> press-y: 0px;
-                                    width: parent.width - 38px;
-                                    mouse-cursor: move;
-                                    moved => {
-                                        if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
-                                            && abs(self.mouse-y - self.press-y) < 5px)) {
-                                            return;
-                                        }
-                                        root.update-dock-preview(
-                                            1,
-                                            self.absolute-position.x + self.mouse-x - workspace-area.absolute-position.x,
-                                            self.absolute-position.y + self.mouse-y - workspace-area.absolute-position.y
-                                        );
-                                }
-                                pointer-event(event) => {
-                                        if (event.kind == PointerEventKind.down) {
-                                            self.press-x = self.mouse-x;
-                                            self.press-y = self.mouse-y;
-                                        } else if (event.kind == PointerEventKind.up && root.dragging-panel == 1) {
-                                            root.dock-panel(1, root.dock-preview);
-                                        } else if (event.kind == PointerEventKind.cancel) {
-                                            root.dragging-panel = -1;
-                                            root.dock-preview = -1;
-                                        }
-                                    }
-                                    double-clicked => {
-                                        root.toggle-panel-maximize(1);
-                                    }
-                                }
-                                Rectangle {
-                                    x: parent.width - 36px;
-                                    width: 36px;
-                                    height: parent.height;
-                                    border-radius: 3px;
-                                    background: terminal-maximize-touch.has-hover ? #3a3f48 : transparent;
-                                    Text {
-                                        text: root.workspace-layout == 5 ? "❐" : "□";
-                                        color: #d7dae0;
-                                        font-family: "Segoe UI Symbol";
-                                        font-size: 17px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                    terminal-maximize-touch := TouchArea {
-                                        clicked => { root.toggle-panel-maximize(1); }
-                                    }
-                                }
-                            }
-                            terminal-focus := FocusScope {
-                                horizontal-stretch: 1;
-                                max-width: 100000px;
-                                vertical-stretch: 1;
-                                focus-on-click: true;
-                                terminal-scroll := ScrollView {
-                                    viewport-width: max(self.visible-width, root.terminal-grid-columns * 8px);
-                                    viewport-height: max(self.visible-height, root.terminal-grid-rows * 18px);
-                                    viewport-x: 0px;
-                                    viewport-y: 0px;
-                                    private property <int> follow-generation: root.terminal-update-generation;
-                                    private property <length> cursor-top: max(0, root.terminal-cursor-row) * 18px;
-                                    private property <length> cursor-bottom: self.cursor-top + 18px;
-                                    changed follow-generation => {
-                                        if (root.terminal-cursor-row >= 0) {
-                                            if (self.cursor-top + self.viewport-y < 0px) {
-                                                self.viewport-y = -self.cursor-top;
-                                            } else if (self.cursor-bottom + self.viewport-y > self.visible-height) {
-                                                self.viewport-y = self.visible-height - self.cursor-bottom;
-                                            }
-                                            self.viewport-y = max(
-                                                self.visible-height - self.viewport-height,
-                                                min(0px, self.viewport-y)
-                                            );
-                                        }
-                                    }
-                                    Rectangle {
-                                        x: 0px;
-                                        y: 0px;
-                                        width: root.terminal-grid-columns * 8px;
-                                        height: root.terminal-grid-rows * 18px;
-                                        for cell[index] in root.terminal-cells: Rectangle {
-                                            x: Math.mod(index, max(1, root.terminal-grid-columns)) * 8px;
-                                            y: floor(index / max(1, root.terminal-grid-columns)) * 18px;
-                                            width: cell.column-span * 8px;
-                                            height: 18px;
-                                            visible: cell.column-span > 0;
-                                            background: cell.cursor ? cell.foreground : cell.background;
-                                            Text {
-                                                text: cell.glyph;
-                                                color: cell.cursor ? cell.background : cell.foreground;
-                                                font-family: "Cascadia Mono";
-                                                font-size: 14px;
-                                                font-weight: cell.bold ? 700 : 500;
-                                                width: parent.width;
-                                                height: parent.height;
-                                                vertical-alignment: center;
-                                                wrap: no-wrap;
-                                            }
-                                        }
-                                    }
-                                }
-                                terminal-ime-input := TextInput {
-                                    x: max(0px, root.terminal-cursor-column * 8px + terminal-scroll.viewport-x);
-                                    y: max(0px, root.terminal-cursor-row * 18px + terminal-scroll.viewport-y);
-                                    width: max(18px, terminal-focus.width - self.x);
-                                    height: 18px;
-                                    text: "";
-                                    single-line: true;
-                                    wrap: no-wrap;
-                                    font-family: "Cascadia Mono";
-                                    font-size: 14px;
-                                    font-weight: 500;
-                                    color: #d8dee9;
-                                    selection-background-color: #264f78;
-                                    selection-foreground-color: #ffffff;
-                                    text-cursor-width: 0px;
-                                    edited => {
-                                        if (self.text != "") {
-                                            root.terminal-text(self.text);
-                                            self.text = "";
-                                            self.set-selection-offsets(0, 0);
-                                        }
-                                    }
-                                    key-pressed(event) => {
-                                        if (event.text == Key.Shift || event.text == Key.ShiftR
-                                            || event.text == Key.Control || event.text == Key.ControlR
-                                            || event.text == Key.Alt || event.text == Key.AltGr
-                                            || event.text == Key.Meta || event.text == Key.MetaR
-                                            || event.text == Key.CapsLock) {
-                                            return accept;
-                                        }
-                                        if (event.text == Key.UpArrow) {
-                                            root.terminal-key("<UP>", event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
-                                            return accept;
-                                        }
-                                        if (event.text == Key.DownArrow) {
-                                            root.terminal-key("<DOWN>", event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
-                                            return accept;
-                                        }
-                                        if (event.text == Key.LeftArrow) {
-                                            root.terminal-key("<LEFT>", event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
-                                            return accept;
-                                        }
-                                        if (event.text == Key.RightArrow) {
-                                            root.terminal-key("<RIGHT>", event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
-                                            return accept;
-                                        }
-                                        if (event.text == Key.Home) { root.terminal-key("<HOME>", false, false, false); return accept; }
-                                        if (event.text == Key.End) { root.terminal-key("<END>", false, false, false); return accept; }
-                                        if (event.text == Key.PageUp) { root.terminal-key("<PAGEUP>", false, false, false); return accept; }
-                                        if (event.text == Key.PageDown) { root.terminal-key("<PAGEDOWN>", false, false, false); return accept; }
-                                        if (event.text == Key.Delete) { root.terminal-key("<DELETE>", false, false, false); return accept; }
-                                        if (event.text == Key.Backspace) { root.terminal-key("<BACKSPACE>", false, false, false); return accept; }
-                                        if (event.text == Key.Return) { root.terminal-key("<ENTER>", false, false, false); return accept; }
-                                        if (event.text == Key.Backtab) { root.terminal-key("<BACKTAB>", false, false, false); return accept; }
-                                        if (event.text == Key.Tab) { root.terminal-key("<TAB>", false, false, false); return accept; }
-                                        if (event.text == Key.Escape) { root.terminal-key("<ESCAPE>", false, false, false); return accept; }
-                                        if (event.modifiers.control || event.modifiers.alt) {
-                                            root.terminal-key(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
-                                            return accept;
-                                        }
-                                        return reject;
-                                    }
-                                }
-                                terminal-click := TouchArea {
-                                    clicked => { root.focus-terminal(); }
-                                }
-                            }
-                        }
-                    }
+                if root.dragging-tab >= 0 && root.dock-preview >= 0: Rectangle {
+                    x: root.dock-preview == 1 ? workspace-area.width / 2
+                        : (root.dock-preview == 4 ? workspace-area.width / 4 : 0px);
+                    y: root.dock-preview == 3 ? workspace-area.height / 2
+                        : (root.dock-preview == 4 ? workspace-area.height / 4 : 0px);
+                    width: root.dock-preview == 0 || root.dock-preview == 1
+                        ? workspace-area.width / 2
+                        : (root.dock-preview == 4 ? workspace-area.width / 2 : workspace-area.width);
+                    height: root.dock-preview == 2 || root.dock-preview == 3
+                        ? workspace-area.height / 2
+                        : (root.dock-preview == 4 ? workspace-area.height / 2 : workspace-area.height);
+                    background: #315f8a99;
+                    border-width: 2px;
+                    border-color: #79b8f3;
+                    border-radius: 5px;
 
-                    panel-divider := Rectangle {
-                        visible: workspace-area.vertical-split || workspace-area.horizontal-split;
-                        x: workspace-area.horizontal-split
-                            ? (root.workspace-layout == 2
-                                ? workspace-area.terminal-split-width
-                                : workspace-area.editor-split-width)
-                            : 0px;
-                        y: workspace-area.vertical-split
-                            ? (root.workspace-layout == 1
-                                ? workspace-area.terminal-split-height
-                                : workspace-area.editor-split-height)
-                            : 0px;
-                        width: workspace-area.horizontal-split
-                            ? workspace-area.divider-size
-                            : workspace-area.width;
-                        height: workspace-area.vertical-split
-                            ? workspace-area.divider-size
-                            : workspace-area.height;
-                        background: divider-touch.pressed || divider-touch.has-hover ? #5686b3 : #313640;
-
-                        divider-touch := TouchArea {
-                            mouse-cursor: workspace-area.horizontal-split ? ew-resize : ns-resize;
-                            moved => {
-                                if (!self.pressed) {
-                                    return;
-                                }
-                                if (workspace-area.horizontal-split) {
-                                    let pointer-x = self.absolute-position.x + self.mouse-x
-                                        - workspace-area.absolute-position.x;
-                                    root.panel-split-ratio = max(0.2, min(0.8,
-                                        root.workspace-layout == 2
-                                            ? (workspace-area.width - workspace-area.divider-size - pointer-x)
-                                                / (workspace-area.width - workspace-area.divider-size)
-                                            : pointer-x / (workspace-area.width - workspace-area.divider-size)
-                                    ));
-                                } else {
-                                    let pointer-y = self.absolute-position.y + self.mouse-y
-                                        - workspace-area.absolute-position.y;
-                                    root.panel-split-ratio = max(0.2, min(0.8,
-                                        root.workspace-layout == 1
-                                            ? (workspace-area.height - workspace-area.divider-size - pointer-y)
-                                                / (workspace-area.height - workspace-area.divider-size)
-                                            : pointer-y / (workspace-area.height - workspace-area.divider-size)
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    if root.dragging-panel >= 0 && root.dock-preview >= 0: Rectangle {
-                        x: root.dock-preview == 1 ? workspace-area.width / 2
-                            : (root.dock-preview == 4 ? workspace-area.width / 4 : 0px);
-                        y: root.dock-preview == 3 ? workspace-area.height / 2
-                            : (root.dock-preview == 4 ? workspace-area.height / 4 : 0px);
-                        width: root.dock-preview == 0 || root.dock-preview == 1
-                            ? workspace-area.width / 2
-                            : (root.dock-preview == 4 ? workspace-area.width / 2 : workspace-area.width);
-                        height: root.dock-preview == 2 || root.dock-preview == 3
-                            ? workspace-area.height / 2
-                            : (root.dock-preview == 4 ? workspace-area.height / 2 : workspace-area.height);
-                        background: #315f8a99;
-                        border-width: 2px;
-                        border-color: #79b8f3;
-                        border-radius: 5px;
-
-                        Text {
-                            text: root.dock-preview == 0 ? "Dock left"
-                                : (root.dock-preview == 1 ? "Dock right"
-                                : (root.dock-preview == 2 ? "Dock top"
-                                : (root.dock-preview == 3 ? "Dock bottom" : "Maximize")));
-                            color: white;
-                            font-family: "Geist";
-                            font-size: 14px;
-                            font-weight: 600;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
+                    Text {
+                        text: root.dock-preview == 0 ? "Move tab to left group"
+                            : (root.dock-preview == 1 ? "Move tab to right group"
+                            : (root.dock-preview == 2 ? "Move tab to top group"
+                            : (root.dock-preview == 3 ? "Move tab to bottom group"
+                            : "Return tab to primary group")));
+                        color: white;
+                        font-family: "Geist";
+                        font-size: 14px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                 }
             }
+
+        }
 
         Rectangle {
             height: 24px;
@@ -1122,7 +1240,7 @@ export component AppWindow inherits Window {
                 Text {
                     x: 12px;
                     width: parent.width - 24px;
-                    text: "OPEN EDITORS  " + root.tabs.length;
+                    text: "OPEN FILES & TERMINALS  " + root.tabs.length;
                     color: #bbc0ca;
                     font-size: 11px;
                     font-weight: 600;
@@ -1135,14 +1253,16 @@ export component AppWindow inherits Window {
                     spacing: 0px;
                     for tab[index] in root.tabs: Rectangle {
                         height: 30px;
-                        background: index == root.active-tab ? #373d47
+                        background: tab.active ? #373d47
                             : (open-tab-touch.has-hover ? #303640 : transparent);
                         Text {
                             x: 12px;
                             width: parent.width - 44px;
-                            text: tab.title;
-                            color: index == root.active-tab ? #ffffff : #d5d8de;
-                            font-family: "Geist";
+                            text: (tab.kind == "terminal" ? ">_ " : "") + tab.title
+                                + (root.has-secondary-group ? (tab.group == 0 ? "  ①" : "  ②") : "");
+                            color: tab.kind == "terminal" ? #82c7ff
+                                : (tab.active ? #ffffff : #d5d8de);
+                            font-family: tab.kind == "terminal" ? "Cascadia Mono" : "Geist";
                             font-size: 12px;
                             overflow: elide;
                             vertical-alignment: center;
@@ -1159,7 +1279,7 @@ export component AppWindow inherits Window {
                         open-tab-touch := TouchArea {
                             clicked => {
                                 root.tab-list-visible = false;
-                                root.tab-activated(index);
+                                root.tab-activated(tab.id);
                             }
                         }
                     }

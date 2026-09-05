@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
+use tabs::{TabGroups, TabId};
 use terminal::TerminalSession;
 use tree::{FlatNode, GitStatus};
 use workspace::Workspace;
@@ -30,14 +31,29 @@ struct AppState {
     statuses: HashMap<PathBuf, GitStatus>,
     repositories: HashSet<PathBuf>,
     tree: Vec<FlatNode>,
-    documents: Vec<Document>,
-    active_document: Option<usize>,
-    terminal: Option<TerminalSession>,
+    tabs: Vec<WorkspaceTab>,
+    tab_groups: TabGroups,
+    next_tab_id: TabId,
+    next_terminal_number: u32,
     git_monitor: Option<git::StatusMonitor>,
     status: String,
-    save_conflict: bool,
+    save_conflict: Option<TabId>,
     syncing_editor: Cell<bool>,
     emoji_icons: emoji::EmojiIcons,
+}
+
+enum TabContent {
+    File(Document),
+    Terminal {
+        session: TerminalSession,
+        start_path: PathBuf,
+        number: u32,
+    },
+}
+
+struct WorkspaceTab {
+    id: TabId,
+    content: TabContent,
 }
 
 fn main() -> Result<()> {
@@ -62,18 +78,36 @@ fn main() -> Result<()> {
             Ok(terminal) => (Some(terminal), monitor_error.unwrap_or_else(|| "Ready".to_string())),
             Err(error) => (None, format!("Terminal unavailable: {error}")),
         };
+    let mut workspace_tabs = Vec::new();
+    let mut tab_groups = TabGroups::default();
+    let mut next_tab_id = 0;
+    let mut next_terminal_number = 1;
+    if let Some(terminal) = terminal {
+        workspace_tabs.push(WorkspaceTab {
+            id: next_tab_id,
+            content: TabContent::Terminal {
+                session: terminal,
+                start_path: workspace.linux_root.clone(),
+                number: next_terminal_number,
+            },
+        });
+        tab_groups.add(next_tab_id, 0);
+        next_tab_id += 1;
+        next_terminal_number += 1;
+    }
     let state = Rc::new(RefCell::new(AppState {
         workspace,
         expanded: HashSet::new(),
         statuses,
         repositories: HashSet::new(),
         tree,
-        documents: Vec::new(),
-        active_document: None,
-        terminal,
+        tabs: workspace_tabs,
+        tab_groups,
+        next_tab_id,
+        next_terminal_number,
         git_monitor,
         status: initial_status,
-        save_conflict: false,
+        save_conflict: None,
         syncing_editor: Cell::new(false),
         emoji_icons: emoji::EmojiIcons::load_system(),
     }));
@@ -118,15 +152,15 @@ fn main() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_undo_requested(move |document_index| {
-            apply_history_change(&weak, &state, document_index, true);
+        ui.on_undo_requested(move |tab_id| {
+            apply_history_change(&weak, &state, tab_id, true);
         });
     }
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_redo_requested(move |document_index| {
-            apply_history_change(&weak, &state, document_index, false);
+        ui.on_redo_requested(move |tab_id| {
+            apply_history_change(&weak, &state, tab_id, false);
         });
     }
     {
@@ -134,8 +168,7 @@ fn main() -> Result<()> {
         let state = state.clone();
         ui.on_tab_cycle(move |delta| {
             let mut state = state.borrow_mut();
-            state.active_document =
-                tabs::cycle_index(state.active_document, state.documents.len(), delta);
+            state.tab_groups.cycle(delta);
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
             }
@@ -144,10 +177,10 @@ fn main() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_tab_activated(move |index| {
+        ui.on_tab_activated(move |tab_id| {
             let mut state = state.borrow_mut();
-            if (index as usize) < state.documents.len() {
-                state.active_document = Some(index as usize);
+            if let Ok(tab_id) = TabId::try_from(tab_id) {
+                state.tab_groups.activate(tab_id);
             }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
@@ -157,20 +190,10 @@ fn main() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_tab_close(move |index| {
+        ui.on_tab_close(move |tab_id| {
             let mut state = state.borrow_mut();
-            let index = index as usize;
-            if let Some(document) = state.documents.get(index) {
-                if document.dirty {
-                    state.status = "Save the modified file before closing it".into();
-                } else {
-                    state.documents.remove(index);
-                    state.active_document = if state.documents.is_empty() {
-                        None
-                    } else {
-                        Some(index.min(state.documents.len() - 1))
-                    };
-                }
+            if let Ok(tab_id) = TabId::try_from(tab_id) {
+                close_tab(&mut state, tab_id);
             }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
@@ -180,30 +203,39 @@ fn main() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_editor_edited(move |text, document_index| {
+        ui.on_editor_edited(move |text, tab_id| {
             if state.borrow().syncing_editor.get() {
                 return;
             }
             let mut state = state.borrow_mut();
-            let document_index = usize::try_from(document_index).ok();
-            if let Some(index) = document_index
-                && state.active_document == Some(index)
-                && index < state.documents.len()
+            let Ok(tab_id) = TabId::try_from(tab_id) else {
+                return;
+            };
+            let is_active = state
+                .tab_groups
+                .group_of(tab_id)
+                .is_some_and(|group| state.tab_groups.active(group) == Some(tab_id));
+            if is_active
+                && let Some(document) = document_mut(&mut state, tab_id)
             {
-                state.documents[index].set_text(text.to_string());
+                document.set_text(text.to_string());
             }
             if let Some(ui) = weak.upgrade() {
                 sync_tabs(&ui, &state);
-                sync_highlight(&ui, &state);
+                if let Some(group) = state.tab_groups.group_of(tab_id) {
+                    sync_group(&ui, &state, group);
+                }
             }
         });
     }
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_save_requested(move || {
+        ui.on_save_requested(move |tab_id| {
             let mut state = state.borrow_mut();
-            save_active(&mut state, false);
+            if let Ok(tab_id) = TabId::try_from(tab_id) {
+                save_tab(&mut state, tab_id, false);
+            }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
             }
@@ -214,7 +246,9 @@ fn main() -> Result<()> {
         let state = state.clone();
         ui.on_force_save_requested(move || {
             let mut state = state.borrow_mut();
-            save_active(&mut state, true);
+            if let Some(tab_id) = state.save_conflict.or_else(|| focused_tab_id(&state)) {
+                save_tab(&mut state, tab_id, true);
+            }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
             }
@@ -225,7 +259,9 @@ fn main() -> Result<()> {
         let state = state.clone();
         ui.on_reload_requested(move || {
             let mut state = state.borrow_mut();
-            reload_active(&mut state);
+            if let Some(tab_id) = state.save_conflict.or_else(|| focused_tab_id(&state)) {
+                reload_tab(&mut state, tab_id);
+            }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
             }
@@ -233,16 +269,22 @@ fn main() -> Result<()> {
     }
     {
         let state = state.clone();
-        ui.on_terminal_key(move |text, control, alt, shift| {
-            if let Some(terminal) = &state.borrow().terminal {
+        ui.on_terminal_key(move |tab_id, text, control, alt, shift| {
+            let Ok(tab_id) = TabId::try_from(tab_id) else {
+                return;
+            };
+            if let Some(terminal) = terminal_ref(&state.borrow(), tab_id) {
                 terminal.write(&terminal::encode_key(&text, control, alt, shift));
             }
         });
     }
     {
         let state = state.clone();
-        ui.on_terminal_text(move |text| {
-            if let Some(terminal) = &state.borrow().terminal {
+        ui.on_terminal_text(move |tab_id, text| {
+            let Ok(tab_id) = TabId::try_from(tab_id) else {
+                return;
+            };
+            if let Some(terminal) = terminal_ref(&state.borrow(), tab_id) {
                 terminal.write(text.as_bytes());
             }
         });
@@ -250,12 +292,13 @@ fn main() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_find_requested(move |query| {
+        ui.on_find_requested(move |tab_id, query| {
             let mut state = state.borrow_mut();
-            state.status = match state
-                .active_document
-                .and_then(|index| state.documents[index].text.find(query.as_str()))
-            {
+            let result = TabId::try_from(tab_id)
+                .ok()
+                .and_then(|tab_id| document_ref(&state, tab_id))
+                .and_then(|document| document.text.find(query.as_str()));
+            state.status = match result {
                 Some(offset) if !query.is_empty() => format!("Found at byte {}", offset + 1),
                 _ if query.is_empty() => "Find".into(),
                 _ => "No match".into(),
@@ -263,6 +306,43 @@ fn main() -> Result<()> {
             if let Some(ui) = weak.upgrade() {
                 ui.set_status_text(state.status.clone().into());
             }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_new_terminal_requested(move |group| {
+            let mut state = state.borrow_mut();
+            let group = usize::try_from(group).unwrap_or(0).min(1);
+            if let Err(error) = open_terminal(&mut state, group) {
+                state.status = format!("Terminal unavailable: {error}");
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+                ui.invoke_focus_terminal();
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_tab_dock_requested(move |tab_id, zone| {
+            let mut state = state.borrow_mut();
+            if let Ok(tab_id) = TabId::try_from(tab_id) {
+                state.tab_groups.dock(tab_id, zone);
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        ui.on_focused_group_changed(move |group| {
+            state
+                .borrow_mut()
+                .tab_groups
+                .set_focused_group(usize::try_from(group).unwrap_or(0));
         });
     }
     ui.on_terminal_paste(|_| {});
@@ -273,19 +353,49 @@ fn main() -> Result<()> {
         let state = state.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = weak.upgrade() else { return };
-            let rows = ui.get_terminal_rows().round().clamp(2.0, u16::MAX as f32) as u16;
-            let columns = ui
-                .get_terminal_columns()
-                .round()
-                .clamp(20.0, u16::MAX as f32) as u16;
+            let terminal_sizes = [
+                (
+                    ui.get_terminal_rows().round().clamp(2.0, u16::MAX as f32) as u16,
+                    ui.get_terminal_columns()
+                        .round()
+                        .clamp(20.0, u16::MAX as f32) as u16,
+                ),
+                (
+                    ui.get_secondary_terminal_rows()
+                        .round()
+                        .clamp(2.0, u16::MAX as f32) as u16,
+                    ui.get_secondary_terminal_columns()
+                        .round()
+                        .clamp(20.0, u16::MAX as f32) as u16,
+                ),
+            ];
             let mut state = state.borrow_mut();
-            let changed = state
-                .terminal
-                .as_mut()
-                .is_some_and(|terminal| terminal.resize(rows, columns) | terminal.poll());
-            if changed {
-                if let Some(terminal) = state.terminal.as_ref() {
-                    sync_terminal(&ui, terminal);
+            let active = [state.tab_groups.active(0), state.tab_groups.active(1)];
+            let mut changed_groups = [false, false];
+            for tab in &mut state.tabs {
+                if let TabContent::Terminal { session, .. } = &mut tab.content {
+                    let visible_group = if active[0] == Some(tab.id) {
+                        Some(0)
+                    } else if active[1] == Some(tab.id) {
+                        Some(1)
+                    } else {
+                        None
+                    };
+                    let resized = visible_group.is_some_and(|group| {
+                        let (rows, columns) = terminal_sizes[group];
+                        session.resize(rows, columns)
+                    });
+                    let changed = resized | session.poll();
+                    if changed
+                        && let Some(group) = visible_group
+                    {
+                        changed_groups[group] = true;
+                    }
+                }
+            }
+            for (group, changed) in changed_groups.into_iter().enumerate() {
+                if changed {
+                    sync_group(&ui, &state, group);
                 }
             }
         });
@@ -395,61 +505,114 @@ fn parse_args() -> Result<(String, PathBuf, Option<PathBuf>)> {
 fn apply_history_change(
     weak: &slint::Weak<AppWindow>,
     state: &Rc<RefCell<AppState>>,
-    document_index: i32,
+    tab_id: i32,
     undo: bool,
 ) {
-    let Some(index) = usize::try_from(document_index).ok() else {
+    let Ok(tab_id) = TabId::try_from(tab_id) else {
         return;
     };
     let mut state = state.borrow_mut();
-    if state.active_document != Some(index) || index >= state.documents.len() {
+    let is_active = state
+        .tab_groups
+        .group_of(tab_id)
+        .is_some_and(|group| state.tab_groups.active(group) == Some(tab_id));
+    if !is_active {
         return;
     }
-    let cursor = if undo {
-        state.documents[index].undo()
-    } else {
-        state.documents[index].redo()
-    };
+    let cursor = document_mut(&mut state, tab_id).and_then(|document| {
+        if undo {
+            document.undo()
+        } else {
+            document.redo()
+        }
+    });
     let Some(cursor) = cursor else {
         return;
     };
     if let Some(ui) = weak.upgrade() {
-        state.syncing_editor.set(true);
-        ui.set_editor_text(state.documents[index].text.clone().into());
-        ui.set_editor_cursor_offset(cursor.min(i32::MAX as usize) as i32);
-        ui.set_editor_cursor_generation(ui.get_editor_cursor_generation().wrapping_add(1));
-        state.syncing_editor.set(false);
-        ui.set_line_numbers(line_numbers(&state.documents[index].text).into());
-        sync_tabs(&ui, &state);
-        sync_highlight(&ui, &state);
+        if let Some(group) = state.tab_groups.group_of(tab_id) {
+            state.syncing_editor.set(true);
+            sync_group(&ui, &state, group);
+            if group == 0 {
+                ui.set_editor_cursor_offset(cursor.min(i32::MAX as usize) as i32);
+                ui.set_editor_cursor_generation(ui.get_editor_cursor_generation().wrapping_add(1));
+            } else {
+                ui.set_secondary_editor_cursor_offset(cursor.min(i32::MAX as usize) as i32);
+                ui.set_secondary_editor_cursor_generation(
+                    ui.get_secondary_editor_cursor_generation().wrapping_add(1),
+                );
+            }
+            state.syncing_editor.set(false);
+            sync_tabs(&ui, &state);
+        }
     }
 }
 
 fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
-    if let Some(index) = state
-        .documents
-        .iter()
-        .position(|document| document.linux_path == linux_path)
-    {
-        state.active_document = Some(index);
+    if let Some(tab_id) = state.tabs.iter().find_map(|tab| match &tab.content {
+        TabContent::File(document) if document.linux_path == linux_path => Some(tab.id),
+        _ => None,
+    }) {
+        state.tab_groups.activate(tab_id);
         return Ok(());
     }
+
     let host_path = state.workspace.host_path(&linux_path)?;
     let document = Document::open(linux_path, host_path)?;
-    state.documents.push(document);
-    state.active_document = Some(state.documents.len() - 1);
+    let tab_id = take_next_tab_id(state);
+    let group = state.tab_groups.focused_group();
+    state.tabs.push(WorkspaceTab {
+        id: tab_id,
+        content: TabContent::File(document),
+    });
+    state.tab_groups.add(tab_id, group);
     state.status = "File opened".into();
     Ok(())
 }
 
-fn save_active(state: &mut AppState, overwrite_external: bool) {
-    let Some(index) = state.active_document else {
+fn open_terminal(state: &mut AppState, group: usize) -> Result<TabId> {
+    let session = TerminalSession::spawn(&state.workspace.distro, &state.workspace.linux_root)?;
+    let tab_id = take_next_tab_id(state);
+    let number = state.next_terminal_number;
+    state.next_terminal_number = state.next_terminal_number.saturating_add(1);
+    state.tabs.push(WorkspaceTab {
+        id: tab_id,
+        content: TabContent::Terminal {
+            session,
+            start_path: state.workspace.linux_root.clone(),
+            number,
+        },
+    });
+    state.tab_groups.add(tab_id, group);
+    state.status = "Terminal opened".into();
+    Ok(tab_id)
+}
+
+fn close_tab(state: &mut AppState, tab_id: TabId) {
+    let Some(index) = state.tabs.iter().position(|tab| tab.id == tab_id) else {
         return;
     };
-    match state.documents[index].save(overwrite_external) {
+    if matches!(&state.tabs[index].content, TabContent::File(document) if document.dirty) {
+        state.status = "Save the modified file before closing it".into();
+        return;
+    }
+
+    state.tab_groups.remove(tab_id);
+    state.tabs.remove(index);
+    if state.save_conflict == Some(tab_id) {
+        state.save_conflict = None;
+    }
+    state.status = "Tab closed".into();
+}
+
+fn save_tab(state: &mut AppState, tab_id: TabId, overwrite_external: bool) {
+    let Some(document) = document_mut(state, tab_id) else {
+        return;
+    };
+    match document.save(overwrite_external) {
         Ok(()) => {
             state.status = "Saved".into();
-            state.save_conflict = false;
+            state.save_conflict = None;
             if let Some(monitor) = state.git_monitor.as_mut() {
                 let _ = monitor.force_refresh();
             } else {
@@ -458,26 +621,76 @@ fn save_active(state: &mut AppState, overwrite_external: bool) {
             refresh_tree(state);
         }
         Err(error) => {
-            state.save_conflict = state.documents[index].changed_on_disk();
+            state.save_conflict = document_ref(state, tab_id)
+                .is_some_and(Document::changed_on_disk)
+                .then_some(tab_id);
             state.status = error.to_string();
         }
     }
 }
 
-fn reload_active(state: &mut AppState) {
-    let Some(index) = state.active_document else {
+fn reload_tab(state: &mut AppState, tab_id: TabId) {
+    let Some(document) = document_ref(state, tab_id) else {
         return;
     };
-    let linux_path = state.documents[index].linux_path.clone();
-    let host_path = state.documents[index].host_path.clone();
+    let linux_path = document.linux_path.clone();
+    let host_path = document.host_path.clone();
     match Document::open(linux_path, host_path) {
         Ok(document) => {
-            state.documents[index] = document;
-            state.save_conflict = false;
+            if let Some(target) = document_mut(state, tab_id) {
+                *target = document;
+            }
+            state.save_conflict = None;
             state.status = "Reloaded from disk".into();
         }
         Err(error) => state.status = error.to_string(),
     }
+}
+
+fn take_next_tab_id(state: &mut AppState) -> TabId {
+    let id = state.next_tab_id;
+    state.next_tab_id = state.next_tab_id.wrapping_add(1);
+    id
+}
+
+fn focused_tab_id(state: &AppState) -> Option<TabId> {
+    state.tab_groups.active(state.tab_groups.focused_group())
+}
+
+fn document_ref(state: &AppState, tab_id: TabId) -> Option<&Document> {
+    state.tabs.iter().find_map(|tab| {
+        if tab.id != tab_id {
+            return None;
+        }
+        match &tab.content {
+            TabContent::File(document) => Some(document),
+            TabContent::Terminal { .. } => None,
+        }
+    })
+}
+
+fn document_mut(state: &mut AppState, tab_id: TabId) -> Option<&mut Document> {
+    state.tabs.iter_mut().find_map(|tab| {
+        if tab.id != tab_id {
+            return None;
+        }
+        match &mut tab.content {
+            TabContent::File(document) => Some(document),
+            TabContent::Terminal { .. } => None,
+        }
+    })
+}
+
+fn terminal_ref(state: &AppState, tab_id: TabId) -> Option<&TerminalSession> {
+    state.tabs.iter().find_map(|tab| {
+        if tab.id != tab_id {
+            return None;
+        }
+        match &tab.content {
+            TabContent::Terminal { session, .. } => Some(session),
+            TabContent::File(_) => None,
+        }
+    })
 }
 
 fn refresh_tree(state: &mut AppState) {
@@ -497,49 +710,119 @@ fn sync_ui(ui: &AppWindow, state: &AppState) {
             .into(),
     );
     ui.set_status_text(state.status.clone().into());
-    ui.set_save_conflict(state.save_conflict);
+    ui.set_save_conflict(state.save_conflict.is_some());
+    ui.set_focused_group(state.tab_groups.focused_group() as i32);
     sync_tree(ui, state);
     sync_tabs(ui, state);
-    if let Some(index) = state.active_document {
-        let document = &state.documents[index];
-        ui.set_active_tab(index as i32);
-        state.syncing_editor.set(true);
-        ui.set_editor_text(document.text.clone().into());
-        state.syncing_editor.set(false);
-        ui.set_line_numbers(line_numbers(&document.text).into());
-        ui.set_active_path(document.linux_path.to_string_lossy().to_string().into());
-        sync_highlight(ui, state);
-    } else {
-        ui.set_active_tab(-1);
-        ui.set_editor_text("".into());
-        ui.set_line_numbers("1".into());
-        ui.set_active_path("".into());
-        ui.set_syntax_highlight_enabled(false);
-        ui.set_highlighted_text(slint::StyledText::default());
-    }
-    if let Some(terminal) = &state.terminal {
-        sync_terminal(ui, terminal);
+    sync_group(ui, state, 0);
+    sync_group(ui, state, 1);
+
+    let active_path = focused_tab_id(state)
+        .and_then(|tab_id| state.tabs.iter().find(|tab| tab.id == tab_id))
+        .map(tab_detail)
+        .unwrap_or_default();
+    ui.set_active_path(active_path.into());
+}
+
+fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
+    let active_id = state.tab_groups.active(group);
+    let active_tab = active_id.and_then(|id| state.tabs.iter().find(|tab| tab.id == id));
+
+    match (group, active_tab) {
+        (0, Some(tab)) => {
+            ui.set_primary_active_tab_id(tab.id as i32);
+            ui.set_primary_active_title(tab_title(tab).into());
+            ui.set_primary_active_detail(tab_detail(tab).into());
+            match &tab.content {
+                TabContent::File(document) => {
+                    ui.set_primary_active_kind("file".into());
+                    state.syncing_editor.set(true);
+                    ui.set_editor_text(document.text.clone().into());
+                    state.syncing_editor.set(false);
+                    ui.set_line_numbers(line_numbers(&document.text).into());
+                    sync_highlight_for_document(ui, document, 0);
+                    clear_terminal_group(ui, 0);
+                }
+                TabContent::Terminal { session, .. } => {
+                    ui.set_primary_active_kind("terminal".into());
+                    ui.set_syntax_highlight_enabled(false);
+                    ui.set_highlighted_text(slint::StyledText::default());
+                    sync_terminal(ui, session, 0);
+                }
+            }
+        }
+        (1, Some(tab)) => {
+            ui.set_secondary_active_tab_id(tab.id as i32);
+            ui.set_secondary_active_title(tab_title(tab).into());
+            ui.set_secondary_active_detail(tab_detail(tab).into());
+            match &tab.content {
+                TabContent::File(document) => {
+                    ui.set_secondary_active_kind("file".into());
+                    state.syncing_editor.set(true);
+                    ui.set_secondary_editor_text(document.text.clone().into());
+                    state.syncing_editor.set(false);
+                    ui.set_secondary_line_numbers(line_numbers(&document.text).into());
+                    sync_highlight_for_document(ui, document, 1);
+                    clear_terminal_group(ui, 1);
+                }
+                TabContent::Terminal { session, .. } => {
+                    ui.set_secondary_active_kind("terminal".into());
+                    ui.set_secondary_syntax_highlight_enabled(false);
+                    ui.set_secondary_highlighted_text(slint::StyledText::default());
+                    sync_terminal(ui, session, 1);
+                }
+            }
+        }
+        (0, None) => {
+            ui.set_primary_active_tab_id(-1);
+            ui.set_primary_active_kind("".into());
+            ui.set_primary_active_title("".into());
+            ui.set_primary_active_detail("".into());
+            ui.set_editor_text("".into());
+            ui.set_line_numbers("1".into());
+            ui.set_syntax_highlight_enabled(false);
+            ui.set_highlighted_text(slint::StyledText::default());
+            clear_terminal_group(ui, 0);
+        }
+        (1, None) => {
+            ui.set_secondary_active_tab_id(-1);
+            ui.set_secondary_active_kind("".into());
+            ui.set_secondary_active_title("".into());
+            ui.set_secondary_active_detail("".into());
+            ui.set_secondary_editor_text("".into());
+            ui.set_secondary_line_numbers("1".into());
+            ui.set_secondary_syntax_highlight_enabled(false);
+            ui.set_secondary_highlighted_text(slint::StyledText::default());
+            clear_terminal_group(ui, 1);
+        }
+        _ => {}
     }
 }
 
-fn sync_highlight(ui: &AppWindow, state: &AppState) {
-    let highlighted = state.active_document.and_then(|index| {
-        let document = &state.documents[index];
-        highlight::highlighted(&document.linux_path, &document.text)
-    });
-    match highlighted {
-        Some(text) => {
+fn sync_highlight_for_document(ui: &AppWindow, document: &Document, group: usize) {
+    let highlighted = highlight::highlighted(&document.linux_path, &document.text);
+    match (group, highlighted) {
+        (0, Some(text)) => {
             ui.set_highlighted_text(text);
             ui.set_syntax_highlight_enabled(true);
         }
-        None => {
+        (1, Some(text)) => {
+            ui.set_secondary_highlighted_text(text);
+            ui.set_secondary_syntax_highlight_enabled(true);
+        }
+        (0, None) => {
             ui.set_highlighted_text(slint::StyledText::default());
             ui.set_syntax_highlight_enabled(false);
         }
+        (1, None) => {
+            ui.set_secondary_highlighted_text(slint::StyledText::default());
+            ui.set_secondary_syntax_highlight_enabled(false);
+        }
+        _ => {}
     }
 }
 
-fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession) {
+fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
     let (rows, columns) = terminal.size();
     let cells = terminal
         .cells()
@@ -561,12 +844,59 @@ fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession) {
             column_span: cell.column_span,
         })
         .collect::<Vec<_>>();
-    ui.set_terminal_grid_rows(rows.into());
-    ui.set_terminal_grid_columns(columns.into());
-    ui.set_terminal_cursor_row(terminal.cursor_row());
-    ui.set_terminal_cursor_column(terminal.cursor_column());
-    ui.set_terminal_cells(ModelRc::new(VecModel::from(cells)));
-    ui.set_terminal_update_generation(ui.get_terminal_update_generation().wrapping_add(1));
+    let cells = ModelRc::new(VecModel::from(cells));
+    if group == 0 {
+        ui.set_terminal_grid_rows(rows.into());
+        ui.set_terminal_grid_columns(columns.into());
+        ui.set_terminal_cursor_row(terminal.cursor_row());
+        ui.set_terminal_cursor_column(terminal.cursor_column());
+        ui.set_terminal_cells(cells);
+        ui.set_terminal_update_generation(ui.get_terminal_update_generation().wrapping_add(1));
+    } else {
+        ui.set_secondary_terminal_grid_rows(rows.into());
+        ui.set_secondary_terminal_grid_columns(columns.into());
+        ui.set_secondary_terminal_cursor_row(terminal.cursor_row());
+        ui.set_secondary_terminal_cursor_column(terminal.cursor_column());
+        ui.set_secondary_terminal_cells(cells);
+        ui.set_secondary_terminal_update_generation(
+            ui.get_secondary_terminal_update_generation().wrapping_add(1),
+        );
+    }
+}
+
+fn clear_terminal_group(ui: &AppWindow, group: usize) {
+    let cells = ModelRc::new(VecModel::<TerminalCell>::default());
+    if group == 0 {
+        ui.set_terminal_cells(cells);
+        ui.set_terminal_cursor_row(-1);
+        ui.set_terminal_cursor_column(-1);
+    } else {
+        ui.set_secondary_terminal_cells(cells);
+        ui.set_secondary_terminal_cursor_row(-1);
+        ui.set_secondary_terminal_cursor_column(-1);
+    }
+}
+
+fn tab_title(tab: &WorkspaceTab) -> String {
+    match &tab.content {
+        TabContent::File(document) => document.title(),
+        TabContent::Terminal {
+            start_path, number, ..
+        } => {
+            let directory = start_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("/");
+            format!("Terminal {number} · {directory}")
+        }
+    }
+}
+
+fn tab_detail(tab: &WorkspaceTab) -> String {
+    match &tab.content {
+        TabContent::File(document) => document.linux_path.to_string_lossy().to_string(),
+        TabContent::Terminal { start_path, .. } => start_path.to_string_lossy().to_string(),
+    }
 }
 
 fn sync_tree(ui: &AppWindow, state: &AppState) {
@@ -613,13 +943,31 @@ fn sync_tree(ui: &AppWindow, state: &AppState) {
 }
 
 fn sync_tabs(ui: &AppWindow, state: &AppState) {
+    let focused_id = focused_tab_id(state);
+    let active_index = focused_id
+        .and_then(|id| state.tabs.iter().position(|tab| tab.id == id))
+        .map(|index| index as i32)
+        .unwrap_or(-1);
     let tabs = state
-        .documents
+        .tabs
         .iter()
-        .map(|document| TabEntry {
-            title: document.title().into(),
-            dirty: document.dirty,
+        .map(|tab| {
+            let group = state.tab_groups.group_of(tab.id).unwrap_or(0);
+            TabEntry {
+                id: tab.id as i32,
+                title: tab_title(tab).into(),
+                detail: tab_detail(tab).into(),
+                kind: match tab.content {
+                    TabContent::File(_) => "file",
+                    TabContent::Terminal { .. } => "terminal",
+                }
+                .into(),
+                group: group as i32,
+                active: state.tab_groups.active(group) == Some(tab.id),
+                dirty: matches!(&tab.content, TabContent::File(document) if document.dirty),
+            }
         })
         .collect::<Vec<_>>();
+    ui.set_active_tab(active_index);
     ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
 }

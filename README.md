@@ -21,11 +21,11 @@ full-scale IDE.
 
 - Lazy, expandable file tree with context-aware icons
 - Git status detection across multiple nested repositories
-- Tabbed UTF-8 editor with syntax highlighting, undo/redo, and conflict detection
-- Interactive WSL terminal with ANSI colors, Korean text, and IME input
-- Drag-and-dock editor and terminal panels with resizable horizontal or vertical splits and maximized views
+- Unified file and terminal tabs with shared activation, scrolling, and close controls
+- Multiple independent WSL terminals with ANSI colors, Korean text, IME input, and visible start paths
+- Two drag-and-dock tab groups with resizable horizontal or vertical splits and maximized views
 - WSL-aware CLI arguments and Linux-to-UNC path mapping
-- Headless behavioral Harness for editor, terminal, docking layouts, Git, and UI regressions
+- Headless behavioral Harness for editor isolation, multiple terminals, docking layouts, Git, and UI regressions
 
 ## Actively Evolving
 

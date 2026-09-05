@@ -215,6 +215,17 @@ impl TerminalSession {
     }
 }
 
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if let Some(child) = self._pty_child.as_mut() {
+            let _ = child.kill();
+        }
+        if let Some(child) = self._pipe_child.as_mut() {
+            let _ = child.kill();
+        }
+    }
+}
+
 fn cell_column_span(cell: Option<&vt100::Cell>) -> i32 {
     if cell.is_some_and(vt100::Cell::is_wide_continuation) {
         0

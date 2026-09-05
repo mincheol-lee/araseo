@@ -41,8 +41,8 @@ Measurements use an optimized release build, a warm WSL environment rather than 
 
 - One window and one workspace
 - Directory tree navigation and basic file operations
-- Multiple file tabs and basic text editing
-- One WSL bash terminal
+- Unified file and terminal tabs with basic text editing
+- Multiple independent WSL bash terminals
 - Per-file Git modified and untracked indicators
 - An `araseo [PATH]` launcher for WSL terminals
 - Clear errors and protection against losing unsaved changes
@@ -51,7 +51,7 @@ Measurements use an optimized release build, a warm WSL environment rather than 
 
 - Syntax highlighting, autocomplete, LSP, go to definition, and diagnostics
 - Multiple cursors, minimap, code folding, regular-expression search, and workspace-wide search
-- Multiple workspaces and multiple terminals
+- Multiple workspaces and more than two simultaneous tab groups
 - A dedicated Codex Agent panel and Codex session management
 - Git operation UI such as a diff viewer, staging, committing, and branch switching
 - Extensions, remote accounts, and settings synchronization
@@ -78,7 +78,7 @@ If `PATH` is omitted, the launcher uses the current directory. It converts relat
 
 ### 4.3 Running Codex
 
-1. The user clicks the terminal panel.
+1. The user activates an existing terminal tab or creates one with the new-terminal button.
 2. The user enters `codex` just as they would in their existing WSL shell.
 3. Araseo only relays PTY input/output and the terminal screen. It does not modify the Codex installation, authentication, or configuration.
 
@@ -88,22 +88,23 @@ If `PATH` is omitted, the launcher uses the current directory. It converts relat
 
 ```text
 +------------------+---------------------------------------------+
-| File Tree        | Editor Tabs                                 |
+| File Tree        | Unified File & Terminal Tabs                |
 |                  +---------------------------------------------+
 |                  |                                             |
-|                  | Editor                                      |
+|                  | Tab Group 1                                 |
 |                  |                                             |
 |                  +---------------------------------------------+
-|                  | Terminal                                    |
+|                  | Tab Group 2                                 |
 +------------------+---------------------------------------------+
 | Workspace | Git | Active file | Cursor/encoding | Status       |
 +---------------------------------------------------------------+
 ```
 
-- Keep the file tree fixed on the left while allowing the editor and terminal to be drag-docked above, below, left, or right of each other.
-- Show a live target preview while a panel header is dragged, then dock the panel when it is dropped.
-- Allow either the editor or terminal to fill the work area and restore the previous split layout afterward.
-- Place a draggable splitter between the editor and terminal in both horizontal and vertical layouts, preserving its ratio during the current application session.
+- Keep the file tree fixed on the left and present files and terminals in one shared tab strip.
+- Support at most two tab groups. Each group may display either a file or terminal, and multiple file and terminal tabs may coexist in either group.
+- Show a live target preview while a tab or active group header is dragged, then move that tab to the left, right, top, bottom, or primary group when dropped.
+- Allow either tab group to fill the work area and restore the previous split layout afterward.
+- Place a draggable splitter between the two tab groups in both horizontal and vertical layouts, preserving its ratio during the current application session.
 - Give keyboard focus to the clicked panel. Indicate focus through a border or header state.
 - Use one dark theme and a system monospace font in the first release.
 - Set the minimum window size to 800×600. At smaller sizes, allow the file tree and terminal to collapse.
@@ -153,7 +154,7 @@ When the terminal has focus, forward key combinations used by the shell or Codex
 
 ### 6.3 Integrated Terminal
 
-- FR-TR-01: When a workspace opens, the application shall create one ConPTY session and start a login shell with semantics equivalent to the following command:
+- FR-TR-01: When a workspace opens, the application shall create an initial terminal tab. Each terminal tab shall own an independent ConPTY session and start a login shell with semantics equivalent to the following command:
 
   ```text
   wsl.exe -d <distro> --cd <linux-workspace-root> bash -l
@@ -166,6 +167,8 @@ When the terminal has focus, forward key combinations used by the shell or Codex
 - FR-TR-06: Dragging shall perform local text selection by default. When the running application requests mouse reporting, ordinary clicks and wheel events shall be forwarded while `Shift+drag` remains available for local selection.
 - FR-TR-07: If the shell exits, the terminal shall display its exit code and provide a `Restart` action.
 - FR-TR-08: On application exit, Araseo shall close PTY input and wait for the child process to terminate, then clean up any remaining host process after a timeout.
+- FR-TR-09: The user shall be able to create and close multiple terminal tabs. Closing one terminal tab shall terminate only its PTY session.
+- FR-TR-10: A terminal tab shall show its starting directory in the active group header and a shortened directory label in the shared tab strip.
 
 ### 6.4 Git Status
 
@@ -337,12 +340,12 @@ The UI consumes read-only view models of this state and sends explicit command c
 
 ### MVP
 
-Complete the file tree, basic editor, single terminal, Git status indicators, and `araseo .` launch flow defined in this document.
+Complete the file tree, basic editor, unified file/terminal tabs, Git status indicators, and `araseo .` launch flow defined in this document.
 
 ### Phase 2 Candidates
 
 - Tree-sitter-based syntax highlighting
-- Multiple terminal tabs
+- Persist tab groups and split ratios between application sessions
 - Read-only Git diff viewer
 - Persistence for recent workspaces and basic UI settings
 
