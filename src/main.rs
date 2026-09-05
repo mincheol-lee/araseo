@@ -943,17 +943,12 @@ fn sync_tree(ui: &AppWindow, state: &AppState) {
 }
 
 fn sync_tabs(ui: &AppWindow, state: &AppState) {
-    let focused_id = focused_tab_id(state);
-    let active_index = focused_id
-        .and_then(|id| state.tabs.iter().position(|tab| tab.id == id))
-        .map(|index| index as i32)
-        .unwrap_or(-1);
-    let tabs = state
-        .tabs
-        .iter()
-        .map(|tab| {
-            let group = state.tab_groups.group_of(tab.id).unwrap_or(0);
-            TabEntry {
+    let tabs_for_group = |group| {
+        state
+            .tabs
+            .iter()
+            .filter(|tab| state.tab_groups.group_of(tab.id) == Some(group))
+            .map(|tab| TabEntry {
                 id: tab.id as i32,
                 title: tab_title(tab).into(),
                 detail: tab_detail(tab).into(),
@@ -965,9 +960,9 @@ fn sync_tabs(ui: &AppWindow, state: &AppState) {
                 group: group as i32,
                 active: state.tab_groups.active(group) == Some(tab.id),
                 dirty: matches!(&tab.content, TabContent::File(document) if document.dirty),
-            }
-        })
-        .collect::<Vec<_>>();
-    ui.set_active_tab(active_index);
-    ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
+            })
+            .collect::<Vec<_>>()
+    };
+    ui.set_primary_tabs(ModelRc::new(VecModel::from(tabs_for_group(0))));
+    ui.set_secondary_tabs(ModelRc::new(VecModel::from(tabs_for_group(1))));
 }

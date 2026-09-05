@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn mouse_selection_is_visible_to_the_editor_and_control_c_copies_it() {
-        let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         window.set_size(PhysicalSize::new(1200, 800));
         let clipboard = Rc::new(RefCell::new(String::new()));
         slint::platform::set_platform(Box::new(TestPlatform {
@@ -105,7 +105,7 @@ mod tests {
             title_logo_pixels > 20 && title_accent_pixels > 2,
             "new Araseo icon is not visible in the title bar (light={title_logo_pixels}, accent={title_accent_pixels})"
         );
-        ui.set_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
             id: 0,
             title: "sample.js".into(),
             detail: "/workspace/sample.js".into(),
@@ -124,7 +124,6 @@ mod tests {
             git_mark: "".into(),
             project_kind: "local".into(),
         }])));
-        ui.set_active_tab(0);
         ui.set_primary_active_tab_id(0);
         ui.set_primary_active_kind("file".into());
         ui.set_primary_active_title("sample.js".into());
@@ -188,9 +187,25 @@ mod tests {
         });
         ui.show().unwrap();
         let populated_ui = render(&window);
+        write_snapshot_if_requested("single-editor.png", &populated_ui);
 
-        // The title/tab strip must start after the 250px file sidebar.
-        dispatch_click(&ui, 150.0, 17.0);
+        assert!(
+            ui.get_primary_group_visible() && !ui.get_secondary_group_visible(),
+            "a single tab unexpectedly reserved space for an empty second pane"
+        );
+        assert!(
+            ui.get_primary_group_width() > 900.0 && ui.get_primary_group_height() > 700.0,
+            "the initial pane did not fill the workspace"
+        );
+        assert!(
+            ui.get_primary_editor_surface_width() > 850.0
+                && ui.get_primary_editor_surface_height() > 650.0,
+            "the editor surface used only part of the initial pane"
+        );
+
+        // Orca-style tabs belong to their pane, below the window title bar.
+        // The file tree must remain a separate fixed sidebar.
+        dispatch_click(&ui, 150.0, 51.0);
         assert_eq!(
             *activated_tab.borrow(),
             None,
@@ -223,7 +238,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerMoved {
-                position: LogicalPosition::new(340.0, 17.0),
+                position: LogicalPosition::new(340.0, 51.0),
             },
         );
         let after_close_hover = render(&window);
@@ -234,7 +249,7 @@ mod tests {
             .filter(|(index, (before, after))| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (320..360).contains(&x) && y < 34 && before != after
+                (320..360).contains(&x) && (34..70).contains(&y) && before != after
             })
             .count();
         assert!(
@@ -253,11 +268,11 @@ mod tests {
                 dirty: index == 4,
             })
             .collect::<Vec<_>>();
-        ui.set_tabs(ModelRc::new(VecModel::from(many_tabs)));
-        ui.set_active_tab(15);
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(many_tabs)));
+        ui.set_primary_active_tab_id(15);
         let before_window_control_hover = render(&window);
         assert!(
-            ui.get_tab_scroll_offset() < 0.0,
+            ui.get_primary_tab_scroll_offset() < 0.0,
             "the newest active tab was not scrolled into view"
         );
         dispatch_pointer(
@@ -281,83 +296,58 @@ mod tests {
             changed_maximize_pixels > 100,
             "file tabs pushed the fixed maximize control out of the visible window"
         );
-        ui.set_active_tab(0);
+        ui.set_primary_active_tab_id(0);
         render(&window);
         assert!(
-            ui.get_tab_scroll_offset().abs() < 0.1,
+            ui.get_primary_tab_scroll_offset().abs() < 0.1,
             "activating the first tab did not scroll it back into view"
         );
 
         ui.window().dispatch_event(WindowEvent::PointerScrolled {
-            position: LogicalPosition::new(500.0, 17.0),
+            position: LogicalPosition::new(500.0, 51.0),
             delta_x: 0.0,
             delta_y: -120.0,
         });
         assert!(
-            ui.get_tab_scroll_offset() < 0.0,
+            ui.get_primary_tab_scroll_offset() < 0.0,
             "mouse wheel over the tab strip did not scroll hidden tabs into reach"
         );
 
-        dispatch_click(&ui, 976.0, 17.0);
-        dispatch_click(&ui, 1008.0, 17.0);
-        assert_eq!(
-            cycled_tabs.borrow().as_slice(),
-            &[-1, 1],
-            "fixed previous/next tab controls did not request navigation"
-        );
-
-        dispatch_click(&ui, 1042.0, 17.0);
-        assert!(ui.get_tab_list_visible(), "open-editors list did not open");
-        dispatch_click(&ui, 800.0, 119.0);
-        assert_eq!(
-            *activated_tab.borrow(),
-            Some(1),
-            "selecting an item in the open-editors list activated the wrong tab"
-        );
-        assert!(
-            !ui.get_tab_list_visible(),
-            "open-editors list remained visible after choosing a file"
-        );
-
-        dispatch_click(&ui, 940.0, 17.0);
+        dispatch_click(&ui, 1146.0, 51.0);
         assert_eq!(
             terminal_groups.borrow().as_slice(),
             &[0],
-            "the title-bar terminal button did not request a terminal in the focused group"
+            "the primary pane terminal button did not request a terminal in its group"
         );
 
-        let mixed_tabs = vec![
-            TabEntry {
-                id: 50,
-                title: "main.rs".into(),
-                detail: "/workspace/src/main.rs".into(),
-                kind: "file".into(),
-                group: 0,
-                active: true,
-                dirty: false,
-            },
-            TabEntry {
-                id: 51,
-                title: "Terminal · agent_ide".into(),
-                detail: "/home/minch/agent_ide".into(),
-                kind: "terminal".into(),
-                group: 1,
-                active: true,
-                dirty: false,
-            },
-        ];
-        ui.set_tabs(ModelRc::new(VecModel::from(mixed_tabs)));
-        ui.set_active_tab(0);
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 50,
+            title: "main.rs".into(),
+            detail: "/workspace/src/main.rs".into(),
+            kind: "file".into(),
+            group: 0,
+            active: true,
+            dirty: false,
+        }])));
+        ui.set_secondary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 51,
+            title: "Terminal 1 · agent_ide".into(),
+            detail: "/home/minch/agent_ide".into(),
+            kind: "terminal".into(),
+            group: 1,
+            active: true,
+            dirty: false,
+        }])));
         ui.set_primary_active_tab_id(50);
         ui.set_primary_active_kind("file".into());
         ui.set_primary_active_title("main.rs".into());
         ui.set_secondary_active_tab_id(51);
         ui.set_secondary_active_kind("terminal".into());
-        ui.set_secondary_active_title("Terminal · agent_ide".into());
+        ui.set_secondary_active_title("Terminal 1 · agent_ide".into());
         ui.set_secondary_active_detail("/home/minch/agent_ide".into());
         render(&window);
 
-        dispatch_click(&ui, 400.0, 17.0);
+        dispatch_click(&ui, 300.0, 520.0);
         assert_eq!(
             *activated_tab.borrow(),
             Some(51),
@@ -367,7 +357,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(280.0, 17.0),
+                position: LogicalPosition::new(280.0, 51.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -392,23 +382,24 @@ mod tests {
         );
         assert_eq!(ui.get_workspace_layout(), 3);
 
-        ui.set_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
             id: 51,
-            title: "Terminal · agent_ide".into(),
+            title: "Terminal 1 · agent_ide".into(),
             detail: "/home/minch/agent_ide".into(),
             kind: "terminal".into(),
             group: 0,
             active: true,
             dirty: false,
         }])));
-        ui.set_active_tab(-1);
+        ui.set_primary_active_tab_id(-1);
         render(&window);
-        ui.set_active_tab(0);
+        ui.set_primary_active_tab_id(51);
+        ui.set_secondary_tabs(ModelRc::new(VecModel::from(Vec::<TabEntry>::new())));
         ui.set_secondary_active_tab_id(-1);
         render(&window);
-        assert!(ui.get_tab_scroll_offset().abs() < 0.1);
+        assert!(ui.get_primary_tab_scroll_offset().abs() < 0.1);
         for x in (380..470).step_by(4) {
-            dispatch_click(&ui, x as f32, 17.0);
+            dispatch_click(&ui, x as f32, 51.0);
             if !closed_tabs.borrow().is_empty() {
                 break;
             }
@@ -421,6 +412,25 @@ mod tests {
 
         // The file tree is fixed while either tab group can occupy any edge,
         // share either axis, or take over the entire workspace.
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 50,
+            title: "main.rs".into(),
+            detail: "/workspace/src/main.rs".into(),
+            kind: "file".into(),
+            group: 0,
+            active: true,
+            dirty: false,
+        }])));
+        ui.set_secondary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 51,
+            title: "Terminal 1 · agent_ide".into(),
+            detail: "/home/minch/agent_ide".into(),
+            kind: "terminal".into(),
+            group: 1,
+            active: true,
+            dirty: false,
+        }])));
+        ui.set_primary_active_tab_id(50);
         ui.set_secondary_active_tab_id(51);
         ui.set_secondary_active_kind("terminal".into());
         ui.set_secondary_active_title("agent_ide".into());
@@ -443,7 +453,7 @@ mod tests {
             Some(&(51, "둘".to_string())),
             "terminal text was routed to the wrong tab"
         );
-        dispatch_click(&ui, 940.0, 17.0);
+        dispatch_click(&ui, 1146.0, 528.0);
         assert_eq!(
             terminal_groups.borrow().as_slice(),
             &[0, 1],
@@ -454,6 +464,58 @@ mod tests {
         assert!(
             ui.get_primary_group_y() < ui.get_secondary_group_y(),
             "default layout did not place the primary group above the secondary group"
+        );
+
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(300.0, 51.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(700.0, 550.0),
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(700.0, 550.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert_eq!(
+            docked_tabs.borrow().last(),
+            Some(&(50, 5)),
+            "dropping a tab onto the secondary pane did not target that pane"
+        );
+
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(300.0, 528.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(700.0, 300.0),
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(700.0, 300.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert_eq!(
+            docked_tabs.borrow().last(),
+            Some(&(51, 4)),
+            "dropping a tab onto the primary pane did not target that pane"
         );
 
         ui.set_workspace_layout(1);
@@ -474,7 +536,8 @@ mod tests {
 
         ui.set_workspace_layout(3);
         ui.set_panel_split_ratio(0.5);
-        render(&window);
+        let split_ui = render(&window);
+        write_snapshot_if_requested("split-file-terminal.png", &split_ui);
         assert_eq!(ui.get_workspace_layout(), 3);
         assert!(
             ui.get_primary_group_x() < ui.get_secondary_group_x(),
@@ -543,7 +606,7 @@ mod tests {
         assert_eq!(
             ui.get_workspace_layout(),
             0,
-            "clicking a panel header without dragging changed the layout"
+            "clicking a pane tab bar without dragging changed the layout"
         );
         dispatch_pointer(
             &ui,
@@ -600,15 +663,15 @@ mod tests {
             "secondary-group maximize did not fill the workspace"
         );
 
-        // Exercise both production header drag handlers, not only the public
-        // layout function. First drag the terminal to the top.
+        // Exercise both production pane-local tab drag handlers. First drag
+        // the terminal tab from the secondary pane to the top edge.
         ui.set_workspace_layout(0);
         ui.set_panel_split_ratio(0.64);
         render(&window);
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(600.0, 520.0),
+                position: LogicalPosition::new(300.0, 528.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -628,7 +691,7 @@ mod tests {
         assert_eq!(
             ui.get_workspace_layout(),
             1,
-            "dragging the terminal header to the top did not dock it there"
+            "dragging the secondary pane's terminal tab to the top did not dock it there"
         );
 
         // Then drag the editor to the right and render the live preview before
@@ -638,7 +701,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(600.0, 48.0),
+                position: LogicalPosition::new(300.0, 51.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -676,8 +739,8 @@ mod tests {
         let before_editor_selection = render(&window);
 
         // The editor starts after the 250px tree and 48px line-number gutter.
-        // Its draggable panel header occupies the first 28px of the workspace.
-        // Drag across a portion of the first source line below that header.
+        // Its pane-local tab bar occupies the first 36px of the workspace.
+        // Drag across a portion of the first source line below that tab bar.
         dispatch_pointer(&ui, WindowEvent::PointerPressed {
             position: LogicalPosition::new(320.0, 78.0),
             button: PointerEventButton::Left,
@@ -806,6 +869,16 @@ mod tests {
 
         // The first shell prompt starts on row zero. Do not jump to the bottom
         // of a taller VT screen and hide it before the user enters a command.
+        ui.set_secondary_tabs(ModelRc::new(VecModel::from(Vec::<TabEntry>::new())));
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 1,
+            title: "Terminal 1 · agent_ide".into(),
+            detail: "/home/minch/agent_ide".into(),
+            kind: "terminal".into(),
+            group: 0,
+            active: true,
+            dirty: false,
+        }])));
         ui.set_secondary_active_tab_id(-1);
         ui.set_primary_active_tab_id(1);
         ui.set_primary_active_kind("terminal".into());
@@ -816,7 +889,22 @@ mod tests {
         ui.set_terminal_grid_rows(40);
         ui.set_terminal_cursor_row(0);
         ui.set_terminal_update_generation(ui.get_terminal_update_generation() + 1);
-        render(&window);
+        let terminal_ui = render(&window);
+        write_snapshot_if_requested("single-terminal.png", &terminal_ui);
+        assert!(
+            ui.get_primary_terminal_surface_width() > 900.0
+                && ui.get_primary_terminal_surface_height() > 650.0,
+            "the terminal surface remained a small intrinsic-size window instead of filling its pane"
+        );
+        assert!(
+            ui.get_terminal_columns() > 100.0 && ui.get_terminal_rows() > 30.0,
+            "the PTY size was not derived from the full terminal pane"
+        );
+        assert_eq!(
+            ui.get_editor_selection_length(),
+            0,
+            "file-selection status leaked into the active terminal tab"
+        );
         assert!(
             ui.get_terminal_scroll_offset().abs() < 0.1,
             "the initial terminal prompt was scrolled out of view"
@@ -857,6 +945,78 @@ mod tests {
 
     fn dispatch_pointer(ui: &AppWindow, event: WindowEvent) {
         ui.window().dispatch_event(event);
+    }
+
+    fn write_snapshot_if_requested(name: &str, pixels: &[TestPixel]) {
+        let Ok(directory) = std::env::var("ARASEO_UI_SNAPSHOT_DIR") else {
+            return;
+        };
+        let directory = Path::new(&directory);
+        std::fs::create_dir_all(directory).unwrap();
+        let width = 1200u32;
+        let height = 800u32;
+        let mut raw = Vec::with_capacity((width * height * 3 + height) as usize);
+        for row in pixels.chunks_exact(width as usize) {
+            raw.push(0);
+            for pixel in row {
+                raw.extend_from_slice(&[pixel.red, pixel.green, pixel.blue]);
+            }
+        }
+
+        let mut zlib = vec![0x78, 0x01];
+        let mut remaining = raw.as_slice();
+        while !remaining.is_empty() {
+            let block_length = remaining.len().min(u16::MAX as usize);
+            let final_block = block_length == remaining.len();
+            zlib.push(u8::from(final_block));
+            let length = block_length as u16;
+            zlib.extend_from_slice(&length.to_le_bytes());
+            zlib.extend_from_slice(&(!length).to_le_bytes());
+            zlib.extend_from_slice(&remaining[..block_length]);
+            remaining = &remaining[block_length..];
+        }
+        zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut header = Vec::with_capacity(13);
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[8, 2, 0, 0, 0]);
+        append_png_chunk(&mut png, b"IHDR", &header);
+        append_png_chunk(&mut png, b"IDAT", &zlib);
+        append_png_chunk(&mut png, b"IEND", &[]);
+        std::fs::write(directory.join(name), png).unwrap();
+    }
+
+    fn adler32(bytes: &[u8]) -> u32 {
+        let mut a = 1u32;
+        let mut b = 0u32;
+        for byte in bytes {
+            a = (a + u32::from(*byte)) % 65_521;
+            b = (b + a) % 65_521;
+        }
+        (b << 16) | a
+    }
+
+    fn append_png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(kind.len() + data.len());
+        crc_input.extend_from_slice(kind);
+        crc_input.extend_from_slice(data);
+        png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
     }
 
     fn dispatch_click(ui: &AppWindow, x: f32, y: f32) {

@@ -54,6 +54,8 @@ impl TabGroups {
         let Some(source_group) = self.group_of(id) else {
             return false;
         };
+        // Edge zones 0..=3 use the secondary pane. Body zones 4 and 5
+        // explicitly target the primary and secondary pane, respectively.
         let target_group = if zone == 4 || self.placements.len() < 2 {
             0
         } else {
@@ -62,6 +64,7 @@ impl TabGroups {
 
         if source_group == 0
             && target_group == 1
+            && zone != 5
             && self.group_ids(0).len() == 1
             && self.has_secondary()
         {
@@ -212,5 +215,19 @@ mod tests {
         groups.dock(2, 4);
         assert!(!groups.has_secondary());
         assert_eq!(groups.active(0), Some(2));
+    }
+
+    #[test]
+    fn dropping_the_last_primary_tab_onto_secondary_merges_the_panes() {
+        let mut groups = TabGroups::default();
+        groups.add(1, 0);
+        groups.add(2, 1);
+        groups.add(3, 1);
+
+        assert!(groups.dock(1, 5));
+        assert!(!groups.has_secondary());
+        assert_eq!(groups.group_ids(0), vec![1, 2, 3]);
+        assert_eq!(groups.active(0), Some(1));
+        assert_eq!(groups.focused_group(), 0);
     }
 }

@@ -32,6 +32,8 @@ export struct TerminalCell {
 
 component WorkspaceGroup inherits Rectangle {
     in property <int> group-id: 0;
+    in property <[TabEntry]> tabs;
+    in property <bool> focused: false;
     in property <int> active-tab-id: -1;
     in property <string> active-kind: "";
     in property <string> active-title: "";
@@ -54,6 +56,11 @@ component WorkspaceGroup inherits Rectangle {
     out property <length> terminal-scroll-offset: terminal-scroll.viewport-y;
     out property <bool> terminal-ime-active: terminal-ime-input.has-focus;
     out property <string> terminal-ime-buffer: terminal-ime-input.text;
+    out property <length> tab-scroll-offset: group-tabs-flickable.viewport-x;
+    out property <length> editor-surface-width: file-layer.width;
+    out property <length> editor-surface-height: file-layer.height;
+    out property <length> terminal-surface-width: terminal-scroll.width;
+    out property <length> terminal-surface-height: terminal-scroll.height;
     out property <int> editor-selection-length: self.editor-selection-cursor >= self.editor-selection-anchor
         ? self.editor-selection-cursor - self.editor-selection-anchor
         : self.editor-selection-anchor - self.editor-selection-cursor;
@@ -70,6 +77,9 @@ component WorkspaceGroup inherits Rectangle {
     callback find-visibility-requested(int, bool);
     callback terminal-key(int, string, bool, bool, bool);
     callback terminal-text(int, string);
+    callback tab-activated(int);
+    callback tab-close(int);
+    callback new-terminal-requested(int);
     callback group-focused(int);
     callback toggle-maximize(int);
     callback tab-drag-moved(int, length, length);
@@ -78,6 +88,24 @@ component WorkspaceGroup inherits Rectangle {
 
     public function focus-terminal() {
         terminal-ime-input.focus();
+    }
+
+    function reveal-tab(tab-x: length, tab-width: length) {
+        if (tab-x + group-tabs-flickable.viewport-x < 0px) {
+            group-tabs-flickable.viewport-x = -tab-x;
+        } else if (tab-x + tab-width + group-tabs-flickable.viewport-x > group-tabs-flickable.width) {
+            group-tabs-flickable.viewport-x = group-tabs-flickable.width - tab-x - tab-width;
+        }
+    }
+
+    function scroll-tabs(delta-x: length, delta-y: length) {
+        if (group-tabs-flickable.viewport-width <= group-tabs-flickable.width) {
+            return;
+        }
+        group-tabs-flickable.viewport-x = max(
+            group-tabs-flickable.width - group-tabs-flickable.viewport-width,
+            min(0px, group-tabs-flickable.viewport-x + (delta-x != 0px ? delta-x : delta-y))
+        );
     }
 
     function show-copy-feedback() {
@@ -100,75 +128,188 @@ component WorkspaceGroup inherits Rectangle {
     VerticalLayout {
         spacing: 0px;
 
-        Rectangle {
-            height: 30px;
-            background: group-header-drag.pressed ? #343944
-                : (group-header-drag.has-hover ? #2b2f37 : #24272e);
-            Text {
-                x: 9px;
-                width: parent.width - 52px;
-                text: root.active-kind == "terminal"
-                    ? ">_  " + root.active-detail
-                    : (root.active-kind == "file" ? "FILE  ·  " + root.active-title : "EMPTY GROUP");
-                color: root.active-kind == "terminal" ? #82c7ff : #bbc0ca;
-                font-family: root.active-kind == "terminal" ? "Cascadia Mono" : "Geist";
-                font-size: 11px;
-                vertical-alignment: center;
-                overflow: elide;
-            }
-            group-header-drag := TouchArea {
-                private property <length> press-x: 0px;
-                private property <length> press-y: 0px;
-                width: parent.width - 38px;
-                enabled: root.active-tab-id >= 0;
-                mouse-cursor: move;
-                moved => {
-                    if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
-                        && abs(self.mouse-y - self.press-y) < 5px)) {
-                        return;
-                    }
-                    root.tab-drag-moved(
-                        root.active-tab-id,
-                        self.absolute-position.x + self.mouse-x,
-                        self.absolute-position.y + self.mouse-y
-                    );
-                }
-                pointer-event(event) => {
-                    if (event.kind == PointerEventKind.down) {
-                        self.press-x = self.mouse-x;
-                        self.press-y = self.mouse-y;
-                        root.group-focused(root.group-id);
-                    } else if (event.kind == PointerEventKind.up) {
-                        root.tab-drag-released(root.active-tab-id);
-                    } else if (event.kind == PointerEventKind.cancel) {
-                        root.tab-drag-cancelled();
-                    }
-                }
-                double-clicked => { root.toggle-maximize(root.group-id); }
-            }
+        pane-tab-bar := Rectangle {
+            height: 36px;
+            background: #202329;
+            border-width: 1px;
+            border-color: root.focused ? #3d5268 : #2b2f36;
+
             Rectangle {
-                x: parent.width - 36px;
-                width: 36px;
-                height: parent.height;
-                border-radius: 3px;
-                background: group-maximize-touch.has-hover ? #3a3f48 : transparent;
-                Text {
-                    text: "□";
-                    color: #d7dae0;
-                    font-family: "Segoe UI Symbol";
-                    font-size: 17px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: 2px;
+                background: root.focused ? #5ca8e6 : transparent;
+            }
+
+            HorizontalLayout {
+                y: 2px;
+                height: parent.height - 2px;
+                spacing: 1px;
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    clip: true;
+
+                    group-tabs-flickable := Flickable {
+                        width: parent.width;
+                        height: parent.height;
+                        viewport-width: max(self.width, group-tabs-row.preferred-width);
+                        viewport-height: self.height;
+                        interactive: false;
+
+                        group-tabs-row := HorizontalLayout {
+                            width: group-tabs-flickable.viewport-width;
+                            height: group-tabs-flickable.height;
+                            spacing: 1px;
+
+                            for tab in root.tabs: Rectangle {
+                                private property <bool> active: tab.id == root.active-tab-id;
+                                width: min(210px, max(108px, local-tab-title.preferred-width + 48px));
+                                background: self.active ? #1e1e1e
+                                    : (local-tab-touch.has-hover || local-tab-close-touch.has-hover ? #30343c : #25282f);
+                                border-width: self.active ? 1px : 0px;
+                                border-color: root.focused ? #3a4655 : #30343b;
+
+                                changed active => {
+                                    if (self.active) { root.reveal-tab(self.x, self.width); }
+                                }
+                                changed x => {
+                                    if (self.active) { root.reveal-tab(self.x, self.width); }
+                                }
+
+                                local-tab-title := Text {
+                                    x: 9px;
+                                    width: parent.width - 43px;
+                                    text: (tab.kind == "terminal" ? ">_ " : "") + tab.title
+                                        + (tab.dirty ? " ●" : "");
+                                    color: tab.kind == "terminal" ? #82c7ff
+                                        : (parent.active ? #f1f1f1 : #aeb4bf);
+                                    font-family: tab.kind == "terminal" ? "Cascadia Mono" : "Geist";
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+
+                                local-tab-touch := TouchArea {
+                                    private property <length> press-x: 0px;
+                                    private property <length> press-y: 0px;
+                                    width: parent.width - 32px;
+                                    mouse-cursor: move;
+                                    moved => {
+                                        if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
+                                            && abs(self.mouse-y - self.press-y) < 5px)) {
+                                            return;
+                                        }
+                                        root.tab-drag-moved(
+                                            tab.id,
+                                            self.absolute-position.x + self.mouse-x,
+                                            self.absolute-position.y + self.mouse-y
+                                        );
+                                    }
+                                    pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down) {
+                                            self.press-x = self.mouse-x;
+                                            self.press-y = self.mouse-y;
+                                            root.group-focused(root.group-id);
+                                        } else if (event.kind == PointerEventKind.up) {
+                                            root.tab-drag-released(tab.id);
+                                        } else if (event.kind == PointerEventKind.cancel) {
+                                            root.tab-drag-cancelled();
+                                        }
+                                    }
+                                    clicked => { root.tab-activated(tab.id); }
+                                    scroll-event(event) => {
+                                        root.scroll-tabs(event.delta-x, event.delta-y);
+                                        return accept;
+                                    }
+                                }
+
+                                Rectangle {
+                                    x: parent.width - 30px;
+                                    y: 3px;
+                                    width: 27px;
+                                    height: 27px;
+                                    border-radius: 4px;
+                                    background: local-tab-close-touch.has-hover ? #454a54 : transparent;
+                                    Text {
+                                        text: "×";
+                                        color: local-tab-close-touch.has-hover ? #ffffff : #abb0ba;
+                                        font-family: "Segoe UI Symbol";
+                                        font-size: 18px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    local-tab-close-touch := TouchArea {
+                                        clicked => { root.tab-close(tab.id); }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                background: #202329;
+                                blank-tab-bar-touch := TouchArea {
+                                    clicked => { root.group-focused(root.group-id); }
+                                    double-clicked => { root.toggle-maximize(root.group-id); }
+                                    scroll-event(event) => {
+                                        root.scroll-tabs(event.delta-x, event.delta-y);
+                                        return accept;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                group-maximize-touch := TouchArea {
-                    clicked => { root.toggle-maximize(root.group-id); }
+
+                Rectangle {
+                    width: 38px;
+                    background: group-new-terminal-touch.has-hover ? #343943 : transparent;
+                    Text {
+                        text: ">_+";
+                        color: #82c7ff;
+                        font-family: "Cascadia Mono";
+                        font-size: 12px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    group-new-terminal-touch := TouchArea {
+                        clicked => {
+                            root.group-focused(root.group-id);
+                            root.new-terminal-requested(root.group-id);
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 34px;
+                    background: group-maximize-touch.has-hover ? #343943 : transparent;
+                    Text {
+                        text: "□";
+                        color: #d7dae0;
+                        font-family: "Segoe UI Symbol";
+                        font-size: 17px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    group-maximize-touch := TouchArea {
+                        clicked => { root.toggle-maximize(root.group-id); }
+                    }
                 }
             }
         }
 
-        if root.active-kind == "file": Rectangle {
+        content-stack := Rectangle {
             horizontal-stretch: 1;
             vertical-stretch: 1;
+            background: #181a1f;
+            clip: true;
+
+        file-layer := Rectangle {
+            visible: root.active-kind == "file";
+            width: parent.width;
+            height: parent.height;
             background: #1e1e1e;
 
             VerticalLayout {
@@ -351,10 +492,17 @@ component WorkspaceGroup inherits Rectangle {
 
         terminal-focus := FocusScope {
             visible: root.active-kind == "terminal";
-            horizontal-stretch: 1;
-            vertical-stretch: 1;
+            width: parent.width;
+            height: parent.height;
             focus-on-click: true;
+            Rectangle {
+                width: parent.width;
+                height: parent.height;
+                background: #0f1115;
+            }
             terminal-scroll := ScrollView {
+                width: parent.width;
+                height: parent.height;
                 viewport-width: max(self.visible-width, root.terminal-grid-columns * 8px);
                 viewport-height: max(self.visible-height, root.terminal-grid-rows * 18px);
                 viewport-x: 0px;
@@ -453,8 +601,8 @@ component WorkspaceGroup inherits Rectangle {
         }
 
         if root.active-kind == "": Rectangle {
-            horizontal-stretch: 1;
-            vertical-stretch: 1;
+            width: parent.width;
+            height: parent.height;
             background: #181a1f;
             Text {
                 text: "Drop a file or terminal tab here";
@@ -462,6 +610,7 @@ component WorkspaceGroup inherits Rectangle {
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
+        }
         }
     }
 }
@@ -482,7 +631,8 @@ export component AppWindow inherits Window {
 
     in property <string> workspace-name: "No workspace";
     in property <[TreeEntry]> tree-entries;
-    in property <[TabEntry]> tabs;
+    in property <[TabEntry]> primary-tabs;
+    in property <[TabEntry]> secondary-tabs;
     in-out property <string> editor-text;
     in property <styled-text> highlighted-text;
     in property <bool> syntax-highlight-enabled: false;
@@ -520,8 +670,12 @@ export component AppWindow inherits Window {
     out property <length> secondary-terminal-scroll-offset: secondary-view.terminal-scroll-offset;
     out property <bool> secondary-terminal-ime-active: secondary-view.terminal-ime-active;
     out property <string> secondary-terminal-ime-buffer: secondary-view.terminal-ime-buffer;
-    out property <length> tab-scroll-offset: tabs-flickable.viewport-x;
-    in property <int> active-tab: -1;
+    out property <length> primary-tab-scroll-offset: primary-view.tab-scroll-offset;
+    out property <length> secondary-tab-scroll-offset: secondary-view.tab-scroll-offset;
+    out property <length> primary-editor-surface-width: primary-view.editor-surface-width;
+    out property <length> primary-editor-surface-height: primary-view.editor-surface-height;
+    out property <length> primary-terminal-surface-width: primary-view.terminal-surface-width;
+    out property <length> primary-terminal-surface-height: primary-view.terminal-surface-height;
     in property <int> primary-active-tab-id: -1;
     in property <string> primary-active-kind: "";
     in property <string> primary-active-title: "";
@@ -531,12 +685,13 @@ export component AppWindow inherits Window {
     in property <string> secondary-active-title: "";
     in property <string> secondary-active-detail: "";
     in-out property <int> focused-group: 0;
-    in-out property <bool> tab-list-visible: false;
     in-out property <bool> find-visible: false;
     out property <int> editor-selection-length: root.focused-group == 1
-        ? secondary-view.editor-selection-length : primary-view.editor-selection-length;
+        ? (root.secondary-active-kind == "file" ? secondary-view.editor-selection-length : 0)
+        : (root.primary-active-kind == "file" ? primary-view.editor-selection-length : 0);
     out property <bool> copy-feedback-active: root.focused-group == 1
-        ? secondary-view.copy-feedback-active : primary-view.copy-feedback-active;
+        ? (root.secondary-active-kind == "file" && secondary-view.copy-feedback-active)
+        : (root.primary-active-kind == "file" && primary-view.copy-feedback-active);
     in-out property <int> workspace-layout: 0;
     in-out property <float> panel-split-ratio: 0.64;
     out property <length> primary-group-x: primary-view.x;
@@ -553,7 +708,7 @@ export component AppWindow inherits Window {
     private property <int> dragging-tab: -1;
     private property <int> dock-preview: -1;
     private property <int> restore-layout: 0;
-    private property <bool> has-secondary-group: root.secondary-active-tab-id >= 0;
+    private property <bool> has-secondary-group: root.secondary-tabs.length > 0;
 
     callback tree-activated(int);
     callback tab-activated(int);
@@ -574,24 +729,6 @@ export component AppWindow inherits Window {
     callback tab-dock-requested(int, int);
     callback focused-group-changed(int);
     callback window-drag-requested();
-
-    function reveal-tab(tab-x: length, tab-width: length) {
-        if (tab-x + tabs-flickable.viewport-x < 0px) {
-            tabs-flickable.viewport-x = -tab-x;
-        } else if (tab-x + tab-width + tabs-flickable.viewport-x > tabs-flickable.width) {
-            tabs-flickable.viewport-x = tabs-flickable.width - tab-x - tab-width;
-        }
-    }
-
-    function scroll-tabs(delta-x: length, delta-y: length) {
-        if (tabs-flickable.viewport-width <= tabs-flickable.width) {
-            return;
-        }
-        tabs-flickable.viewport-x = max(
-            tabs-flickable.width - tabs-flickable.viewport-width,
-            min(0px, tabs-flickable.viewport-x + (delta-x != 0px ? delta-x : delta-y))
-        );
-    }
 
     public function focus-terminal() {
         if (root.focused-group == 1) {
@@ -625,6 +762,10 @@ export component AppWindow inherits Window {
             root.dock-preview = 2;
         } else if (local-y > workspace-area.height * 0.75) {
             root.dock-preview = 3;
+        } else if (root.has-secondary-group
+            && local-x >= secondary-view.x && local-x <= secondary-view.x + secondary-view.width
+            && local-y >= secondary-view.y && local-y <= secondary-view.y + secondary-view.height) {
+            root.dock-preview = 5;
         } else {
             root.dock-preview = 4;
         }
@@ -702,195 +843,20 @@ export component AppWindow inherits Window {
 
                 Rectangle {
                     horizontal-stretch: 1;
-                    clip: true;
-
-                    tabs-flickable := Flickable {
-                        width: parent.width;
-                        height: parent.height;
-                        viewport-width: max(self.width, tabs-row.preferred-width);
-                        viewport-height: self.height;
-                        interactive: false;
-
-                        tabs-row := HorizontalLayout {
-                            width: tabs-flickable.viewport-width;
-                            height: tabs-flickable.height;
-                            spacing: 1px;
-
-                            for tab[index] in root.tabs: Rectangle {
-                                private property <bool> active: tab.active;
-                                private property <bool> focused: index == root.active-tab;
-                                width: min(210px, max(110px, tab-title.preferred-width + 52px));
-                                background: self.focused ? #27313d
-                                    : (self.active ? #20232a
-                                    : (tab-touch.has-hover || tab-close-touch.has-hover ? #292d35 : #181a1f));
-                                changed focused => {
-                                    if (self.focused) {
-                                        root.reveal-tab(self.x, self.width);
-                                    }
-                                }
-                                changed x => {
-                                    if (self.focused) {
-                                        root.reveal-tab(self.x, self.width);
-                                    }
-                                }
-                                changed width => {
-                                    if (self.focused) {
-                                        root.reveal-tab(self.x, self.width);
-                                    }
-                                }
-                                tab-title := Text {
-                                    x: 10px;
-                                    width: parent.width - 48px;
-                                    text: (tab.kind == "terminal" ? ">_ " : "") + tab.title
-                                        + (root.has-secondary-group ? (tab.group == 0 ? "  ①" : "  ②") : "")
-                                        + (tab.dirty ? " ●" : "");
-                                    color: tab.kind == "terminal" ? #82c7ff
-                                        : (parent.active ? #f1f1f1 : #aeb4bf);
-                                    font-family: tab.kind == "terminal" ? "Cascadia Mono" : "Geist";
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                tab-touch := TouchArea {
-                                    private property <length> press-x: 0px;
-                                    private property <length> press-y: 0px;
-                                    width: parent.width - 34px;
-                                    mouse-cursor: move;
-                                    moved => {
-                                        if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
-                                            && abs(self.mouse-y - self.press-y) < 5px)) {
-                                            return;
-                                        }
-                                        root.update-dock-preview(
-                                            tab.id,
-                                            self.absolute-position.x + self.mouse-x,
-                                            self.absolute-position.y + self.mouse-y
-                                        );
-                                    }
-                                    pointer-event(event) => {
-                                        if (event.kind == PointerEventKind.down) {
-                                            self.press-x = self.mouse-x;
-                                            self.press-y = self.mouse-y;
-                                        } else if (event.kind == PointerEventKind.up) {
-                                            if (root.dragging-tab == tab.id) {
-                                                root.finish-tab-drag(tab.id);
-                                            } else {
-                                                root.tab-activated(tab.id);
-                                            }
-                                        } else if (event.kind == PointerEventKind.cancel) {
-                                            root.cancel-tab-drag();
-                                        }
-                                    }
-                                    scroll-event(event) => {
-                                        root.scroll-tabs(event.delta-x, event.delta-y);
-                                        return accept;
-                                    }
-                                }
-                                Rectangle {
-                                    x: parent.width - 31px;
-                                    y: 3px;
-                                    width: 28px;
-                                    height: 28px;
-                                    border-radius: 4px;
-                                    background: tab-close-touch.has-hover ? #3b4048 : transparent;
-                                    Text {
-                                        text: "×";
-                                        color: tab-close-touch.has-hover ? #ffffff : #abb0ba;
-                                        font-family: "Segoe UI Symbol";
-                                        font-size: 19px;
-                                        font-weight: 500;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                    tab-close-touch := TouchArea {
-                                        clicked => { root.tab-close(tab.id); }
-                                        scroll-event(event) => {
-                                            root.scroll-tabs(event.delta-x, event.delta-y);
-                                            return accept;
-                                        }
-                                    }
-                                }
-                            }
-
-                            Rectangle {
-                                horizontal-stretch: 1;
-                                background: title-drag-touch.has-hover ? #1d2026 : #181a1f;
-                                title-drag-touch := TouchArea {
-                                    moved => { root.window-drag-requested(); }
-                                    double-clicked => { root.maximized = !root.maximized; }
-                                    scroll-event(event) => {
-                                        root.scroll-tabs(event.delta-x, event.delta-y);
-                                        return accept;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Rectangle {
-                    width: 48px;
-                    background: new-terminal-touch.has-hover ? #30333a : transparent;
+                    background: title-drag-touch.has-hover ? #1d2026 : #181a1f;
                     Text {
-                        text: ">_+";
-                        color: #82c7ff;
-                        font-family: "Cascadia Mono";
-                        font-size: 13px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
+                        x: 12px;
+                        width: parent.width - 24px;
+                        text: root.active-path;
+                        color: #777e89;
+                        font-size: 11px;
                         vertical-alignment: center;
-                    }
-                    new-terminal-touch := TouchArea {
-                        clicked => { root.new-terminal-requested(root.focused-group); }
-                    }
-                }
-
-                Rectangle {
-                    width: 31px;
-                    background: previous-tab-touch.has-hover ? #30333a : transparent;
-                    Text {
-                        text: "‹";
-                        color: root.tabs.length > 1 ? #d7dae0 : #626872;
-                        font-family: "Segoe UI Symbol";
-                        font-size: 22px;
                         horizontal-alignment: center;
-                        vertical-alignment: center;
+                        overflow: elide;
                     }
-                    previous-tab-touch := TouchArea {
-                        enabled: root.tabs.length > 1;
-                        clicked => { root.tab-cycle(-1); }
-                    }
-                }
-                Rectangle {
-                    width: 31px;
-                    background: next-tab-touch.has-hover ? #30333a : transparent;
-                    Text {
-                        text: "›";
-                        color: root.tabs.length > 1 ? #d7dae0 : #626872;
-                        font-family: "Segoe UI Symbol";
-                        font-size: 22px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    next-tab-touch := TouchArea {
-                        enabled: root.tabs.length > 1;
-                        clicked => { root.tab-cycle(1); }
-                    }
-                }
-                Rectangle {
-                    width: 36px;
-                    background: tab-list-touch.has-hover || root.tab-list-visible ? #30333a : transparent;
-                    Text {
-                        text: "⌄";
-                        color: root.tabs.length > 0 ? #d7dae0 : #626872;
-                        font-family: "Segoe UI Symbol";
-                        font-size: 18px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    tab-list-touch := TouchArea {
-                        enabled: root.tabs.length > 0;
-                        clicked => { root.tab-list-visible = !root.tab-list-visible; }
+                    title-drag-touch := TouchArea {
+                        moved => { root.window-drag-requested(); }
+                        double-clicked => { root.maximized = !root.maximized; }
                     }
                 }
 
@@ -1010,6 +976,8 @@ export component AppWindow inherits Window {
 
                 primary-view := WorkspaceGroup {
                     group-id: 0;
+                    tabs: root.primary-tabs;
+                    focused: root.focused-group == 0;
                     active-tab-id: root.primary-active-tab-id;
                     active-kind: root.primary-active-kind;
                     active-title: root.primary-active-title;
@@ -1052,6 +1020,9 @@ export component AppWindow inherits Window {
                         root.terminal-key(tab-id, text, control, alt, shift);
                     }
                     terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
+                    tab-activated(tab-id) => { root.tab-activated(tab-id); }
+                    tab-close(tab-id) => { root.tab-close(tab-id); }
+                    new-terminal-requested(group) => { root.new-terminal-requested(group); }
                     group-focused(group) => {
                         root.focused-group = group;
                         root.focused-group-changed(group);
@@ -1064,6 +1035,8 @@ export component AppWindow inherits Window {
 
                 secondary-view := WorkspaceGroup {
                     group-id: 1;
+                    tabs: root.secondary-tabs;
+                    focused: root.focused-group == 1;
                     active-tab-id: root.secondary-active-tab-id;
                     active-kind: root.secondary-active-kind;
                     active-title: root.secondary-active-title;
@@ -1106,6 +1079,9 @@ export component AppWindow inherits Window {
                         root.terminal-key(tab-id, text, control, alt, shift);
                     }
                     terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
+                    tab-activated(tab-id) => { root.tab-activated(tab-id); }
+                    tab-close(tab-id) => { root.tab-close(tab-id); }
+                    new-terminal-requested(group) => { root.new-terminal-requested(group); }
                     group-focused(group) => {
                         root.focused-group = group;
                         root.focused-group-changed(group);
@@ -1161,15 +1137,19 @@ export component AppWindow inherits Window {
 
                 if root.dragging-tab >= 0 && root.dock-preview >= 0: Rectangle {
                     x: root.dock-preview == 1 ? workspace-area.width / 2
-                        : (root.dock-preview == 4 ? workspace-area.width / 4 : 0px);
+                        : (root.dock-preview == 4 ? primary-view.x
+                        : (root.dock-preview == 5 ? secondary-view.x : 0px));
                     y: root.dock-preview == 3 ? workspace-area.height / 2
-                        : (root.dock-preview == 4 ? workspace-area.height / 4 : 0px);
+                        : (root.dock-preview == 4 ? primary-view.y
+                        : (root.dock-preview == 5 ? secondary-view.y : 0px));
                     width: root.dock-preview == 0 || root.dock-preview == 1
                         ? workspace-area.width / 2
-                        : (root.dock-preview == 4 ? workspace-area.width / 2 : workspace-area.width);
+                        : (root.dock-preview == 4 ? primary-view.width
+                        : (root.dock-preview == 5 ? secondary-view.width : workspace-area.width));
                     height: root.dock-preview == 2 || root.dock-preview == 3
                         ? workspace-area.height / 2
-                        : (root.dock-preview == 4 ? workspace-area.height / 2 : workspace-area.height);
+                        : (root.dock-preview == 4 ? primary-view.height
+                        : (root.dock-preview == 5 ? secondary-view.height : workspace-area.height));
                     background: #315f8a99;
                     border-width: 2px;
                     border-color: #79b8f3;
@@ -1180,7 +1160,8 @@ export component AppWindow inherits Window {
                             : (root.dock-preview == 1 ? "Move tab to right group"
                             : (root.dock-preview == 2 ? "Move tab to top group"
                             : (root.dock-preview == 3 ? "Move tab to bottom group"
-                            : "Return tab to primary group")));
+                            : (root.dock-preview == 5 ? "Move tab to this group"
+                            : "Move tab to this group"))));
                         color: white;
                         font-family: "Geist";
                         font-size: 14px;
@@ -1214,78 +1195,5 @@ export component AppWindow inherits Window {
         }
     }
 
-        if root.tab-list-visible: TouchArea {
-            x: 0px;
-            y: 34px;
-            width: root.width;
-            height: root.height - 34px;
-            clicked => { root.tab-list-visible = false; }
-        }
-
-        if root.tab-list-visible: Rectangle {
-            x: max(root.sidebar-width, root.width - 498px);
-            y: 34px;
-            width: min(360px, root.width - root.sidebar-width);
-            height: min(420px, max(72px, root.tabs.length * 30px + 42px));
-            background: #252930;
-            border-width: 1px;
-            border-color: #454b56;
-            clip: true;
-
-            VerticalLayout {
-            spacing: 0px;
-            Rectangle {
-                height: 40px;
-                background: #20232a;
-                Text {
-                    x: 12px;
-                    width: parent.width - 24px;
-                    text: "OPEN FILES & TERMINALS  " + root.tabs.length;
-                    color: #bbc0ca;
-                    font-size: 11px;
-                    font-weight: 600;
-                    vertical-alignment: center;
-                }
-            }
-            ScrollView {
-                vertical-stretch: 1;
-                VerticalLayout {
-                    spacing: 0px;
-                    for tab[index] in root.tabs: Rectangle {
-                        height: 30px;
-                        background: tab.active ? #373d47
-                            : (open-tab-touch.has-hover ? #303640 : transparent);
-                        Text {
-                            x: 12px;
-                            width: parent.width - 44px;
-                            text: (tab.kind == "terminal" ? ">_ " : "") + tab.title
-                                + (root.has-secondary-group ? (tab.group == 0 ? "  ①" : "  ②") : "");
-                            color: tab.kind == "terminal" ? #82c7ff
-                                : (tab.active ? #ffffff : #d5d8de);
-                            font-family: tab.kind == "terminal" ? "Cascadia Mono" : "Geist";
-                            font-size: 12px;
-                            overflow: elide;
-                            vertical-alignment: center;
-                        }
-                        if tab.dirty: Text {
-                            x: parent.width - 30px;
-                            width: 18px;
-                            text: "●";
-                            color: #e2b86b;
-                            font-size: 11px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                        open-tab-touch := TouchArea {
-                            clicked => {
-                                root.tab-list-visible = false;
-                                root.tab-activated(tab.id);
-                            }
-                        }
-                    }
-                }
-            }
-            }
-        }
     }
 }

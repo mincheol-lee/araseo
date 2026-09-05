@@ -88,21 +88,24 @@ If `PATH` is omitted, the launcher uses the current directory. It converts relat
 
 ```text
 +------------------+---------------------------------------------+
-| File Tree        | Unified File & Terminal Tabs                |
+| File Tree        | Group 1: [file.rs] [>_ terminal] [+]        |
 |                  +---------------------------------------------+
 |                  |                                             |
-|                  | Tab Group 1                                 |
+|                  | Active file or terminal                     |
 |                  |                                             |
 |                  +---------------------------------------------+
-|                  | Tab Group 2                                 |
+|                  | Group 2: [README.md] [>_ terminal 2] [+]    |
+|                  +---------------------------------------------+
+|                  | Active file or terminal                     |
 +------------------+---------------------------------------------+
 | Workspace | Git | Active file | Cursor/encoding | Status       |
 +---------------------------------------------------------------+
 ```
 
-- Keep the file tree fixed on the left and present files and terminals in one shared tab strip.
+- Keep the file tree fixed on the left. Every pane owns its own tab bar and active content; there is no global tab strip detached from the panes.
 - Support at most two tab groups. Each group may display either a file or terminal, and multiple file and terminal tabs may coexist in either group.
-- Show a live target preview while a tab or active group header is dragged, then move that tab to the left, right, top, bottom, or primary group when dropped.
+- With one group, its tab bar and active content shall fill the entire workspace area. No space shall be reserved for an empty second group.
+- Show a live target preview while a pane-local tab is dragged. Dropping at a workspace edge creates or repositions a split; dropping on the body of the other pane moves the tab into that pane.
 - Allow either tab group to fill the work area and restore the previous split layout afterward.
 - Place a draggable splitter between the two tab groups in both horizontal and vertical layouts, preserving its ratio during the current application session.
 - Give keyboard focus to the clicked panel. Indicate focus through a border or header state.
@@ -168,7 +171,7 @@ When the terminal has focus, forward key combinations used by the shell or Codex
 - FR-TR-07: If the shell exits, the terminal shall display its exit code and provide a `Restart` action.
 - FR-TR-08: On application exit, Araseo shall close PTY input and wait for the child process to terminate, then clean up any remaining host process after a timeout.
 - FR-TR-09: The user shall be able to create and close multiple terminal tabs. Closing one terminal tab shall terminate only its PTY session.
-- FR-TR-10: A terminal tab shall show its starting directory in the active group header and a shortened directory label in the shared tab strip.
+- FR-TR-10: A terminal tab shall show a numbered, shortened starting-directory label in its pane-local tab bar and the full starting path in the window title/status context.
 
 ### 6.4 Git Status
 
