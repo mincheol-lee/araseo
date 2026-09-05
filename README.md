@@ -21,10 +21,11 @@ full-scale IDE.
 
 - Lazy, expandable file tree with context-aware icons
 - Git status detection across multiple nested repositories
-- Tabbed UTF-8 editor with syntax highlighting, undo/redo, and conflict detection
-- Interactive WSL terminal with ANSI colors, Korean text, and IME input
+- Unified file and terminal tabs, organized in Orca-style pane-local tab bars
+- Multiple independent WSL terminals with ANSI colors, Korean text, IME input, and visible start paths
+- Up to two drag-and-dock tab groups with independent tabs and resizable splits
 - WSL-aware CLI arguments and Linux-to-UNC path mapping
-- Headless behavioral Harness for editor, terminal, Git, and UI regressions
+- Headless behavioral Harness for editor isolation, multiple terminals, docking layouts, Git, and UI regressions
 
 ## Actively Evolving
 
@@ -75,6 +76,13 @@ It executes the production editor/document code, file tree, workspace path
 checks, terminal key and Korean character-width checks, and a real multi-repo
 Git/inotify integration scenario. It does not need the Linux Slint/fontconfig
 development packages.
+
+Set `ARASEO_UI_SNAPSHOT_DIR` to have the UI Harness also write full-frame PNG
+snapshots of the single-editor, split-pane, and single-terminal layouts:
+
+```bash
+ARASEO_UI_SNAPSHOT_DIR=/tmp/araseo-ui-snapshots ./scripts/verify
+```
 
 Before distributing a Windows build, also compile every test and the Slint UI
 for the Windows target:
