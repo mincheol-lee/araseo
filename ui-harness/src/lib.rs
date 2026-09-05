@@ -145,7 +145,7 @@ mod tests {
             observed_cycles.borrow_mut().push(delta);
         });
         ui.show().unwrap();
-        let before_selection = render(&window);
+        let populated_ui = render(&window);
 
         // The title/tab strip must start after the 250px file sidebar.
         dispatch_click(&ui, 150.0, 17.0);
@@ -160,7 +160,7 @@ mod tests {
             "🧩",
             "context-aware project emoji was not delivered to the tree UI"
         );
-        let colored_emoji_pixels = before_selection
+        let colored_emoji_pixels = populated_ui
             .iter()
             .enumerate()
             .filter(|(index, pixel)| {
@@ -272,17 +272,224 @@ mod tests {
             "open-editors list remained visible after choosing a file"
         );
 
+        // The file tree is fixed while the editor and terminal can occupy any
+        // edge, share either axis, or take over the entire workspace.
+        ui.set_workspace_layout(0);
+        ui.set_panel_split_ratio(0.64);
+        render(&window);
+        assert!(ui.get_editor_panel_visible() && ui.get_terminal_panel_visible());
+        assert!(
+            ui.get_editor_panel_y() < ui.get_terminal_panel_y(),
+            "default layout did not place the editor above the terminal"
+        );
+
+        ui.invoke_dock_panel(1, 2);
+        render(&window);
+        assert_eq!(ui.get_workspace_layout(), 1);
+        assert!(
+            ui.get_terminal_panel_y() < ui.get_editor_panel_y(),
+            "docking the terminal to the top did not swap the vertical panels"
+        );
+
+        ui.invoke_dock_panel(1, 0);
+        render(&window);
+        assert_eq!(ui.get_workspace_layout(), 2);
+        assert!(
+            ui.get_terminal_panel_x() < ui.get_editor_panel_x(),
+            "docking the terminal left did not create a left/right split"
+        );
+
+        ui.invoke_dock_panel(1, 1);
+        ui.set_panel_split_ratio(0.5);
+        render(&window);
+        assert_eq!(ui.get_workspace_layout(), 3);
+        assert!(
+            ui.get_editor_panel_x() < ui.get_terminal_panel_x(),
+            "docking the terminal right did not create an editor-left split"
+        );
+        assert!(
+            (ui.get_editor_panel_width() - ui.get_terminal_panel_width()).abs() < 1.0,
+            "a 50/50 horizontal split did not give both panels equal width"
+        );
+
+        ui.invoke_toggle_panel_maximize(0);
+        assert_eq!(ui.get_workspace_layout(), 4);
+        ui.invoke_toggle_panel_maximize(0);
+        render(&window);
+        assert_eq!(
+            ui.get_workspace_layout(),
+            3,
+            "restoring a maximized panel did not recover the previous arrangement"
+        );
+
+        let split_ratio_before_drag = ui.get_panel_split_ratio();
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(724.0, 400.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(850.0, 400.0),
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(850.0, 400.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert!(
+            ui.get_panel_split_ratio() > split_ratio_before_drag + 0.1,
+            "dragging the divider did not resize the horizontal split"
+        );
+
+        ui.set_workspace_layout(0);
+        ui.set_panel_split_ratio(0.64);
+        render(&window);
+        dispatch_click(&ui, 600.0, 48.0);
+        assert_eq!(
+            ui.get_workspace_layout(),
+            0,
+            "clicking a panel header without dragging changed the layout"
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(700.0, 508.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(700.0, 400.0),
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(700.0, 400.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert!(
+            ui.get_panel_split_ratio() < 0.55,
+            "dragging the divider did not resize the vertical split"
+        );
+
+        ui.invoke_dock_panel(0, 4);
+        render(&window);
+        assert_eq!(ui.get_workspace_layout(), 4);
+        assert!(ui.get_editor_panel_visible() && !ui.get_terminal_panel_visible());
+        assert!(
+            ui.get_editor_panel_width() > 900.0 && ui.get_editor_panel_height() > 700.0,
+            "editor maximize did not fill the workspace"
+        );
+
+        let activated_tree_entry = Rc::new(RefCell::new(None));
+        let observed_tree_entry = activated_tree_entry.clone();
+        ui.on_tree_activated(move |index| {
+            *observed_tree_entry.borrow_mut() = Some(index);
+        });
+        dispatch_click(&ui, 20.0, 76.0);
+        assert_eq!(
+            *activated_tree_entry.borrow(),
+            Some(0),
+            "maximizing a panel covered or displaced the fixed file tree"
+        );
+
+        ui.invoke_dock_panel(1, 4);
+        render(&window);
+        assert_eq!(ui.get_workspace_layout(), 5);
+        assert!(!ui.get_editor_panel_visible() && ui.get_terminal_panel_visible());
+        assert!(
+            ui.get_terminal_panel_width() > 900.0 && ui.get_terminal_panel_height() > 700.0,
+            "terminal maximize did not fill the workspace"
+        );
+
+        // Exercise both production header drag handlers, not only the public
+        // layout function. First drag the terminal to the top.
+        ui.set_workspace_layout(0);
+        ui.set_panel_split_ratio(0.64);
+        render(&window);
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(600.0, 520.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(600.0, 45.0),
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(600.0, 45.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert_eq!(
+            ui.get_workspace_layout(),
+            1,
+            "dragging the terminal header to the top did not dock it there"
+        );
+
+        // Then drag the editor to the right and render the live preview before
+        // release so the preview path is covered by the regression Harness.
+        ui.set_workspace_layout(0);
+        render(&window);
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(600.0, 48.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(1180.0, 300.0),
+            },
+        );
+        render(&window);
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(1180.0, 300.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert_eq!(
+            ui.get_workspace_layout(),
+            2,
+            "dragging the editor header to the right did not dock it there"
+        );
+
+        ui.set_workspace_layout(0);
+        ui.set_panel_split_ratio(0.64);
+        let before_editor_selection = render(&window);
+
         // The editor starts after the 250px tree and 48px line-number gutter.
-        // Drag across a portion of the first source line.
+        // Its draggable panel header occupies the first 28px of the workspace.
+        // Drag across a portion of the first source line below that header.
         dispatch_pointer(&ui, WindowEvent::PointerPressed {
-            position: LogicalPosition::new(320.0, 50.0),
+            position: LogicalPosition::new(320.0, 78.0),
             button: PointerEventButton::Left,
         });
         dispatch_pointer(&ui, WindowEvent::PointerMoved {
-            position: LogicalPosition::new(450.0, 50.0),
+            position: LogicalPosition::new(450.0, 78.0),
         });
         dispatch_pointer(&ui, WindowEvent::PointerReleased {
-            position: LogicalPosition::new(450.0, 50.0),
+            position: LogicalPosition::new(450.0, 78.0),
             button: PointerEventButton::Left,
         });
 
@@ -296,14 +503,14 @@ mod tests {
         );
 
         let after_selection = render(&window);
-        let changed_editor_pixels = before_selection
+        let changed_editor_pixels = before_editor_selection
             .iter()
             .zip(&after_selection)
             .enumerate()
             .filter(|(index, (before, after))| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (299..1000).contains(&x) && (34..100).contains(&y) && before != after
+                (299..1000).contains(&x) && (62..130).contains(&y) && before != after
             })
             .count();
         assert!(
@@ -355,14 +562,14 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(1140.0, 55.0),
+                position: LogicalPosition::new(1140.0, 80.0),
                 button: PointerEventButton::Left,
             },
         );
         dispatch_pointer(
             &ui,
             WindowEvent::PointerReleased {
-                position: LogicalPosition::new(1140.0, 55.0),
+                position: LogicalPosition::new(1140.0, 80.0),
                 button: PointerEventButton::Left,
             },
         );

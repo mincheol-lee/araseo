@@ -70,9 +70,24 @@ export component AppWindow inherits Window {
         ? root.editor-selection-cursor - root.editor-selection-anchor
         : root.editor-selection-anchor - root.editor-selection-cursor;
     out property <bool> copy-feedback-active: false;
+    in-out property <int> workspace-layout: 0;
+    in-out property <float> panel-split-ratio: 0.64;
+    out property <length> editor-panel-x: editor-panel.x;
+    out property <length> editor-panel-y: editor-panel.y;
+    out property <length> editor-panel-width: editor-panel.width;
+    out property <length> editor-panel-height: editor-panel.height;
+    out property <bool> editor-panel-visible: editor-panel.visible;
+    out property <length> terminal-panel-x: terminal-panel.x;
+    out property <length> terminal-panel-y: terminal-panel.y;
+    out property <length> terminal-panel-width: terminal-panel.width;
+    out property <length> terminal-panel-height: terminal-panel.height;
+    out property <bool> terminal-panel-visible: terminal-panel.visible;
     private property <int> editor-selection-anchor: 0;
     private property <int> editor-selection-cursor: 0;
     private property <length> sidebar-width: 250px;
+    private property <int> dragging-panel: -1;
+    private property <int> dock-preview: -1;
+    private property <int> restore-layout: 0;
 
     callback tree-activated(int);
     callback tab-activated(int);
@@ -116,6 +131,52 @@ export component AppWindow inherits Window {
 
     public function focus-terminal() {
         terminal-ime-input.focus();
+    }
+
+    public function dock-panel(panel: int, zone: int) {
+        if (zone == 0) {
+            root.workspace-layout = panel == 1 ? 2 : 3;
+        } else if (zone == 1) {
+            root.workspace-layout = panel == 1 ? 3 : 2;
+        } else if (zone == 2) {
+            root.workspace-layout = panel == 1 ? 1 : 0;
+        } else if (zone == 3) {
+            root.workspace-layout = panel == 1 ? 0 : 1;
+        } else if (zone == 4) {
+            if (root.workspace-layout <= 3) {
+                root.restore-layout = root.workspace-layout;
+            }
+            root.workspace-layout = panel == 1 ? 5 : 4;
+        }
+        root.dragging-panel = -1;
+        root.dock-preview = -1;
+    }
+
+    public function toggle-panel-maximize(panel: int) {
+        let maximized-layout = panel == 1 ? 5 : 4;
+        if (root.workspace-layout == maximized-layout) {
+            root.workspace-layout = root.restore-layout;
+        } else {
+            if (root.workspace-layout <= 3) {
+                root.restore-layout = root.workspace-layout;
+            }
+            root.workspace-layout = maximized-layout;
+        }
+    }
+
+    function update-dock-preview(panel: int, x: length, y: length) {
+        root.dragging-panel = panel;
+        if (x < workspace-area.width * 0.25) {
+            root.dock-preview = 0;
+        } else if (x > workspace-area.width * 0.75) {
+            root.dock-preview = 1;
+        } else if (y < workspace-area.height * 0.25) {
+            root.dock-preview = 2;
+        } else if (y > workspace-area.height * 0.75) {
+            root.dock-preview = 3;
+        } else {
+            root.dock-preview = 4;
+        }
     }
 
     copy-feedback-timer := Timer {
@@ -418,17 +479,98 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+
                 }
             }
 
-            Rectangle {
+            workspace-area := Rectangle {
                 background: #181a1f;
                 horizontal-stretch: 1;
                 max-width: 100000px;
-                VerticalLayout {
-                    width: parent.width;
-                    height: parent.height;
-                    spacing: 1px;
+                clip: true;
+                private property <length> divider-size: 6px;
+                private property <bool> vertical-split: root.workspace-layout == 0 || root.workspace-layout == 1;
+                private property <bool> horizontal-split: root.workspace-layout == 2 || root.workspace-layout == 3;
+                private property <length> editor-split-width: (self.width - self.divider-size) * root.panel-split-ratio;
+                private property <length> terminal-split-width: self.width - self.divider-size - self.editor-split-width;
+                private property <length> editor-split-height: (self.height - self.divider-size) * root.panel-split-ratio;
+                private property <length> terminal-split-height: self.height - self.divider-size - self.editor-split-height;
+
+                editor-panel := Rectangle {
+                    x: root.workspace-layout == 2 ? workspace-area.terminal-split-width + workspace-area.divider-size : 0px;
+                    y: root.workspace-layout == 1 ? workspace-area.terminal-split-height + workspace-area.divider-size : 0px;
+                    width: workspace-area.horizontal-split ? workspace-area.editor-split-width : workspace-area.width;
+                    height: workspace-area.vertical-split ? workspace-area.editor-split-height : workspace-area.height;
+                    visible: root.workspace-layout != 5;
+                    background: #181a1f;
+                    clip: true;
+
+                    VerticalLayout {
+                        width: parent.width;
+                        height: parent.height;
+                        spacing: 0px;
+                        Rectangle {
+                            height: 28px;
+                            background: editor-drag-touch.pressed ? #343944
+                                : (editor-drag-touch.has-hover ? #2b2f37 : #24272e);
+                            Text {
+                                text: "EDITOR  ·  DRAG TO DOCK";
+                                color: #bbc0ca;
+                                font-size: 11px;
+                                x: 9px;
+                                width: parent.width - 48px;
+                                vertical-alignment: center;
+                            }
+                            editor-drag-touch := TouchArea {
+                                private property <length> press-x: 0px;
+                                private property <length> press-y: 0px;
+                                width: parent.width - 38px;
+                                mouse-cursor: move;
+                                moved => {
+                                    if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
+                                        && abs(self.mouse-y - self.press-y) < 5px)) {
+                                        return;
+                                    }
+                                    root.update-dock-preview(
+                                        0,
+                                        self.absolute-position.x + self.mouse-x - workspace-area.absolute-position.x,
+                                        self.absolute-position.y + self.mouse-y - workspace-area.absolute-position.y
+                                    );
+                                }
+                                pointer-event(event) => {
+                                    if (event.kind == PointerEventKind.down) {
+                                        self.press-x = self.mouse-x;
+                                        self.press-y = self.mouse-y;
+                                    } else if (event.kind == PointerEventKind.up && root.dragging-panel == 0) {
+                                        root.dock-panel(0, root.dock-preview);
+                                    } else if (event.kind == PointerEventKind.cancel) {
+                                        root.dragging-panel = -1;
+                                        root.dock-preview = -1;
+                                    }
+                                }
+                                double-clicked => {
+                                    root.toggle-panel-maximize(0);
+                                }
+                            }
+                            Rectangle {
+                                x: parent.width - 36px;
+                                width: 36px;
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: editor-maximize-touch.has-hover ? #3a3f48 : transparent;
+                                Text {
+                                    text: root.workspace-layout == 4 ? "❐" : "□";
+                                    color: #d7dae0;
+                                    font-family: "Segoe UI Symbol";
+                                    font-size: 17px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                editor-maximize-touch := TouchArea {
+                                    clicked => { root.toggle-panel-maximize(0); }
+                                }
+                            }
+                        }
                     Rectangle {
                         horizontal-stretch: 1;
                         max-width: 100000px;
@@ -651,15 +793,17 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                    }
+                }
 
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        max-width: 100000px;
-                        vertical-stretch: 1;
-                        preferred-height: 280px;
-                        min-height: 200px;
-                        max-height: 400px;
+                terminal-panel := Rectangle {
+                        x: root.workspace-layout == 3 ? workspace-area.editor-split-width + workspace-area.divider-size : 0px;
+                        y: root.workspace-layout == 0 ? workspace-area.editor-split-height + workspace-area.divider-size : 0px;
+                        width: workspace-area.horizontal-split ? workspace-area.terminal-split-width : workspace-area.width;
+                        height: workspace-area.vertical-split ? workspace-area.terminal-split-height : workspace-area.height;
+                        visible: root.workspace-layout != 4;
                         background: #111318;
+                        clip: true;
                         VerticalLayout {
                             width: parent.width;
                             height: parent.height;
@@ -668,8 +812,65 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 1;
                                 max-width: 100000px;
                                 height: 28px;
-                                background: #24272e;
-                                Text { text: "TERMINAL — WSL"; color: #bbc0ca; font-size: 11px; x: 9px; vertical-alignment: center; }
+                                background: terminal-drag-touch.pressed ? #343944
+                                    : (terminal-drag-touch.has-hover ? #2b2f37 : #24272e);
+                                Text {
+                                    text: "TERMINAL — WSL  ·  DRAG TO DOCK";
+                                    color: #bbc0ca;
+                                    font-size: 11px;
+                                    x: 9px;
+                                    width: parent.width - 48px;
+                                    vertical-alignment: center;
+                                }
+                                terminal-drag-touch := TouchArea {
+                                    private property <length> press-x: 0px;
+                                    private property <length> press-y: 0px;
+                                    width: parent.width - 38px;
+                                    mouse-cursor: move;
+                                    moved => {
+                                        if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
+                                            && abs(self.mouse-y - self.press-y) < 5px)) {
+                                            return;
+                                        }
+                                        root.update-dock-preview(
+                                            1,
+                                            self.absolute-position.x + self.mouse-x - workspace-area.absolute-position.x,
+                                            self.absolute-position.y + self.mouse-y - workspace-area.absolute-position.y
+                                        );
+                                }
+                                pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down) {
+                                            self.press-x = self.mouse-x;
+                                            self.press-y = self.mouse-y;
+                                        } else if (event.kind == PointerEventKind.up && root.dragging-panel == 1) {
+                                            root.dock-panel(1, root.dock-preview);
+                                        } else if (event.kind == PointerEventKind.cancel) {
+                                            root.dragging-panel = -1;
+                                            root.dock-preview = -1;
+                                        }
+                                    }
+                                    double-clicked => {
+                                        root.toggle-panel-maximize(1);
+                                    }
+                                }
+                                Rectangle {
+                                    x: parent.width - 36px;
+                                    width: 36px;
+                                    height: parent.height;
+                                    border-radius: 3px;
+                                    background: terminal-maximize-touch.has-hover ? #3a3f48 : transparent;
+                                    Text {
+                                        text: root.workspace-layout == 5 ? "❐" : "□";
+                                        color: #d7dae0;
+                                        font-family: "Segoe UI Symbol";
+                                        font-size: 17px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    terminal-maximize-touch := TouchArea {
+                                        clicked => { root.toggle-panel-maximize(1); }
+                                    }
+                                }
                             }
                             terminal-focus := FocusScope {
                                 horizontal-stretch: 1;
@@ -792,9 +993,87 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+
+                    panel-divider := Rectangle {
+                        visible: workspace-area.vertical-split || workspace-area.horizontal-split;
+                        x: workspace-area.horizontal-split
+                            ? (root.workspace-layout == 2
+                                ? workspace-area.terminal-split-width
+                                : workspace-area.editor-split-width)
+                            : 0px;
+                        y: workspace-area.vertical-split
+                            ? (root.workspace-layout == 1
+                                ? workspace-area.terminal-split-height
+                                : workspace-area.editor-split-height)
+                            : 0px;
+                        width: workspace-area.horizontal-split
+                            ? workspace-area.divider-size
+                            : workspace-area.width;
+                        height: workspace-area.vertical-split
+                            ? workspace-area.divider-size
+                            : workspace-area.height;
+                        background: divider-touch.pressed || divider-touch.has-hover ? #5686b3 : #313640;
+
+                        divider-touch := TouchArea {
+                            mouse-cursor: workspace-area.horizontal-split ? ew-resize : ns-resize;
+                            moved => {
+                                if (!self.pressed) {
+                                    return;
+                                }
+                                if (workspace-area.horizontal-split) {
+                                    let pointer-x = self.absolute-position.x + self.mouse-x
+                                        - workspace-area.absolute-position.x;
+                                    root.panel-split-ratio = max(0.2, min(0.8,
+                                        root.workspace-layout == 2
+                                            ? (workspace-area.width - workspace-area.divider-size - pointer-x)
+                                                / (workspace-area.width - workspace-area.divider-size)
+                                            : pointer-x / (workspace-area.width - workspace-area.divider-size)
+                                    ));
+                                } else {
+                                    let pointer-y = self.absolute-position.y + self.mouse-y
+                                        - workspace-area.absolute-position.y;
+                                    root.panel-split-ratio = max(0.2, min(0.8,
+                                        root.workspace-layout == 1
+                                            ? (workspace-area.height - workspace-area.divider-size - pointer-y)
+                                                / (workspace-area.height - workspace-area.divider-size)
+                                            : pointer-y / (workspace-area.height - workspace-area.divider-size)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    if root.dragging-panel >= 0 && root.dock-preview >= 0: Rectangle {
+                        x: root.dock-preview == 1 ? workspace-area.width / 2
+                            : (root.dock-preview == 4 ? workspace-area.width / 4 : 0px);
+                        y: root.dock-preview == 3 ? workspace-area.height / 2
+                            : (root.dock-preview == 4 ? workspace-area.height / 4 : 0px);
+                        width: root.dock-preview == 0 || root.dock-preview == 1
+                            ? workspace-area.width / 2
+                            : (root.dock-preview == 4 ? workspace-area.width / 2 : workspace-area.width);
+                        height: root.dock-preview == 2 || root.dock-preview == 3
+                            ? workspace-area.height / 2
+                            : (root.dock-preview == 4 ? workspace-area.height / 2 : workspace-area.height);
+                        background: #315f8a99;
+                        border-width: 2px;
+                        border-color: #79b8f3;
+                        border-radius: 5px;
+
+                        Text {
+                            text: root.dock-preview == 0 ? "Dock left"
+                                : (root.dock-preview == 1 ? "Dock right"
+                                : (root.dock-preview == 2 ? "Dock top"
+                                : (root.dock-preview == 3 ? "Dock bottom" : "Maximize")));
+                            color: white;
+                            font-family: "Geist";
+                            font-size: 14px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
                 }
             }
-        }
 
         Rectangle {
             height: 24px;

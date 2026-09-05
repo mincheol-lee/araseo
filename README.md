@@ -23,8 +23,9 @@ full-scale IDE.
 - Git status detection across multiple nested repositories
 - Tabbed UTF-8 editor with syntax highlighting, undo/redo, and conflict detection
 - Interactive WSL terminal with ANSI colors, Korean text, and IME input
+- Drag-and-dock editor and terminal panels with resizable horizontal or vertical splits and maximized views
 - WSL-aware CLI arguments and Linux-to-UNC path mapping
-- Headless behavioral Harness for editor, terminal, Git, and UI regressions
+- Headless behavioral Harness for editor, terminal, docking layouts, Git, and UI regressions
 
 ## Actively Evolving
 

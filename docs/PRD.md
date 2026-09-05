@@ -100,8 +100,10 @@ If `PATH` is omitted, the launcher uses the current directory. It converts relat
 +---------------------------------------------------------------+
 ```
 
-- Place draggable splitters between the file tree and work area, and between the editor and terminal.
-- Allow the terminal to collapse and expand, preserving its most recent height during the current application session.
+- Keep the file tree fixed on the left while allowing the editor and terminal to be drag-docked above, below, left, or right of each other.
+- Show a live target preview while a panel header is dragged, then dock the panel when it is dropped.
+- Allow either the editor or terminal to fill the work area and restore the previous split layout afterward.
+- Place a draggable splitter between the editor and terminal in both horizontal and vertical layouts, preserving its ratio during the current application session.
 - Give keyboard focus to the clicked panel. Indicate focus through a border or header state.
 - Use one dark theme and a system monospace font in the first release.
 - Set the minimum window size to 800×600. At smaller sizes, allow the file tree and terminal to collapse.
