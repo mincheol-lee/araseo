@@ -30,6 +30,13 @@ pub struct Document {
     redo_stack: Vec<TextChange>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalRefresh {
+    Unchanged,
+    Reloaded,
+    Conflict,
+}
+
 #[derive(Clone, Debug)]
 struct TextChange {
     start: usize,
@@ -114,6 +121,19 @@ impl Document {
         fs::metadata(&self.host_path)
             .map(|metadata| revision_from(&metadata) != self.disk_revision)
             .unwrap_or(true)
+    }
+
+    pub fn refresh_from_disk(&mut self) -> Result<ExternalRefresh> {
+        if !self.changed_on_disk() {
+            return Ok(ExternalRefresh::Unchanged);
+        }
+        if self.dirty {
+            return Ok(ExternalRefresh::Conflict);
+        }
+
+        let refreshed = Self::open(self.linux_path.clone(), self.host_path.clone())?;
+        *self = refreshed;
+        Ok(ExternalRefresh::Reloaded)
     }
 
     pub fn save(&mut self, overwrite_external: bool) -> Result<()> {
@@ -258,6 +278,68 @@ mod tests {
         fs::write(&path, b"external change with a different length").unwrap();
         assert!(document.changed_on_disk());
         assert!(document.save(false).is_err());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn refreshes_clean_documents_after_an_external_edit() {
+        let directory = std::env::temp_dir().join(format!(
+            "araseo-document-refresh-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("sample.txt");
+        fs::write(&path, "before").unwrap();
+
+        let mut document = Document::open(PathBuf::from("/sample.txt"), path.clone()).unwrap();
+        fs::write(&path, "after external edit").unwrap();
+
+        assert_eq!(document.refresh_from_disk().unwrap(), ExternalRefresh::Reloaded);
+        assert_eq!(document.text, "after external edit");
+        assert!(!document.dirty);
+        assert_eq!(document.refresh_from_disk().unwrap(), ExternalRefresh::Unchanged);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn preserves_dirty_documents_when_the_disk_copy_changes() {
+        let directory = std::env::temp_dir().join(format!(
+            "araseo-document-conflict-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("sample.txt");
+        fs::write(&path, "original").unwrap();
+
+        let mut document = Document::open(PathBuf::from("/sample.txt"), path.clone()).unwrap();
+        document.set_text("unsaved editor text".into());
+        fs::write(&path, "external edit").unwrap();
+
+        assert_eq!(document.refresh_from_disk().unwrap(), ExternalRefresh::Conflict);
+        assert_eq!(document.text, "unsaved editor text");
+        assert!(document.dirty);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn preserves_the_open_buffer_when_an_external_file_is_deleted() {
+        let directory = std::env::temp_dir().join(format!(
+            "araseo-document-delete-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("sample.txt");
+        fs::write(&path, "keep this open").unwrap();
+
+        let mut document = Document::open(PathBuf::from("/sample.txt"), path.clone()).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(document.refresh_from_disk().is_err());
+        assert_eq!(document.text, "keep this open");
+        assert!(!document.dirty);
         fs::remove_dir_all(&directory).unwrap();
     }
 
