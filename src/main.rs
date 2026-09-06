@@ -10,7 +10,7 @@ mod tree;
 mod workspace;
 
 use anyhow::{Context, Result, bail};
-use document::{Document, line_numbers};
+use document::{Document, ExternalRefresh, line_numbers};
 use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use slint::winit_030::WinitWindowAccessor;
 use std::cell::{Cell, RefCell};
@@ -458,17 +458,27 @@ fn main() -> Result<()> {
             let previous_tree = state.tree.clone();
             let previous_repositories = state.repositories.clone();
             let previous_status = state.status.clone();
+            let previous_save_conflict = state.save_conflict;
             state.statuses = snapshot.statuses;
             state.repositories = snapshot.repositories;
             if state.status == "Refreshing..." {
                 state.status = "Refreshed".into();
             }
             refresh_tree(&mut state);
+            let refreshed_groups = refresh_external_documents(&mut state);
             if state.tree != previous_tree || state.repositories != previous_repositories {
                 sync_tree(&ui, &state);
             }
+            for (group, refreshed) in refreshed_groups.into_iter().enumerate() {
+                if refreshed {
+                    sync_group(&ui, &state, group);
+                }
+            }
             if state.status != previous_status {
                 ui.set_status_text(state.status.clone().into());
+            }
+            if state.save_conflict != previous_save_conflict {
+                ui.set_save_conflict(state.save_conflict.is_some());
             }
         });
     }
@@ -677,6 +687,63 @@ fn reload_tab(state: &mut AppState, tab_id: TabId) {
         }
         Err(error) => state.status = error.to_string(),
     }
+}
+
+fn refresh_external_documents(state: &mut AppState) -> [bool; 2] {
+    let active = [state.tab_groups.active(0), state.tab_groups.active(1)];
+    let mut refreshed_groups = [false, false];
+    let mut reloaded = 0usize;
+    let mut conflict = None;
+    let mut refresh_error = None;
+    let mut resolved_conflict = false;
+
+    for tab in &mut state.tabs {
+        let TabContent::File(document) = &mut tab.content else {
+            continue;
+        };
+        let path = document.linux_path.clone();
+        match document.refresh_from_disk() {
+            Ok(ExternalRefresh::Unchanged) => {}
+            Ok(ExternalRefresh::Reloaded) => {
+                reloaded += 1;
+                resolved_conflict |= state.save_conflict == Some(tab.id);
+                for (group, active_id) in active.into_iter().enumerate() {
+                    if active_id == Some(tab.id) {
+                        refreshed_groups[group] = true;
+                    }
+                }
+            }
+            Ok(ExternalRefresh::Conflict) => {
+                if conflict.is_none() {
+                    conflict = Some((tab.id, path));
+                }
+            }
+            Err(error) => {
+                if refresh_error.is_none() {
+                    refresh_error = Some(format!("Cannot refresh {}: {error}", path.display()));
+                }
+            }
+        }
+    }
+
+    if resolved_conflict {
+        state.save_conflict = None;
+    }
+    if let Some((tab_id, path)) = conflict {
+        state.save_conflict = Some(tab_id);
+        state.status = format!(
+            "{} changed outside Araseo; reload or overwrite",
+            path.display()
+        );
+    } else if let Some(error) = refresh_error {
+        state.status = error;
+    } else if reloaded == 1 {
+        state.status = "Updated open file from disk".into();
+    } else if reloaded > 1 {
+        state.status = format!("Updated {reloaded} open files from disk");
+    }
+
+    refreshed_groups
 }
 
 fn take_next_tab_id(state: &mut AppState) -> TabId {
