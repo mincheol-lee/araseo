@@ -888,6 +888,28 @@ mod tests {
         ui.set_terminal_grid_columns(80);
         ui.set_terminal_grid_rows(40);
         ui.set_terminal_cursor_row(0);
+        ui.set_terminal_cells(ModelRc::new(VecModel::from(vec![
+            TerminalCell {
+                row: 0,
+                column: 0,
+                glyph: " ".into(),
+                foreground: slint::Color::from_rgb_u8(255, 255, 255),
+                background: slint::Color::from_rgb_u8(180, 20, 20),
+                bold: false,
+                cursor: false,
+                column_span: 1,
+            },
+            TerminalCell {
+                row: 35,
+                column: 70,
+                glyph: " ".into(),
+                foreground: slint::Color::from_rgb_u8(255, 255, 255),
+                background: slint::Color::from_rgb_u8(20, 180, 20),
+                bold: false,
+                cursor: false,
+                column_span: 1,
+            },
+        ])));
         ui.set_terminal_update_generation(ui.get_terminal_update_generation() + 1);
         let terminal_ui = render(&window);
         write_snapshot_if_requested("single-terminal.png", &terminal_ui);
@@ -915,6 +937,34 @@ mod tests {
         assert!(
             ui.get_terminal_scroll_offset().abs() < 0.1,
             "the initial terminal prompt was scrolled out of view"
+        );
+        let top_left_cell_pixels = terminal_ui
+            .iter()
+            .enumerate()
+            .filter(|(index, pixel)| {
+                let x = index % 1200;
+                let y = index / 1200;
+                (250..258).contains(&x)
+                    && (70..88).contains(&y)
+                    && pixel.red > 120
+                    && pixel.red > pixel.green.saturating_add(60)
+            })
+            .count();
+        let positioned_cell_pixels = terminal_ui
+            .iter()
+            .enumerate()
+            .filter(|(index, pixel)| {
+                let x = index % 1200;
+                let y = index / 1200;
+                (810..818).contains(&x)
+                    && (700..718).contains(&y)
+                    && pixel.green > 120
+                    && pixel.green > pixel.red.saturating_add(60)
+            })
+            .count();
+        assert!(
+            top_left_cell_pixels > 80 && positioned_cell_pixels > 80,
+            "sparse terminal cells were not rendered at their explicit grid positions"
         );
 
         // After a long command such as `ls`, reveal the prompt on the last

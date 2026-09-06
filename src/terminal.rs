@@ -5,9 +5,10 @@ use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 #[cfg(windows)]
@@ -121,7 +122,13 @@ fn resize_windows_pty(distro: &str, tty_path_file: &str, rows: u16, columns: u16
     command.status().is_ok_and(|status| status.success())
 }
 
+const DEFAULT_FOREGROUND: [u8; 3] = [0xd8, 0xde, 0xe9];
+const DEFAULT_BACKGROUND: [u8; 3] = [0x11, 0x13, 0x18];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayCell {
+    pub row: i32,
+    pub column: i32,
     pub glyph: String,
     pub foreground: [u8; 3],
     pub background: [u8; 3],
@@ -130,11 +137,45 @@ pub struct DisplayCell {
     pub column_span: i32,
 }
 
+type OutputWaker = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct OutputSignal {
+    pending: AtomicBool,
+    waker: Mutex<Option<OutputWaker>>,
+}
+
+impl OutputSignal {
+    fn notify(&self) {
+        if self.pending.swap(true, AtomicOrdering::AcqRel) {
+            return;
+        }
+        let waker = self.waker.lock().ok().and_then(|waker| waker.clone());
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    fn set_waker(&self, waker: OutputWaker) {
+        if let Ok(mut current) = self.waker.lock() {
+            *current = Some(waker.clone());
+        }
+        if self.pending.load(AtomicOrdering::Acquire) {
+            waker();
+        }
+    }
+
+    fn clear_pending(&self) {
+        self.pending.store(false, AtomicOrdering::Release);
+    }
+}
+
 pub struct TerminalSession {
     #[cfg(not(target_os = "windows"))]
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     receiver: mpsc::Receiver<Vec<u8>>,
+    output_signal: Arc<OutputSignal>,
     parser: vt100::Parser,
     _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     _pipe_child: Option<std::process::Child>,
@@ -187,12 +228,14 @@ impl TerminalSession {
         let stdin = child.stdin.take().context("WSL stdin is unavailable")?;
 
         let (sender, receiver) = mpsc::channel();
-        spawn_reader(stdout, sender.clone());
-        spawn_reader(stderr, sender);
+        let output_signal = Arc::new(OutputSignal::default());
+        spawn_reader(stdout, sender.clone(), output_signal.clone());
+        spawn_reader(stderr, sender, output_signal.clone());
 
         Ok(Self {
             writer: Arc::new(Mutex::new(Box::new(stdin))),
             receiver,
+            output_signal,
             // util-linux `script` allocates an 80x24 Unix PTY by default.
             // Keep the VT parser at the same size so full-screen TUIs such as
             // Codex do not wrap every row into a narrow UI-sized buffer.
@@ -225,12 +268,14 @@ impl TerminalSession {
         let reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let (sender, receiver) = mpsc::channel();
-        spawn_reader(reader, sender);
+        let output_signal = Arc::new(OutputSignal::default());
+        spawn_reader(reader, sender, output_signal.clone());
 
         Ok(Self {
             master: pair.master,
             writer,
             receiver,
+            output_signal,
             parser: vt100::Parser::new(24, 100, 10_000),
             _pty_child: Some(child),
             _pipe_child: None,
@@ -239,50 +284,33 @@ impl TerminalSession {
 
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(bytes) = self.receiver.try_recv() {
-            self.parser.process(&bytes);
-            changed = true;
+        loop {
+            while let Ok(bytes) = self.receiver.try_recv() {
+                self.parser.process(&bytes);
+                changed = true;
+            }
+
+            // Clear the coalescing flag only after draining the channel. If a
+            // reader races with this store, the final try_recv either consumes
+            // its bytes here or its newly queued event wakes the UI again.
+            self.output_signal.clear_pending();
+            match self.receiver.try_recv() {
+                Ok(bytes) => {
+                    self.parser.process(&bytes);
+                    changed = true;
+                }
+                Err(_) => break,
+            }
         }
         changed
     }
 
+    pub fn set_output_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
+        self.output_signal.set_waker(Arc::new(waker));
+    }
+
     pub fn cells(&self) -> Vec<DisplayCell> {
-        let screen = self.parser.screen();
-        let (rows, columns) = screen.size();
-        let cursor_position = (!screen.hide_cursor()).then(|| screen.cursor_position());
-        let mut cells = Vec::with_capacity(rows as usize * columns as usize);
-        for row in 0..rows {
-            for column in 0..columns {
-                let cell = screen.cell(row, column);
-                let mut foreground = terminal_color(
-                    cell.map(vt100::Cell::fgcolor).unwrap_or_default(),
-                    [0xd8, 0xde, 0xe9],
-                );
-                let mut background = terminal_color(
-                    cell.map(vt100::Cell::bgcolor).unwrap_or_default(),
-                    [0x11, 0x13, 0x18],
-                );
-                if cell.is_some_and(vt100::Cell::inverse) {
-                    std::mem::swap(&mut foreground, &mut background);
-                }
-                if cell.is_some_and(vt100::Cell::dim) {
-                    foreground = foreground.map(|channel| channel.saturating_mul(2) / 3);
-                }
-                cells.push(DisplayCell {
-                    glyph: cell
-                        .map(vt100::Cell::contents)
-                        .filter(|contents| !contents.is_empty())
-                        .unwrap_or(" ")
-                        .to_string(),
-                    foreground,
-                    background,
-                    bold: cell.is_some_and(vt100::Cell::bold),
-                    cursor: cursor_position == Some((row, column)),
-                    column_span: cell_column_span(cell),
-                });
-            }
-        }
-        cells
+        display_cells(self.parser.screen())
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -334,6 +362,53 @@ impl TerminalSession {
     }
 }
 
+fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
+    let (rows, columns) = screen.size();
+    let cursor_position = (!screen.hide_cursor()).then(|| screen.cursor_position());
+    let mut cells = Vec::new();
+    for row in 0..rows {
+        for column in 0..columns {
+            let cell = screen.cell(row, column);
+            let mut foreground = terminal_color(
+                cell.map(vt100::Cell::fgcolor).unwrap_or_default(),
+                DEFAULT_FOREGROUND,
+            );
+            let mut background = terminal_color(
+                cell.map(vt100::Cell::bgcolor).unwrap_or_default(),
+                DEFAULT_BACKGROUND,
+            );
+            if cell.is_some_and(vt100::Cell::inverse) {
+                std::mem::swap(&mut foreground, &mut background);
+            }
+            if cell.is_some_and(vt100::Cell::dim) {
+                foreground = foreground.map(|channel| channel.saturating_mul(2) / 3);
+            }
+            let glyph = cell
+                .map(vt100::Cell::contents)
+                .filter(|contents| !contents.is_empty())
+                .unwrap_or(" ");
+            let cursor = cursor_position == Some((row, column));
+            let column_span = cell_column_span(cell);
+            if column_span == 0
+                || (!cursor && glyph == " " && background == DEFAULT_BACKGROUND)
+            {
+                continue;
+            }
+            cells.push(DisplayCell {
+                row: row.into(),
+                column: column.into(),
+                glyph: glyph.to_string(),
+                foreground,
+                background,
+                bold: cell.is_some_and(vt100::Cell::bold),
+                cursor,
+                column_span,
+            });
+        }
+    }
+    cells
+}
+
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         if let Some(child) = self._pty_child.as_mut() {
@@ -355,7 +430,11 @@ fn cell_column_span(cell: Option<&vt100::Cell>) -> i32 {
     }
 }
 
-fn spawn_reader(mut reader: impl Read + Send + 'static, sender: mpsc::Sender<Vec<u8>>) {
+fn spawn_reader(
+    mut reader: impl Read + Send + 'static,
+    sender: mpsc::Sender<Vec<u8>>,
+    output_signal: Arc<OutputSignal>,
+) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -365,6 +444,7 @@ fn spawn_reader(mut reader: impl Read + Send + 'static, sender: mpsc::Sender<Vec
                     if sender.send(buffer[..count].to_vec()).is_err() {
                         break;
                     }
+                    output_signal.notify();
                 }
             }
         }
@@ -453,6 +533,7 @@ pub fn encode_key(text: &str, control: bool, alt: bool, _shift: bool) -> Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn encodes_control_keys() {
@@ -474,6 +555,42 @@ mod tests {
         assert_eq!(cell_column_span(screen.cell(0, 0)), 2);
         assert_eq!(cell_column_span(screen.cell(0, 1)), 0);
         assert_eq!(cell_column_span(screen.cell(0, 2)), 1);
+    }
+
+    #[test]
+    fn omits_blank_cells_but_preserves_grid_positions_and_styled_spaces() {
+        let mut parser = vt100::Parser::new(3, 8, 0);
+        parser.process(b"A\x1b[2;3H\x1b[41m \x1b[0m");
+
+        let cells = display_cells(parser.screen());
+        assert!(cells.len() < 3 * 8);
+        assert!(cells.iter().any(|cell| {
+            cell.row == 0 && cell.column == 0 && cell.glyph == "A"
+        }));
+        assert!(cells.iter().any(|cell| {
+            cell.row == 1
+                && cell.column == 2
+                && cell.glyph == " "
+                && cell.background == ANSI_COLORS[1]
+        }));
+    }
+
+    #[test]
+    fn coalesces_output_wakes_until_the_ui_drains_the_terminal() {
+        let signal = OutputSignal::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observed_wakes = wakes.clone();
+        signal.set_waker(Arc::new(move || {
+            observed_wakes.fetch_add(1, AtomicOrdering::Relaxed);
+        }));
+
+        signal.notify();
+        signal.notify();
+        assert_eq!(wakes.load(AtomicOrdering::Relaxed), 1);
+
+        signal.clear_pending();
+        signal.notify();
+        assert_eq!(wakes.load(AtomicOrdering::Relaxed), 2);
     }
 
     #[test]
