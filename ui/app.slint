@@ -22,6 +22,8 @@ export struct TabEntry {
 }
 
 export struct TerminalCell {
+    row: int,
+    column: int,
     glyph: string,
     foreground: color,
     background: color,
@@ -510,9 +512,9 @@ component WorkspaceGroup inherits Rectangle {
                     width: terminal-scroll.viewport-width;
                     height: terminal-scroll.viewport-height;
                     background: #111318;
-                    for cell[index] in root.terminal-cells: Rectangle {
-                        x: Math.mod(index, max(1, root.terminal-grid-columns)) * 8px;
-                        y: floor(index / max(1, root.terminal-grid-columns)) * 18px;
+                    for cell in root.terminal-cells: Rectangle {
+                        x: cell.column * 8px;
+                        y: cell.row * 18px;
                         width: cell.column-span * 8px;
                         height: 18px;
                         visible: cell.column-span > 0;
@@ -713,6 +715,7 @@ export component AppWindow inherits Window {
     callback find-requested(int, string);
     callback terminal-key(int, string, bool, bool, bool);
     callback terminal-text(int, string);
+    callback terminal-output-ready(int);
     callback terminal-paste(string);
     callback new-terminal-requested(int);
     callback tab-dock-requested(int, int);

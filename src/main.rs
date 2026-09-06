@@ -11,7 +11,7 @@ mod workspace;
 
 use anyhow::{Context, Result, bail};
 use document::{Document, line_numbers};
-use slint::{ModelRc, Timer, TimerMode, VecModel};
+use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use slint::winit_030::WinitWindowAccessor;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -113,6 +113,32 @@ fn main() -> Result<()> {
     }));
 
     let ui = AppWindow::new()?;
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_terminal_output_ready(move |tab_id| {
+            let Ok(tab_id) = TabId::try_from(tab_id) else {
+                return;
+            };
+            let Some(ui) = weak.upgrade() else { return };
+            let mut state = state.borrow_mut();
+            let visible_group = state
+                .tab_groups
+                .group_of(tab_id)
+                .filter(|group| state.tab_groups.active(*group) == Some(tab_id));
+            let changed = terminal_mut(&mut state, tab_id).is_some_and(TerminalSession::poll);
+            if changed
+                && let Some(group) = visible_group
+            {
+                sync_group(&ui, &state, group);
+            }
+        });
+    }
+    for tab in &state.borrow().tabs {
+        if let TabContent::Terminal { session, .. } = &tab.content {
+            connect_terminal_output(&ui, tab.id, session);
+        }
+    }
     if let Some(path) = initial_file {
         let _ = open_document(&mut state.borrow_mut(), path);
     }
@@ -314,8 +340,15 @@ fn main() -> Result<()> {
         ui.on_new_terminal_requested(move |group| {
             let mut state = state.borrow_mut();
             let group = usize::try_from(group).unwrap_or(0).min(1);
-            if let Err(error) = open_terminal(&mut state, group) {
-                state.status = format!("Terminal unavailable: {error}");
+            match open_terminal(&mut state, group) {
+                Ok(tab_id) => {
+                    if let Some(ui) = weak.upgrade()
+                        && let Some(session) = terminal_ref(&state, tab_id)
+                    {
+                        connect_terminal_output(&ui, tab_id, session);
+                    }
+                }
+                Err(error) => state.status = format!("Terminal unavailable: {error}"),
             }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
@@ -385,8 +418,7 @@ fn main() -> Result<()> {
                         let (rows, columns) = terminal_sizes[group];
                         session.resize(rows, columns)
                     });
-                    let changed = resized | session.poll();
-                    if changed
+                    if resized
                         && let Some(group) = visible_group
                     {
                         changed_groups[group] = true;
@@ -693,6 +725,28 @@ fn terminal_ref(state: &AppState, tab_id: TabId) -> Option<&TerminalSession> {
     })
 }
 
+fn terminal_mut(state: &mut AppState, tab_id: TabId) -> Option<&mut TerminalSession> {
+    state.tabs.iter_mut().find_map(|tab| {
+        if tab.id != tab_id {
+            return None;
+        }
+        match &mut tab.content {
+            TabContent::Terminal { session, .. } => Some(session),
+            TabContent::File(_) => None,
+        }
+    })
+}
+
+fn connect_terminal_output(ui: &AppWindow, tab_id: TabId, terminal: &TerminalSession) {
+    let weak = ui.as_weak();
+    terminal.set_output_waker(move || {
+        let weak = weak.clone();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.invoke_terminal_output_ready(tab_id as i32);
+        });
+    });
+}
+
 fn refresh_tree(state: &mut AppState) {
     match tree::build_tree(&state.workspace, &state.expanded, &state.statuses) {
         Ok(tree) => state.tree = tree,
@@ -828,6 +882,8 @@ fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
         .cells()
         .into_iter()
         .map(|cell| TerminalCell {
+            row: cell.row,
+            column: cell.column,
             glyph: cell.glyph.into(),
             foreground: slint::Color::from_rgb_u8(
                 cell.foreground[0],
@@ -844,34 +900,130 @@ fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
             column_span: cell.column_span,
         })
         .collect::<Vec<_>>();
-    let cells = ModelRc::new(VecModel::from(cells));
     if group == 0 {
         ui.set_terminal_grid_rows(rows.into());
         ui.set_terminal_grid_columns(columns.into());
         ui.set_terminal_cursor_row(terminal.cursor_row());
         ui.set_terminal_cursor_column(terminal.cursor_column());
-        ui.set_terminal_cells(cells);
+        update_terminal_model(ui.get_terminal_cells(), cells, |model| {
+            ui.set_terminal_cells(model)
+        });
         ui.set_terminal_update_generation(ui.get_terminal_update_generation().wrapping_add(1));
     } else {
         ui.set_secondary_terminal_grid_rows(rows.into());
         ui.set_secondary_terminal_grid_columns(columns.into());
         ui.set_secondary_terminal_cursor_row(terminal.cursor_row());
         ui.set_secondary_terminal_cursor_column(terminal.cursor_column());
-        ui.set_secondary_terminal_cells(cells);
+        update_terminal_model(ui.get_secondary_terminal_cells(), cells, |model| {
+            ui.set_secondary_terminal_cells(model)
+        });
         ui.set_secondary_terminal_update_generation(
             ui.get_secondary_terminal_update_generation().wrapping_add(1),
         );
     }
 }
 
+fn update_terminal_model(
+    current: ModelRc<TerminalCell>,
+    cells: Vec<TerminalCell>,
+    set_model: impl FnOnce(ModelRc<TerminalCell>),
+) {
+    let Some(model) = current.as_any().downcast_ref::<VecModel<TerminalCell>>() else {
+        set_model(ModelRc::new(VecModel::from(cells)));
+        return;
+    };
+
+    let old_count = model.row_count();
+    if old_count == cells.len()
+        && cells.iter().enumerate().all(|(index, cell)| {
+            model.row_data(index).is_some_and(|current| {
+                current.row == cell.row && current.column == cell.column
+            })
+        })
+    {
+        let changed = cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                model
+                    .row_data(index)
+                    .is_none_or(|current| !terminal_cells_equal(&current, cell))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if changed.len() > 256 && changed.len() * 3 > cells.len() {
+            model.set_vec(cells);
+        } else {
+            for index in changed {
+                model.set_row_data(index, cells[index].clone());
+            }
+        }
+        return;
+    }
+
+    // Sparse cells are sorted by screen position. Preserve the unchanged
+    // prefix and suffix so ordinary typing normally removes the old cursor
+    // cell and inserts only the new glyph and cursor cells.
+    let prefix = (0..old_count.min(cells.len()))
+        .take_while(|index| {
+            model
+                .row_data(*index)
+                .is_some_and(|current| terminal_cells_equal(&current, &cells[*index]))
+        })
+        .count();
+    let max_suffix = (old_count - prefix).min(cells.len() - prefix);
+    let suffix = (0..max_suffix)
+        .take_while(|offset| {
+            let old_index = old_count - 1 - offset;
+            let new_index = cells.len() - 1 - offset;
+            model
+                .row_data(old_index)
+                .is_some_and(|current| terminal_cells_equal(&current, &cells[new_index]))
+        })
+        .count();
+    let old_middle_count = old_count - prefix - suffix;
+    let new_middle_count = cells.len() - prefix - suffix;
+
+    if old_middle_count + new_middle_count > 256 {
+        model.set_vec(cells);
+        return;
+    }
+
+    for _ in 0..old_middle_count {
+        model.remove(prefix);
+    }
+    for (offset, cell) in cells
+        .into_iter()
+        .skip(prefix)
+        .take(new_middle_count)
+        .enumerate()
+    {
+        model.insert(prefix + offset, cell);
+    }
+}
+
+fn terminal_cells_equal(left: &TerminalCell, right: &TerminalCell) -> bool {
+    left.row == right.row
+        && left.column == right.column
+        && left.glyph == right.glyph
+        && left.foreground == right.foreground
+        && left.background == right.background
+        && left.bold == right.bold
+        && left.cursor == right.cursor
+        && left.column_span == right.column_span
+}
+
 fn clear_terminal_group(ui: &AppWindow, group: usize) {
-    let cells = ModelRc::new(VecModel::<TerminalCell>::default());
     if group == 0 {
-        ui.set_terminal_cells(cells);
+        update_terminal_model(ui.get_terminal_cells(), Vec::new(), |model| {
+            ui.set_terminal_cells(model)
+        });
         ui.set_terminal_cursor_row(-1);
         ui.set_terminal_cursor_column(-1);
     } else {
-        ui.set_secondary_terminal_cells(cells);
+        update_terminal_model(ui.get_secondary_terminal_cells(), Vec::new(), |model| {
+            ui.set_secondary_terminal_cells(model)
+        });
         ui.set_secondary_terminal_cursor_row(-1);
         ui.set_secondary_terminal_cursor_column(-1);
     }
