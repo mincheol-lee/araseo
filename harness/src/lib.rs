@@ -16,3 +16,8 @@ pub mod git;
 pub mod terminal;
 #[path = "../../src/tabs.rs"]
 pub mod tabs;
+#[path = "../../src/background.rs"]
+pub mod background;
+
+#[path = "../../src/appearance.rs"]
+pub mod appearance;

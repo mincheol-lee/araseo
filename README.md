@@ -33,6 +33,18 @@ Araseo is an active personal project. More editor, terminal, Git, workspace,
 and quality-of-life features will continue to be added while keeping startup,
 resource usage, and the overall interface lightweight.
 
+Workspace startup, file opening, tree scanning, and emoji preparation run on
+background workers. Rapid file selections keep the latest requested file;
+activating or closing a tab cancels a pending open. While typing, text is shown
+immediately in plain color and syntax colors return after a 120 ms pause plus
+background processing. Unchanged line numbers and editor buffers are retained.
+Continuous terminal output is processed in bounded batches to let input run.
+
+A manual presentation microbenchmark is available with
+`cargo test --manifest-path ui-harness/Cargo.toml benchmark_edit_presentation -- --ignored --nocapture`.
+It compares the old per-edit highlighting work with the deferred input path;
+it excludes document edits, rendering, and eventual background highlighting.
+
 The product specification is in [docs/PRD.md](docs/PRD.md).
 
 ## Development
@@ -93,3 +105,5 @@ for the Windows target:
 
 `scripts/build-windows.ps1` runs the headless harness automatically before it
 creates `dist/araseo.exe`.
+
+Use **Aa** in the status bar to change terminal, file viewer, and file list font sizes and brightness independently. **Reset** restores the Orca-matched defaults (14, 14, and 12 px at 120% brightness). Settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or `$XDG_CONFIG_HOME/araseo/fonts.conf` (default `~/.config/araseo/fonts.conf`) on Linux.

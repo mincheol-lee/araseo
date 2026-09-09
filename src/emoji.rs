@@ -1,16 +1,15 @@
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use swash::FontRef;
 use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
-use swash::FontRef;
 
 const ICON_SIZE: u32 = 24;
 const EMOJIS: &[&str] = &[
-    "🌿", "🧩", "🧪", "📚", "🎨", "🛠️", "📦", "⚙️", "💻", "🧱", "💡", "🗄️",
-    "🌐", "📂", "📁", "🐳", "🙈", "🔒", "🔐", "📖", "⚖️", "📋", "🤖", "🦀",
-    "🐍", "⚡", "🔷", "🐹", "☕", "💎", "🐦", "🎯", "🐘", "📝", "🐚", "📊",
-    "🖼️", "🎵", "🎬", "📕", "📜", "🔤", "📄",
+    "🌿", "🧩", "🧪", "📚", "🎨", "🛠️", "📦", "⚙️", "💻", "🧱", "💡", "🗄️", "🌐", "📂", "📁", "🐳",
+    "🙈", "🔒", "🔐", "📖", "⚖️", "📋", "🤖", "🦀", "🐍", "⚡", "🔷", "🐹", "☕", "💎", "🐦", "🎯",
+    "🐘", "📝", "🐚", "📊", "🖼️", "🎵", "🎬", "📕", "📜", "🔤", "📄",
 ];
 
 #[derive(Default)]
@@ -19,15 +18,38 @@ pub struct EmojiIcons {
 }
 
 impl EmojiIcons {
+    #[cfg(test)]
     pub fn load_system() -> Self {
+        Self::from_pixels(Self::load_pixels())
+    }
+
+    pub fn load_pixels() -> Vec<(&'static str, Vec<Rgba8Pixel>)> {
         emoji_font_candidates()
             .into_iter()
             .find_map(|path| std::fs::read(path).ok())
-            .and_then(|data| Self::from_font_data(&data))
+            .and_then(|data| Self::pixels_from_font(&data))
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn from_font_data(data: &[u8]) -> Option<Self> {
+        Some(Self::from_pixels(Self::pixels_from_font(data)?))
+    }
+
+    pub fn from_pixels(pixels: Vec<(&'static str, Vec<Rgba8Pixel>)>) -> Self {
+        Self {
+            images: pixels
+                .into_iter()
+                .map(|(emoji, pixels)| {
+                    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(ICON_SIZE, ICON_SIZE);
+                    buffer.make_mut_slice().copy_from_slice(&pixels);
+                    (emoji, Image::from_rgba8(buffer))
+                })
+                .collect(),
+        }
+    }
+
+    fn pixels_from_font(data: &[u8]) -> Option<Vec<(&'static str, Vec<Rgba8Pixel>)>> {
         let font = FontRef::from_index(data, 0)?;
         let mut scale_context = ScaleContext::new();
         let images = EMOJIS
@@ -36,7 +58,7 @@ impl EmojiIcons {
                 render_emoji(&font, &mut scale_context, emoji).map(|image| (*emoji, image))
             })
             .collect();
-        Some(Self { images })
+        Some(images)
     }
 
     pub fn get(&self, emoji: &str) -> Image {
@@ -61,14 +83,10 @@ fn render_emoji(
     font: &FontRef<'_>,
     scale_context: &mut ScaleContext,
     emoji: &str,
-) -> Option<Image> {
+) -> Option<Vec<Rgba8Pixel>> {
     let character = emoji.chars().find(|character| *character != '\u{fe0f}')?;
     let glyph_id = font.charmap().map(character);
-    let mut scaler = scale_context
-        .builder(*font)
-        .size(20.0)
-        .hint(true)
-        .build();
+    let mut scaler = scale_context.builder(*font).size(20.0).hint(true).build();
     let rendered = Render::new(&[
         Source::ColorOutline(0),
         Source::ColorBitmap(StrikeWith::BestFit),
@@ -115,7 +133,7 @@ fn render_emoji(
         }
     }
 
-    Some(Image::from_rgba8(buffer))
+    Some(buffer.as_slice().to_vec())
 }
 
 fn fallback_color(emoji: &str) -> [u8; 3] {
@@ -155,11 +173,17 @@ mod tests {
             );
         }
         let pixels = icons.get("🧩").to_rgba8().expect("embedded RGBA icon");
-        assert!(pixels.as_slice().iter().any(|pixel| {
-            pixel.a > 0 && (pixel.r > 0 || pixel.g > 0 || pixel.b > 0)
-        }));
-        assert!(pixels.as_slice().iter().any(|pixel| {
-            pixel.a > 0 && !(pixel.r == pixel.g && pixel.g == pixel.b)
-        }));
+        assert!(
+            pixels
+                .as_slice()
+                .iter()
+                .any(|pixel| { pixel.a > 0 && (pixel.r > 0 || pixel.g > 0 || pixel.b > 0) })
+        );
+        assert!(
+            pixels
+                .as_slice()
+                .iter()
+                .any(|pixel| { pixel.a > 0 && !(pixel.r == pixel.g && pixel.g == pixel.b) })
+        );
     }
 }
