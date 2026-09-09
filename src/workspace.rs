@@ -13,6 +13,19 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(distro: impl Into<String>, linux_root: PathBuf) -> Result<Self> {
+        let workspace = Self::prepare(distro, linux_root)?;
+        if !workspace.host_root.is_dir() {
+            bail!(
+                "workspace is not accessible: {}",
+                workspace.linux_root.display()
+            );
+        }
+        Ok(workspace)
+    }
+
+    /// Validate and map the path without touching WSL or the filesystem. The
+    /// desktop can display its first frame while workers check accessibility.
+    pub fn prepare(distro: impl Into<String>, linux_root: PathBuf) -> Result<Self> {
         let linux_root_text = normalize_linux_path(&linux_root);
         if !linux_root_text.starts_with('/') {
             bail!("workspace path must be absolute: {}", linux_root.display());
@@ -23,10 +36,6 @@ impl Workspace {
 
         let distro = distro.into();
         let host_root = linux_to_host_path(&distro, &linux_root);
-        if !host_root.is_dir() {
-            bail!("workspace is not accessible: {}", linux_root.display());
-        }
-
         Ok(Self {
             distro,
             linux_root,
@@ -82,6 +91,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preparing_a_workspace_does_not_require_disk_access() {
+        let root = PathBuf::from("/araseo-nonexistent-workspace-for-path-test");
+        assert_eq!(
+            Workspace::prepare("Ubuntu", root.clone())
+                .unwrap()
+                .linux_root,
+            root
+        );
+        assert!(Workspace::prepare("Ubuntu", PathBuf::from("relative")).is_err());
+        assert!(Workspace::prepare("Ubuntu", PathBuf::from("/workspace/../escape")).is_err());
+    }
+
+    #[test]
     fn linux_path_is_unchanged_on_linux() {
         let path = Path::new("/home/user/한글 project");
         if cfg!(windows) {
@@ -110,7 +132,8 @@ mod tests {
     fn rejects_symlink_that_escapes_workspace() {
         use std::os::unix::fs::symlink;
 
-        let base = std::env::temp_dir().join(format!("araseo-workspace-test-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("araseo-workspace-test-{}", std::process::id()));
         let root = base.join("root");
         let outside = base.join("outside.txt");
         let _ = fs::remove_dir_all(&base);

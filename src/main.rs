@@ -1,6 +1,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod appearance;
+mod background;
 mod document;
+mod editor_view;
 mod emoji;
 mod git;
 mod highlight;
@@ -10,14 +13,15 @@ mod tree;
 mod workspace;
 
 use anyhow::{Context, Result, bail};
-use document::{Document, ExternalRefresh, line_numbers};
-use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
+use background::Background;
+use document::{Document, ExternalRefresh};
 use slint::winit_030::WinitWindowAccessor;
+use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tabs::{TabGroups, TabId};
 use terminal::TerminalSession;
 use tree::{FlatNode, GitStatus};
@@ -40,6 +44,9 @@ struct AppState {
     save_conflict: Option<TabId>,
     syncing_editor: Cell<bool>,
     emoji_icons: emoji::EmojiIcons,
+    tree_loader: Background<Result<Vec<FlatNode>>>,
+    file_loader: Background<Result<(Document, usize)>>,
+    editor_views: RefCell<[editor_view::EditorView; 2]>,
 }
 
 enum TabContent {
@@ -66,53 +73,73 @@ fn main() -> Result<()> {
         .renderer_name("software".into())
         .select()
         .context("failed to initialize the Windows software renderer")?;
-    let workspace = Workspace::new(distro, root)?;
+    let workspace = Workspace::prepare(distro, root)?;
     let statuses = HashMap::new();
-    let tree = tree::build_tree(&workspace, &HashSet::new(), &statuses)?;
-    let (git_monitor, monitor_error) = match git::StatusMonitor::spawn(&workspace) {
-        Ok(monitor) => (Some(monitor), None),
-        Err(error) => (None, Some(format!("Git auto-refresh unavailable: {error}"))),
-    };
-    let (terminal, initial_status) =
-        match TerminalSession::spawn(&workspace.distro, &workspace.linux_root) {
-            Ok(terminal) => (Some(terminal), monitor_error.unwrap_or_else(|| "Ready".to_string())),
-            Err(error) => (None, format!("Terminal unavailable: {error}")),
-        };
-    let mut workspace_tabs = Vec::new();
-    let mut tab_groups = TabGroups::default();
-    let mut next_tab_id = 0;
-    let mut next_terminal_number = 1;
-    if let Some(terminal) = terminal {
-        workspace_tabs.push(WorkspaceTab {
-            id: next_tab_id,
-            content: TabContent::Terminal {
-                session: terminal,
-                start_path: workspace.linux_root.clone(),
-                number: next_terminal_number,
-            },
-        });
-        tab_groups.add(next_tab_id, 0);
-        next_tab_id += 1;
-        next_terminal_number += 1;
-    }
+    let tree = Vec::new();
+    let mut startup_loader = Background::default();
+    let startup_workspace = workspace.clone();
+    startup_loader.request(move || -> Result<_> {
+        let workspace = Workspace::new(startup_workspace.distro, startup_workspace.linux_root)?;
+        Ok((
+            git::StatusMonitor::spawn(&workspace),
+            TerminalSession::spawn(&workspace.distro, &workspace.linux_root),
+        ))
+    });
     let state = Rc::new(RefCell::new(AppState {
         workspace,
         expanded: HashSet::new(),
         statuses,
         repositories: HashSet::new(),
         tree,
-        tabs: workspace_tabs,
-        tab_groups,
-        next_tab_id,
-        next_terminal_number,
-        git_monitor,
-        status: initial_status,
+        tabs: Vec::new(),
+        tab_groups: TabGroups::default(),
+        next_tab_id: 0,
+        next_terminal_number: 1,
+        git_monitor: None,
+        status: "Starting workspace...".into(),
         save_conflict: None,
         syncing_editor: Cell::new(false),
-        emoji_icons: emoji::EmojiIcons::load_system(),
+        emoji_icons: emoji::EmojiIcons::default(),
+        tree_loader: Background::default(),
+        file_loader: Background::default(),
+        editor_views: RefCell::new(Default::default()),
     }));
 
+    refresh_tree(&mut state.borrow_mut());
+    let mut icon_loader = Background::default();
+    icon_loader.request(emoji::EmojiIcons::load_pixels);
+
     let ui = AppWindow::new()?;
+    if let Some(path) = appearance::settings_path() {
+        let sizes = appearance::FontSizes::load(&path);
+        ui.set_terminal_font_size(sizes.terminal);
+        ui.set_editor_font_size(sizes.editor);
+        ui.set_tree_font_size(sizes.tree);
+        ui.set_terminal_font_brightness(sizes.terminal_brightness);
+        ui.set_editor_font_brightness(sizes.editor_brightness);
+        ui.set_tree_font_brightness(sizes.tree_brightness);
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_font_settings_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let sizes = appearance::FontSizes {
+                terminal: ui.get_terminal_font_size(),
+                editor: ui.get_editor_font_size(),
+                tree: ui.get_tree_font_size(),
+                terminal_brightness: ui.get_terminal_font_brightness(),
+                editor_brightness: ui.get_editor_font_brightness(),
+                tree_brightness: ui.get_tree_font_brightness(),
+            };
+            if let Err(error) = sizes.save(&path) {
+                ui.set_status_text(format!("Could not save font settings: {error}").into());
+            }
+            let state = state.borrow();
+            for group in 0..2 {
+                sync_group(&ui, &state, group);
+            }
+        });
+    }
+
     {
         let weak = ui.as_weak();
         let state = state.clone();
@@ -127,17 +154,10 @@ fn main() -> Result<()> {
                 .group_of(tab_id)
                 .filter(|group| state.tab_groups.active(*group) == Some(tab_id));
             let changed = terminal_mut(&mut state, tab_id).is_some_and(TerminalSession::poll);
-            if changed
-                && let Some(group) = visible_group
-            {
+            if changed && let Some(group) = visible_group {
                 sync_group(&ui, &state, group);
             }
         });
-    }
-    for tab in &state.borrow().tabs {
-        if let TabContent::Terminal { session, .. } = &tab.content {
-            connect_terminal_output(&ui, tab.id, session);
-        }
     }
     if let Some(path) = initial_file {
         let _ = open_document(&mut state.borrow_mut(), path);
@@ -194,6 +214,7 @@ fn main() -> Result<()> {
         let state = state.clone();
         ui.on_tab_cycle(move |delta| {
             let mut state = state.borrow_mut();
+            cancel_file_open(&mut state);
             state.tab_groups.cycle(delta);
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
@@ -205,6 +226,7 @@ fn main() -> Result<()> {
         let state = state.clone();
         ui.on_tab_activated(move |tab_id| {
             let mut state = state.borrow_mut();
+            cancel_file_open(&mut state);
             if let Ok(tab_id) = TabId::try_from(tab_id) {
                 state.tab_groups.activate(tab_id);
             }
@@ -241,15 +263,23 @@ fn main() -> Result<()> {
                 .tab_groups
                 .group_of(tab_id)
                 .is_some_and(|group| state.tab_groups.active(group) == Some(tab_id));
-            if is_active
-                && let Some(document) = document_mut(&mut state, tab_id)
-            {
+            let mut dirty_changed = false;
+            if is_active && let Some(document) = document_mut(&mut state, tab_id) {
+                let was_dirty = document.dirty;
                 document.set_text(text.to_string());
+                dirty_changed = was_dirty != document.dirty;
             }
             if let Some(ui) = weak.upgrade() {
-                sync_tabs(&ui, &state);
-                if let Some(group) = state.tab_groups.group_of(tab_id) {
-                    sync_group(&ui, &state, group);
+                if dirty_changed {
+                    sync_tabs(&ui, &state);
+                }
+                if is_active
+                    && let Some(group) = state.tab_groups.group_of(tab_id)
+                    && let Some(document) = document_ref(&state, tab_id)
+                {
+                    // TextInput already owns the new text. Do not feed the
+                    // entire buffer back through Slint on every keystroke.
+                    sync_editor_view(&ui, &state, document, group, text);
                 }
             }
         });
@@ -361,6 +391,7 @@ fn main() -> Result<()> {
         let state = state.clone();
         ui.on_tab_dock_requested(move |tab_id, zone| {
             let mut state = state.borrow_mut();
+            cancel_file_open(&mut state);
             if let Ok(tab_id) = TabId::try_from(tab_id) {
                 state.tab_groups.dock(tab_id, zone);
             }
@@ -379,6 +410,98 @@ fn main() -> Result<()> {
         });
     }
     ui.on_terminal_paste(|_| {});
+
+    let loading_timer = Timer::default();
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        loading_timer.start(TimerMode::Repeated, Duration::from_millis(16), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut state = state.borrow_mut();
+            if let Some(result) = startup_loader.poll() {
+                match result {
+                    Ok((monitor, terminal)) => {
+                        if state.status == "Starting workspace..." {
+                            state.status = "Ready".into();
+                        }
+                        match monitor {
+                            Ok(monitor) => state.git_monitor = Some(monitor),
+                            Err(error) => {
+                                state.status = format!("Git auto-refresh unavailable: {error}")
+                            }
+                        }
+                        match terminal {
+                            Ok(session) => {
+                                let tab_id = take_next_tab_id(&mut state);
+                                connect_terminal_output(&ui, tab_id, &session);
+                                let start_path = state.workspace.linux_root.clone();
+                                let number = state.next_terminal_number;
+                                state.next_terminal_number += 1;
+                                state.tabs.push(WorkspaceTab {
+                                    id: tab_id,
+                                    content: TabContent::Terminal {
+                                        session,
+                                        start_path,
+                                        number,
+                                    },
+                                });
+                                state.tab_groups.add_background(tab_id, 0);
+                            }
+                            Err(error) => state.status = format!("Terminal unavailable: {error}"),
+                        }
+                    }
+                    Err(error) => state.status = error.to_string(),
+                }
+                sync_ui(&ui, &state);
+            }
+            if let Some(result) = state.tree_loader.poll() {
+                match result {
+                    Ok(tree) => {
+                        if state.tree != tree {
+                            state.tree = tree;
+                            sync_tree(&ui, &state);
+                        }
+                    }
+                    Err(error) => {
+                        state.status = error.to_string();
+                        ui.set_status_text(state.status.clone().into());
+                    }
+                }
+            }
+            if let Some(pixels) = icon_loader.poll() {
+                state.emoji_icons = emoji::EmojiIcons::from_pixels(pixels);
+                sync_tree(&ui, &state);
+            }
+            if let Some(result) = state.file_loader.poll() {
+                match result {
+                    Ok((document, group)) => {
+                        let tab_id = take_next_tab_id(&mut state);
+                        state.tabs.push(WorkspaceTab {
+                            id: tab_id,
+                            content: TabContent::File(document),
+                        });
+                        state.tab_groups.add(tab_id, group);
+                        state.status = "File opened".into();
+                    }
+                    Err(error) => state.status = error.to_string(),
+                }
+                sync_ui(&ui, &state);
+            }
+            for (group, view) in state.editor_views.borrow_mut().iter_mut().enumerate() {
+                if let Some(highlighted) = view.poll(Instant::now()) {
+                    let enabled = highlighted.is_some();
+                    let text = highlighted.unwrap_or_default();
+                    if group == 0 {
+                        ui.set_highlighted_text(text);
+                        ui.set_syntax_highlight_enabled(enabled);
+                    } else {
+                        ui.set_secondary_highlighted_text(text);
+                        ui.set_secondary_syntax_highlight_enabled(enabled);
+                    }
+                }
+            }
+        });
+    }
 
     let timer = Timer::default();
     {
@@ -418,9 +541,7 @@ fn main() -> Result<()> {
                         let (rows, columns) = terminal_sizes[group];
                         session.resize(rows, columns)
                     });
-                    if resized
-                        && let Some(group) = visible_group
-                    {
+                    if resized && let Some(group) = visible_group {
                         changed_groups[group] = true;
                     }
                 }
@@ -590,7 +711,15 @@ fn apply_history_change(
     }
 }
 
+fn cancel_file_open(state: &mut AppState) {
+    state.file_loader.cancel();
+    if state.status.starts_with("Opening ") {
+        state.status = "Ready".into();
+    }
+}
+
 fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
+    cancel_file_open(state);
     if let Some(tab_id) = state.tabs.iter().find_map(|tab| match &tab.content {
         TabContent::File(document) if document.linux_path == linux_path => Some(tab.id),
         _ => None,
@@ -599,20 +728,18 @@ fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let host_path = state.workspace.host_path(&linux_path)?;
-    let document = Document::open(linux_path, host_path)?;
-    let tab_id = take_next_tab_id(state);
+    let workspace = state.workspace.clone();
     let group = state.tab_groups.focused_group();
-    state.tabs.push(WorkspaceTab {
-        id: tab_id,
-        content: TabContent::File(document),
+    state.status = format!("Opening {}...", linux_path.display());
+    state.file_loader.request(move || {
+        let host_path = workspace.host_path(&linux_path)?;
+        Ok((Document::open(linux_path, host_path)?, group))
     });
-    state.tab_groups.add(tab_id, group);
-    state.status = "File opened".into();
     Ok(())
 }
 
 fn open_terminal(state: &mut AppState, group: usize) -> Result<TabId> {
+    cancel_file_open(state);
     let session = TerminalSession::spawn(&state.workspace.distro, &state.workspace.linux_root)?;
     let tab_id = take_next_tab_id(state);
     let number = state.next_terminal_number;
@@ -631,6 +758,7 @@ fn open_terminal(state: &mut AppState, group: usize) -> Result<TabId> {
 }
 
 fn close_tab(state: &mut AppState, tab_id: TabId) {
+    cancel_file_open(state);
     let Some(index) = state.tabs.iter().position(|tab| tab.id == tab_id) else {
         return;
     };
@@ -815,10 +943,12 @@ fn connect_terminal_output(ui: &AppWindow, tab_id: TabId, terminal: &TerminalSes
 }
 
 fn refresh_tree(state: &mut AppState) {
-    match tree::build_tree(&state.workspace, &state.expanded, &state.statuses) {
-        Ok(tree) => state.tree = tree,
-        Err(error) => state.status = error.to_string(),
-    }
+    let workspace = state.workspace.clone();
+    let expanded = state.expanded.clone();
+    let statuses = state.statuses.clone();
+    state
+        .tree_loader
+        .request(move || tree::build_tree(&workspace, &expanded, &statuses));
 }
 
 fn sync_ui(ui: &AppWindow, state: &AppState) {
@@ -858,13 +988,15 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                 TabContent::File(document) => {
                     ui.set_primary_active_kind("file".into());
                     state.syncing_editor.set(true);
-                    ui.set_editor_text(document.text.clone().into());
+                    if ui.get_editor_text().as_str() != document.text {
+                        ui.set_editor_text(document.text.clone().into());
+                    }
                     state.syncing_editor.set(false);
-                    ui.set_line_numbers(line_numbers(&document.text).into());
-                    sync_highlight_for_document(ui, document, 0);
+                    sync_editor_view(ui, state, document, 0, ui.get_editor_text());
                     clear_terminal_group(ui, 0);
                 }
                 TabContent::Terminal { session, .. } => {
+                    state.editor_views.borrow_mut()[0].clear();
                     ui.set_primary_active_kind("terminal".into());
                     ui.set_syntax_highlight_enabled(false);
                     ui.set_highlighted_text(slint::StyledText::default());
@@ -880,13 +1012,15 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                 TabContent::File(document) => {
                     ui.set_secondary_active_kind("file".into());
                     state.syncing_editor.set(true);
-                    ui.set_secondary_editor_text(document.text.clone().into());
+                    if ui.get_secondary_editor_text().as_str() != document.text {
+                        ui.set_secondary_editor_text(document.text.clone().into());
+                    }
                     state.syncing_editor.set(false);
-                    ui.set_secondary_line_numbers(line_numbers(&document.text).into());
-                    sync_highlight_for_document(ui, document, 1);
+                    sync_editor_view(ui, state, document, 1, ui.get_secondary_editor_text());
                     clear_terminal_group(ui, 1);
                 }
                 TabContent::Terminal { session, .. } => {
+                    state.editor_views.borrow_mut()[1].clear();
                     ui.set_secondary_active_kind("terminal".into());
                     ui.set_secondary_syntax_highlight_enabled(false);
                     ui.set_secondary_highlighted_text(slint::StyledText::default());
@@ -895,6 +1029,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
             }
         }
         (0, None) => {
+            state.editor_views.borrow_mut()[0].clear();
             ui.set_primary_active_tab_id(-1);
             ui.set_primary_active_kind("".into());
             ui.set_primary_active_title("".into());
@@ -906,6 +1041,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
             clear_terminal_group(ui, 0);
         }
         (1, None) => {
+            state.editor_views.borrow_mut()[1].clear();
             ui.set_secondary_active_tab_id(-1);
             ui.set_secondary_active_kind("".into());
             ui.set_secondary_active_title("".into());
@@ -920,22 +1056,34 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
     }
 }
 
-fn sync_highlight_for_document(ui: &AppWindow, document: &Document, group: usize) {
-    let highlighted = highlight::highlighted(&document.linux_path, &document.text);
-    match (group, highlighted) {
-        (0, Some(text)) => {
-            ui.set_highlighted_text(text);
-            ui.set_syntax_highlight_enabled(true);
-        }
-        (1, Some(text)) => {
-            ui.set_secondary_highlighted_text(text);
-            ui.set_secondary_syntax_highlight_enabled(true);
-        }
-        (0, None) => {
+fn sync_editor_view(
+    ui: &AppWindow,
+    state: &AppState,
+    document: &Document,
+    group: usize,
+    text: slint::SharedString,
+) {
+    let (changed, numbers) = state.editor_views.borrow_mut()[group].update(
+        &document.linux_path,
+        text,
+        ui.get_editor_font_brightness(),
+        Instant::now(),
+    );
+    if !changed {
+        return;
+    }
+    match group {
+        0 => {
+            if let Some(numbers) = numbers {
+                ui.set_line_numbers(numbers);
+            }
             ui.set_highlighted_text(slint::StyledText::default());
             ui.set_syntax_highlight_enabled(false);
         }
-        (1, None) => {
+        1 => {
+            if let Some(numbers) = numbers {
+                ui.set_secondary_line_numbers(numbers);
+            }
             ui.set_secondary_highlighted_text(slint::StyledText::default());
             ui.set_secondary_syntax_highlight_enabled(false);
         }
@@ -985,7 +1133,8 @@ fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
             ui.set_secondary_terminal_cells(model)
         });
         ui.set_secondary_terminal_update_generation(
-            ui.get_secondary_terminal_update_generation().wrapping_add(1),
+            ui.get_secondary_terminal_update_generation()
+                .wrapping_add(1),
         );
     }
 }
@@ -1003,9 +1152,9 @@ fn update_terminal_model(
     let old_count = model.row_count();
     if old_count == cells.len()
         && cells.iter().enumerate().all(|(index, cell)| {
-            model.row_data(index).is_some_and(|current| {
-                current.row == cell.row && current.column == cell.column
-            })
+            model
+                .row_data(index)
+                .is_some_and(|current| current.row == cell.row && current.column == cell.column)
         })
     {
         let changed = cells
@@ -1123,8 +1272,7 @@ fn sync_tree(ui: &AppWindow, state: &AppState) {
         .tree
         .iter()
         .map(|node| {
-            let project_kind = if node.is_directory
-                && state.repositories.contains(&node.linux_path)
+            let project_kind = if node.is_directory && state.repositories.contains(&node.linux_path)
             {
                 "git"
             } else if node.is_directory

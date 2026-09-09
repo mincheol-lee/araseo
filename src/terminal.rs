@@ -122,8 +122,8 @@ fn resize_windows_pty(distro: &str, tty_path_file: &str, rows: u16, columns: u16
     command.status().is_ok_and(|status| status.success())
 }
 
-const DEFAULT_FOREGROUND: [u8; 3] = [0xd8, 0xde, 0xe9];
-const DEFAULT_BACKGROUND: [u8; 3] = [0x11, 0x13, 0x18];
+const DEFAULT_FOREGROUND: [u8; 3] = [0xff, 0xff, 0xff];
+const DEFAULT_BACKGROUND: [u8; 3] = [0x28, 0x2c, 0x34];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayCell {
@@ -197,10 +197,7 @@ impl TerminalSession {
     #[cfg(target_os = "windows")]
     fn spawn_windows(distro: &str, linux_root: &Path) -> Result<Self> {
         let terminal_id = NEXT_WINDOWS_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
-        let tty_path_file = format!(
-            "/tmp/araseo-pty-{}-{terminal_id}",
-            std::process::id()
-        );
+        let tty_path_file = format!("/tmp/araseo-pty-{}-{terminal_id}", std::process::id());
         let shell_command = format!(
             "stty rows 24 cols 80; tty > {tty_path_file}; \
              /usr/bin/env TERM=xterm-256color COLORTERM=truecolor /bin/bash --login -i; \
@@ -211,11 +208,7 @@ impl TerminalSession {
         command
             .args(["-d", distro, "--cd"])
             .arg(linux_root)
-            .args([
-                "--exec",
-                "/usr/bin/script",
-                "-qfec",
-            ])
+            .args(["--exec", "/usr/bin/script", "-qfec"])
             .arg(shell_command)
             .arg("/dev/null")
             .stdin(Stdio::piped())
@@ -227,7 +220,8 @@ impl TerminalSession {
         let stderr = child.stderr.take().context("WSL stderr is unavailable")?;
         let stdin = child.stdin.take().context("WSL stdin is unavailable")?;
 
-        let (sender, receiver) = mpsc::channel();
+        // Backpressure bounds unread output to roughly 512 KiB per terminal.
+        let (sender, receiver) = mpsc::sync_channel(64);
         let output_signal = Arc::new(OutputSignal::default());
         spawn_reader(stdout, sender.clone(), output_signal.clone());
         spawn_reader(stderr, sender, output_signal.clone());
@@ -267,7 +261,7 @@ impl TerminalSession {
             .context("failed to start WSL shell")?;
         let reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(64);
         let output_signal = Arc::new(OutputSignal::default());
         spawn_reader(reader, sender, output_signal.clone());
 
@@ -283,26 +277,7 @@ impl TerminalSession {
     }
 
     pub fn poll(&mut self) -> bool {
-        let mut changed = false;
-        loop {
-            while let Ok(bytes) = self.receiver.try_recv() {
-                self.parser.process(&bytes);
-                changed = true;
-            }
-
-            // Clear the coalescing flag only after draining the channel. If a
-            // reader races with this store, the final try_recv either consumes
-            // its bytes here or its newly queued event wakes the UI again.
-            self.output_signal.clear_pending();
-            match self.receiver.try_recv() {
-                Ok(bytes) => {
-                    self.parser.process(&bytes);
-                    changed = true;
-                }
-                Err(_) => break,
-            }
-        }
-        changed
+        poll_output(&self.receiver, &self.output_signal, &mut self.parser)
     }
 
     pub fn set_output_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
@@ -362,6 +337,38 @@ impl TerminalSession {
     }
 }
 
+// Bound one UI callback even when a command continuously produces output.
+// Chunk boundaries are not VT boundaries: the parser retains partial escapes.
+fn poll_output(
+    receiver: &mpsc::Receiver<Vec<u8>>,
+    signal: &OutputSignal,
+    parser: &mut vt100::Parser,
+) -> bool {
+    let mut processed = 0;
+    let started = std::time::Instant::now();
+    loop {
+        let bytes = match receiver.try_recv() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                signal.clear_pending();
+                // Close the race between draining the channel and clearing
+                // the signal, without dropping output or losing a wakeup.
+                match receiver.try_recv() {
+                    Ok(bytes) => bytes,
+                    Err(_) => return processed > 0,
+                }
+            }
+        };
+        parser.process(&bytes);
+        processed += bytes.len();
+        if processed >= 64 * 1024 || started.elapsed() >= std::time::Duration::from_millis(4) {
+            signal.clear_pending();
+            signal.notify();
+            return true;
+        }
+    }
+}
+
 fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
     let (rows, columns) = screen.size();
     let cursor_position = (!screen.hide_cursor()).then(|| screen.cursor_position());
@@ -369,10 +376,15 @@ fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
     for row in 0..rows {
         for column in 0..columns {
             let cell = screen.cell(row, column);
-            let mut foreground = terminal_color(
-                cell.map(vt100::Cell::fgcolor).unwrap_or_default(),
-                DEFAULT_FOREGROUND,
-            );
+            let color = cell.map(vt100::Cell::fgcolor).unwrap_or_default();
+            // Match Orca/xterm's bright ANSI colors for bold shell output.
+            let color = match color {
+                vt100::Color::Idx(index @ 0..=7) if cell.is_some_and(vt100::Cell::bold) => {
+                    vt100::Color::Idx(index + 8)
+                }
+                color => color,
+            };
+            let mut foreground = terminal_color(color, DEFAULT_FOREGROUND);
             let mut background = terminal_color(
                 cell.map(vt100::Cell::bgcolor).unwrap_or_default(),
                 DEFAULT_BACKGROUND,
@@ -389,9 +401,7 @@ fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
                 .unwrap_or(" ");
             let cursor = cursor_position == Some((row, column));
             let column_span = cell_column_span(cell);
-            if column_span == 0
-                || (!cursor && glyph == " " && background == DEFAULT_BACKGROUND)
-            {
+            if column_span == 0 || (!cursor && glyph == " " && background == DEFAULT_BACKGROUND) {
                 continue;
             }
             cells.push(DisplayCell {
@@ -432,7 +442,7 @@ fn cell_column_span(cell: Option<&vt100::Cell>) -> i32 {
 
 fn spawn_reader(
     mut reader: impl Read + Send + 'static,
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::SyncSender<Vec<u8>>,
     output_signal: Arc<OutputSignal>,
 ) {
     thread::spawn(move || {
@@ -472,29 +482,38 @@ fn terminal_color(color: vt100::Color, default: [u8; 3]) -> [u8; 3] {
     }
 }
 
+// Orca: Ghostty Default Style Dark.
 const ANSI_COLORS: [[u8; 3]; 16] = [
-    [0x1b, 0x1d, 0x23],
-    [0xe0, 0x6c, 0x75],
-    [0x98, 0xc3, 0x79],
-    [0xe5, 0xc0, 0x7b],
-    [0x61, 0xaf, 0xef],
-    [0xc6, 0x78, 0xdd],
-    [0x56, 0xb6, 0xc2],
-    [0xd8, 0xde, 0xe9],
-    [0x5c, 0x63, 0x70],
-    [0xff, 0x7b, 0x86],
-    [0xb3, 0xe3, 0x8c],
-    [0xff, 0xd6, 0x8a],
-    [0x82, 0xc7, 0xff],
-    [0xdc, 0x8c, 0xf0],
-    [0x7f, 0xd9, 0xe5],
-    [0xff, 0xff, 0xff],
+    [0x1d, 0x1f, 0x21],
+    [0xcc, 0x66, 0x66],
+    [0xb5, 0xbd, 0x68],
+    [0xf0, 0xc6, 0x74],
+    [0x81, 0xa2, 0xbe],
+    [0xb2, 0x94, 0xbb],
+    [0x8a, 0xbe, 0xb7],
+    [0xc5, 0xc8, 0xc6],
+    [0x66, 0x66, 0x66],
+    [0xd5, 0x4e, 0x53],
+    [0xb9, 0xca, 0x4a],
+    [0xe7, 0xc5, 0x47],
+    [0x7a, 0xa6, 0xda],
+    [0xc3, 0x97, 0xd8],
+    [0x70, 0xc0, 0xb1],
+    [0xea, 0xea, 0xea],
 ];
 
 pub fn encode_key(text: &str, control: bool, alt: bool, _shift: bool) -> Vec<u8> {
     if matches!(
         text,
-        "\u{10}" | "\u{11}" | "\u{12}" | "\u{13}" | "\u{14}" | "\u{15}" | "\u{16}" | "\u{17}" | "\u{18}"
+        "\u{10}"
+            | "\u{11}"
+            | "\u{12}"
+            | "\u{13}"
+            | "\u{14}"
+            | "\u{15}"
+            | "\u{16}"
+            | "\u{17}"
+            | "\u{18}"
     ) {
         return Vec::new();
     }
@@ -533,6 +552,42 @@ pub fn encode_key(text: &str, control: bool, alt: bool, _shift: bool) -> Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_terminal_yields_and_reschedules_without_losing_output() {
+        let (sender, receiver) = mpsc::channel();
+        let signal = OutputSignal::default();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        signal.set_waker(Arc::new(move || {
+            count.fetch_add(1, AtomicOrdering::SeqCst);
+        }));
+        for _ in 0..32 {
+            sender.send(vec![b'x'; 8192]).unwrap();
+        }
+        // Include an escape and UTF-8 character split across chunks.
+        sender.send(b"\x1b[2J\x1b[H\x1b[3".to_vec()).unwrap();
+        sender
+            .send([b"1m".as_slice(), &"한".as_bytes()[..1]].concat())
+            .unwrap();
+        sender.send("한".as_bytes()[1..].to_vec()).unwrap();
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        assert!(poll_output(&receiver, &signal, &mut parser));
+        assert!(wakes.load(AtomicOrdering::SeqCst) > 0);
+        assert!(!parser.screen().contents().contains('한'));
+        let mut polls = 1;
+        while poll_output(&receiver, &signal, &mut parser) {
+            polls += 1;
+            assert!(polls < 100);
+        }
+        assert!(polls > 1);
+        assert_eq!(parser.screen().contents(), "한");
+        assert_eq!(
+            parser.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
+        assert!(!signal.pending.load(AtomicOrdering::Acquire));
+    }
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -564,15 +619,29 @@ mod tests {
 
         let cells = display_cells(parser.screen());
         assert!(cells.len() < 3 * 8);
-        assert!(cells.iter().any(|cell| {
-            cell.row == 0 && cell.column == 0 && cell.glyph == "A"
-        }));
+        assert!(
+            cells
+                .iter()
+                .any(|cell| { cell.row == 0 && cell.column == 0 && cell.glyph == "A" })
+        );
         assert!(cells.iter().any(|cell| {
             cell.row == 1
                 && cell.column == 2
                 && cell.glyph == " "
                 && cell.background == ANSI_COLORS[1]
         }));
+    }
+
+    #[test]
+    fn uses_orca_colors_for_plain_bold_and_truecolor_output() {
+        let mut parser = vt100::Parser::new(1, 20, 0);
+        parser.process(b"A\x1b[1;34mB\x1b[38;2;10;20;30mC");
+        let cells = display_cells(parser.screen());
+        let plain = cells.iter().find(|cell| cell.glyph == "A").unwrap();
+        assert_eq!(plain.foreground, [255, 255, 255]);
+        assert_eq!(plain.background, [0x28, 0x2c, 0x34]);
+        assert_eq!(cells.iter().find(|cell| cell.glyph == "B").unwrap().foreground, [0x7a, 0xa6, 0xda]);
+        assert_eq!(cells.iter().find(|cell| cell.glyph == "C").unwrap().foreground, [10, 20, 30]);
     }
 
     #[test]

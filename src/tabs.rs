@@ -33,6 +33,19 @@ impl TabGroups {
         true
     }
 
+    /// A terminal prepared during startup must not steal a file pane that the
+    /// user has already opened while startup work was running.
+    pub fn add_background(&mut self, id: TabId, group: usize) {
+        let group = group.min(1);
+        let previous = self.active[group];
+        let focused = self.focused_group;
+        self.add(id, group);
+        if let Some(previous) = previous {
+            self.activate(previous);
+        }
+        self.set_focused_group(focused);
+    }
+
     pub fn remove(&mut self, id: TabId) -> bool {
         let Some(index) = self.placements.iter().position(|(tab_id, _)| *tab_id == id) else {
             return false;
@@ -77,11 +90,7 @@ impl TabGroups {
             self.active[1] = None;
         }
 
-        if let Some((_, group)) = self
-            .placements
-            .iter_mut()
-            .find(|(tab_id, _)| *tab_id == id)
-        {
+        if let Some((_, group)) = self.placements.iter_mut().find(|(tab_id, _)| *tab_id == id) {
             *group = target_group;
         }
         if self.active[source_group] == Some(id) && source_group != target_group {
@@ -157,6 +166,20 @@ impl TabGroups {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_terminal_does_not_steal_an_open_file_or_split_focus() {
+        let mut tabs = TabGroups::default();
+        tabs.add_background(0, 0);
+        assert_eq!(tabs.active(0), Some(0));
+        tabs.add(1, 0);
+        tabs.add(2, 1);
+        tabs.add_background(3, 0);
+        assert_eq!(tabs.active(0), Some(1));
+        assert_eq!(tabs.active(1), Some(2));
+        assert_eq!(tabs.focused_group(), 1);
+        assert_eq!(tabs.group_of(3), Some(0));
+    }
 
     #[test]
     fn cycles_tabs_in_both_directions_and_wraps() {

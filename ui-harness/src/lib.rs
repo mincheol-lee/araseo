@@ -9,6 +9,19 @@ mod emoji;
 mod highlight;
 
 #[cfg(test)]
+#[path = "../../src/background.rs"]
+mod background;
+
+#[cfg(test)]
+#[path = "../../src/appearance.rs"]
+#[allow(dead_code)]
+mod appearance;
+
+#[cfg(test)]
+#[path = "../../src/editor_view.rs"]
+mod editor_view;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use slint::platform::software_renderer::{
@@ -203,9 +216,31 @@ mod tests {
             "the editor surface used only part of the initial pane"
         );
 
-        // Orca-style tabs belong to their pane, below the window title bar.
+        let window_drags = Rc::new(RefCell::new(0));
+        let observed_drags = window_drags.clone();
+        ui.on_window_drag_requested(move || *observed_drags.borrow_mut() += 1);
+        dispatch_pointer(&ui, WindowEvent::PointerMoved {
+            position: LogicalPosition::new(800.0, 17.0),
+        });
+        assert_eq!(*window_drags.borrow(), 0, "hover must not drag the window");
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(800.0, 17.0),
+            button: PointerEventButton::Left,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved {
+            position: LogicalPosition::new(820.0, 17.0),
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(820.0, 17.0),
+            button: PointerEventButton::Left,
+        });
+        assert!(*window_drags.borrow() > 0, "blank tab space must drag the window");
+
+        // Tabs share the top row with the fixed window controls.
         // The file tree must remain a separate fixed sidebar.
         dispatch_click(&ui, 150.0, 51.0);
+        assert_eq!(ui.get_primary_group_y(), 0.0);
+        assert!(ui.get_primary_editor_surface_height() > 700.0);
         assert_eq!(
             *activated_tab.borrow(),
             None,
@@ -238,7 +273,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerMoved {
-                position: LogicalPosition::new(340.0, 51.0),
+                position: LogicalPosition::new(340.0, 17.0),
             },
         );
         let after_close_hover = render(&window);
@@ -249,7 +284,7 @@ mod tests {
             .filter(|(index, (before, after))| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (320..360).contains(&x) && (34..70).contains(&y) && before != after
+                (320..360).contains(&x) && (0..36).contains(&y) && before != after
             })
             .count();
         assert!(
@@ -296,6 +331,13 @@ mod tests {
             changed_maximize_pixels > 100,
             "file tabs pushed the fixed maximize control out of the visible window"
         );
+        dispatch_click(&ui, 1132.0, 17.0);
+        let maximized_controls = render(&window);
+        assert!(after_window_control_hover.iter().zip(&maximized_controls)
+            .enumerate().any(|(index, (before, after))|
+                (1108..1155).contains(&(index % 1200)) && index / 1200 < 34 && before != after),
+            "overflowing tabs intercepted the maximize control");
+        dispatch_click(&ui, 1132.0, 17.0);
         ui.set_primary_active_tab_id(0);
         render(&window);
         assert!(
@@ -304,7 +346,7 @@ mod tests {
         );
 
         ui.window().dispatch_event(WindowEvent::PointerScrolled {
-            position: LogicalPosition::new(500.0, 51.0),
+            position: LogicalPosition::new(500.0, 17.0),
             delta_x: 0.0,
             delta_y: -120.0,
         });
@@ -313,7 +355,7 @@ mod tests {
             "mouse wheel over the tab strip did not scroll hidden tabs into reach"
         );
 
-        dispatch_click(&ui, 1182.0, 51.0);
+        dispatch_click(&ui, 1042.0, 17.0);
         assert_eq!(
             terminal_groups.borrow().as_slice(),
             &[0],
@@ -357,7 +399,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(280.0, 51.0),
+                position: LogicalPosition::new(280.0, 17.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -399,7 +441,7 @@ mod tests {
         render(&window);
         assert!(ui.get_primary_tab_scroll_offset().abs() < 0.1);
         for x in (380..470).step_by(4) {
-            dispatch_click(&ui, x as f32, 51.0);
+            dispatch_click(&ui, x as f32, 17.0);
             if !closed_tabs.borrow().is_empty() {
                 break;
             }
@@ -453,7 +495,7 @@ mod tests {
             Some(&(51, "둘".to_string())),
             "terminal text was routed to the wrong tab"
         );
-        dispatch_click(&ui, 1182.0, 528.0);
+        dispatch_click(&ui, 1182.0, 516.0);
         assert_eq!(
             terminal_groups.borrow().as_slice(),
             &[0, 1],
@@ -469,7 +511,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(300.0, 51.0),
+                position: LogicalPosition::new(300.0, 17.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -495,7 +537,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(300.0, 528.0),
+                position: LogicalPosition::new(300.0, 516.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -602,7 +644,7 @@ mod tests {
         ui.set_workspace_layout(0);
         ui.set_panel_split_ratio(0.64);
         render(&window);
-        dispatch_click(&ui, 600.0, 48.0);
+        dispatch_click(&ui, 600.0, 17.0);
         assert_eq!(
             ui.get_workspace_layout(),
             0,
@@ -611,7 +653,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(700.0, 508.0),
+                position: LogicalPosition::new(700.0, 496.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -671,7 +713,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(300.0, 528.0),
+                position: LogicalPosition::new(300.0, 516.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -701,7 +743,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(300.0, 51.0),
+                position: LogicalPosition::new(300.0, 17.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -742,14 +784,14 @@ mod tests {
         // Its pane-local tab bar occupies the first 36px of the workspace.
         // Drag across a portion of the first source line below that tab bar.
         dispatch_pointer(&ui, WindowEvent::PointerPressed {
-            position: LogicalPosition::new(320.0, 78.0),
+            position: LogicalPosition::new(320.0, 44.0),
             button: PointerEventButton::Left,
         });
         dispatch_pointer(&ui, WindowEvent::PointerMoved {
-            position: LogicalPosition::new(450.0, 78.0),
+            position: LogicalPosition::new(450.0, 44.0),
         });
         dispatch_pointer(&ui, WindowEvent::PointerReleased {
-            position: LogicalPosition::new(450.0, 78.0),
+            position: LogicalPosition::new(450.0, 44.0),
             button: PointerEventButton::Left,
         });
 
@@ -770,7 +812,7 @@ mod tests {
             .filter(|(index, (before, after))| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (299..1000).contains(&x) && (62..130).contains(&y) && before != after
+                (299..1000).contains(&x) && (36..96).contains(&y) && before != after
             })
             .count();
         assert!(
@@ -822,14 +864,14 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(1140.0, 80.0),
+                position: LogicalPosition::new(1140.0, 46.0),
                 button: PointerEventButton::Left,
             },
         );
         dispatch_pointer(
             &ui,
             WindowEvent::PointerReleased {
-                position: LogicalPosition::new(1140.0, 80.0),
+                position: LogicalPosition::new(1140.0, 46.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -913,6 +955,22 @@ mod tests {
         ui.set_terminal_update_generation(ui.get_terminal_update_generation() + 1);
         let terminal_ui = render(&window);
         write_snapshot_if_requested("single-terminal.png", &terminal_ui);
+        // A terminal that fits horizontally must paint its background all the
+        // way to the status bar, without a scrollbar track along its bottom.
+        // Apply the dimensions exactly as the runtime resize loop does.
+        ui.set_terminal_grid_columns(ui.get_terminal_columns().round() as i32);
+        ui.set_terminal_grid_rows(ui.get_terminal_rows().round() as i32);
+        assert!(ui.get_terminal_columns() * 8.0 <= ui.get_primary_terminal_surface_width());
+        assert!(ui.get_terminal_rows() * 16.0 <= ui.get_primary_terminal_surface_height());
+        let fitted_terminal = render(&window);
+        for y in 762..776 {
+            for x in 251..1200 {
+                assert_eq!(fitted_terminal[y * 1200 + x],
+                    TestPixel::from_rgb(0x28, 0x2c, 0x34),
+                    "unexpected terminal bottom stripe at ({x}, {y})");
+            }
+        }
+
         assert!(
             ui.get_primary_terminal_surface_width() > 900.0
                 && ui.get_primary_terminal_surface_height() > 650.0,
@@ -945,7 +1003,7 @@ mod tests {
                 let x = index % 1200;
                 let y = index / 1200;
                 (250..258).contains(&x)
-                    && (70..88).contains(&y)
+                    && (36..52).contains(&y)
                     && pixel.red > 120
                     && pixel.red > pixel.green.saturating_add(60)
             })
@@ -957,7 +1015,7 @@ mod tests {
                 let x = index % 1200;
                 let y = index / 1200;
                 (810..818).contains(&x)
-                    && (700..718).contains(&y)
+                    && (596..612).contains(&y)
                     && pixel.green > 120
                     && pixel.green > pixel.red.saturating_add(60)
             })
@@ -967,9 +1025,23 @@ mod tests {
             "sparse terminal cells were not rendered at their explicit grid positions"
         );
 
+        // A stale, wider grid can remain until the asynchronous PTY resize
+        // completes. It must not flash a horizontal scrollbar either.
+        ui.set_terminal_grid_columns(160);
+        let resizing_terminal = render(&window);
+        for y in 762..776 {
+            for x in 251..1200 {
+                assert_eq!(resizing_terminal[y * 1200 + x],
+                    TestPixel::from_rgb(0x28, 0x2c, 0x34),
+                    "horizontal scrollbar appeared during terminal resize at ({x}, {y})");
+            }
+        }
+        ui.set_terminal_grid_columns(ui.get_terminal_columns().round() as i32);
+
         // After a long command such as `ls`, reveal the prompt on the last
         // screen row without requiring the user's first manual scroll.
-        ui.set_terminal_cursor_row(39);
+        ui.set_terminal_grid_rows(60);
+        ui.set_terminal_cursor_row(59);
         ui.set_terminal_update_generation(ui.get_terminal_update_generation() + 1);
         render(&window);
         assert!(
@@ -998,6 +1070,92 @@ mod tests {
             terminal_keys.borrow().last().map(|event| (event.0, event.1.as_str())),
             Some((1, "<ENTER>"))
         );
+        ui.set_status_text("Ready".into());
+        render(&window);
+        dispatch_click(&ui, 1128.0, 788.0);
+        assert!(ui.get_font_menu_visible(), "Aa did not open the font appearance menu");
+        assert_eq!(
+            (
+                ui.get_terminal_font_brightness(),
+                ui.get_editor_font_brightness(),
+                ui.get_tree_font_brightness(),
+            ),
+            (120, 120, 120),
+            "default brightness did not match the brighter Orca preset",
+        );
+        write_snapshot_if_requested("font-menu.png", &render(&window));
+        dispatch_click(&ui, 1012.0, 590.0);
+        assert_eq!(ui.get_terminal_font_size(), 15, "terminal size control did not apply");
+        dispatch_click(&ui, 1012.0, 638.0);
+        assert_eq!(ui.get_editor_font_size(), 15, "editor size control did not apply");
+        dispatch_click(&ui, 1012.0, 687.0);
+        assert_eq!(ui.get_tree_font_size(), 13, "file list size control did not apply");
+        dispatch_click(&ui, 1130.0, 590.0);
+        dispatch_click(&ui, 1130.0, 638.0);
+        dispatch_click(&ui, 1130.0, 687.0);
+        assert_eq!(
+            (
+                ui.get_terminal_font_brightness(),
+                ui.get_editor_font_brightness(),
+                ui.get_tree_font_brightness(),
+            ),
+            (121, 121, 121),
+            "brightness controls did not apply independently",
+        );
+        dispatch_click(&ui, 892.0, 737.0);
+        assert_eq!(
+            (
+                ui.get_terminal_font_size(),
+                ui.get_editor_font_size(),
+                ui.get_tree_font_size(),
+                ui.get_terminal_font_brightness(),
+                ui.get_editor_font_brightness(),
+                ui.get_tree_font_brightness(),
+            ),
+            (14, 14, 12, 120, 120, 120),
+            "Reset did not restore Orca font defaults",
+        );
+        render(&window);
+        let original_columns = ui.get_terminal_columns();
+        let original_rows = ui.get_terminal_rows();
+        let original_editor_size = ui.get_editor_font_size();
+        let original_tree_size = ui.get_tree_font_size();
+        ui.set_terminal_font_size(20);
+        render(&window);
+        assert!(ui.get_terminal_columns() < original_columns);
+        assert!(ui.get_terminal_rows() < original_rows);
+        assert_eq!(ui.get_editor_font_size(), original_editor_size);
+        assert_eq!(ui.get_tree_font_size(), original_tree_size);
+        ui.set_editor_font_size(18);
+        ui.set_tree_font_size(16);
+        render(&window);
+        assert_eq!(ui.get_terminal_font_size(), 20);
+        ui.set_primary_active_kind("file".into());
+        ui.set_editor_text("Brightness sample text".into());
+        ui.set_syntax_highlight_enabled(false);
+        ui.set_editor_font_brightness(50);
+        let dim_editor = render(&window);
+        ui.set_editor_font_brightness(150);
+        let bright_editor = render(&window);
+        let editor_luminance = |pixels: &[TestPixel]| -> u64 {
+            pixels
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    let x = index % 1200;
+                    let y = index / 1200;
+                    (300..800).contains(&x) && (40..80).contains(&y)
+                })
+                .map(|(_, pixel)| pixel.red as u64 + pixel.green as u64 + pixel.blue as u64)
+                .sum()
+        };
+        assert!(
+            editor_luminance(&bright_editor) > editor_luminance(&dim_editor),
+            "file viewer brightness did not affect rendered text",
+        );
+        dispatch_click(&ui, 600.0, 400.0);
+        assert!(!ui.get_font_menu_visible(), "clicking outside did not dismiss font appearance");
+
     }
 
     fn dispatch_pointer(ui: &AppWindow, event: WindowEvent) {

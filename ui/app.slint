@@ -1,4 +1,4 @@
-import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
 
 export struct TreeEntry {
     name: string,
@@ -34,6 +34,16 @@ export struct TerminalCell {
 
 component WorkspaceGroup inherits Rectangle {
     in property <int> group-id: 0;
+    in property <int> terminal-font-size: 14;
+    in property <int> editor-font-size: 14;
+    in property <int> terminal-font-brightness: 120;
+    in property <int> editor-font-brightness: 120;
+    private property <length> terminal-cell-width: round(root.terminal-font-size * 4 / 7) * 1px;
+    private property <length> terminal-cell-height: ceil(root.terminal-font-size * 8 / 7) * 1px;
+    in property <length> caption-reserve: 0px;
+    in property <bool> title-row: false;
+    callback window-drag-requested();
+    callback window-maximize-requested();
     in property <[TabEntry]> tabs;
     in property <bool> focused: false;
     in property <int> active-tab-id: -1;
@@ -53,8 +63,8 @@ component WorkspaceGroup inherits Rectangle {
     in property <int> terminal-cursor-row: -1;
     in property <int> terminal-cursor-column: -1;
     in-out property <int> terminal-update-generation: 0;
-    out property <float> terminal-columns: terminal-focus.width / 8px;
-    out property <float> terminal-rows: terminal-focus.height / 18px;
+    out property <float> terminal-columns: floor(terminal-focus.width / root.terminal-cell-width);
+    out property <float> terminal-rows: floor(terminal-focus.height / root.terminal-cell-height);
     out property <length> terminal-scroll-offset: terminal-scroll.viewport-y;
     out property <bool> terminal-ime-active: terminal-ime-input.has-focus;
     out property <string> terminal-ime-buffer: terminal-ime-input.text;
@@ -89,6 +99,13 @@ component WorkspaceGroup inherits Rectangle {
     callback tab-drag-moved(int, length, length);
     callback tab-drag-released(int);
     callback tab-drag-cancelled();
+
+    function adjusted-font-color(source: color, brightness: int) -> color {
+        if brightness >= 100 {
+            return source.brighter((brightness - 100) / 100);
+        }
+        return source.darker((100 - brightness) / 100);
+    }
 
     public function focus-terminal() {
         terminal-ime-input.focus();
@@ -149,6 +166,7 @@ component WorkspaceGroup inherits Rectangle {
             HorizontalLayout {
                 y: 2px;
                 height: parent.height - 2px;
+                padding-right: root.caption-reserve;
                 spacing: 1px;
 
                 Rectangle {
@@ -254,6 +272,12 @@ component WorkspaceGroup inherits Rectangle {
                                 horizontal-stretch: 1;
                                 background: #202329;
                                 blank-tab-bar-touch := TouchArea {
+                                    moved => {
+                                        if (root.title-row && self.pressed) { root.window-drag-requested(); }
+                                    }
+                                    double-clicked => {
+                                        if (root.title-row) { root.window-maximize-requested(); }
+                                    }
                                     clicked => { root.group-focused(root.group-id); }
                                     scroll-event(event) => {
                                         root.scroll-tabs(event.delta-x, event.delta-y);
@@ -329,9 +353,9 @@ component WorkspaceGroup inherits Rectangle {
                         clip: true;
                         Text {
                             text: root.line-numbers;
-                            color: #858585;
+                            color: root.adjusted-font-color(#858585, root.editor-font-brightness);
                             font-family: "Cascadia Mono";
-                            font-size: 14px;
+                            font-size: root.editor-font-size * 1px;
                             horizontal-alignment: right;
                             vertical-alignment: top;
                             x: 4px;
@@ -359,9 +383,9 @@ component WorkspaceGroup inherits Rectangle {
                                 width: editor-scroll.viewport-width;
                                 height: editor-scroll.viewport-height;
                                 text: root.highlighted-text;
-                                default-color: #d4d4d4;
+                                default-color: root.adjusted-font-color(#d4d4d4, root.editor-font-brightness);
                                 default-font-family: "Cascadia Mono";
-                                default-font-size: 14px;
+                                default-font-size: root.editor-font-size * 1px;
                                 vertical-alignment: top;
                             }
 
@@ -373,8 +397,10 @@ component WorkspaceGroup inherits Rectangle {
                                 single-line: false;
                                 wrap: no-wrap;
                                 font-family: "Cascadia Mono";
-                                font-size: 14px;
-                                color: root.syntax-highlight-enabled && self.preedit-text == "" ? transparent : #d4d4d4;
+                                font-size: root.editor-font-size * 1px;
+                                color: root.syntax-highlight-enabled && self.preedit-text == ""
+                                    ? transparent
+                                    : root.adjusted-font-color(#d4d4d4, root.editor-font-brightness);
                                 selection-background-color: #264f78;
                                 selection-foreground-color: #ffffff;
                                 page-height: editor-scroll.visible-height;
@@ -433,8 +459,8 @@ component WorkspaceGroup inherits Rectangle {
                                     }
                                     if (position.y + editor-scroll.viewport-y < 0px) {
                                         editor-scroll.viewport-y = max(editor-scroll.visible-height - self.height, -position.y);
-                                    } else if (position.y + editor-scroll.viewport-y > editor-scroll.visible-height - 20px) {
-                                        editor-scroll.viewport-y = min(0px, max(editor-scroll.visible-height - self.height, editor-scroll.visible-height - position.y - 20px));
+                                    } else if (position.y + editor-scroll.viewport-y > editor-scroll.visible-height - root.editor-font-size * 1.4px) {
+                                        editor-scroll.viewport-y = min(0px, max(editor-scroll.visible-height - self.height, editor-scroll.visible-height - position.y - root.editor-font-size * 1.4px));
                                     }
                                 }
                             }
@@ -443,7 +469,7 @@ component WorkspaceGroup inherits Rectangle {
                                 x: editor-pane.cursor-x;
                                 y: editor-pane.cursor-y;
                                 width: 2px;
-                                height: 18px;
+                                height: root.editor-font-size * 1.35px;
                                 background: #f0f0f0;
                                 visible: code-input.has-focus
                                     && code-input.preedit-text == ""
@@ -486,18 +512,21 @@ component WorkspaceGroup inherits Rectangle {
             Rectangle {
                 width: parent.width;
                 height: parent.height;
-                background: #0f1115;
+                background: #282c34;
             }
             terminal-scroll := ScrollView {
+                // The PTY fits whole cells to this pane. During a resize the
+                // previous grid may briefly be wider; never draw a bottom bar.
+                horizontal-scrollbar-policy: always-off;
                 width: parent.width;
                 height: parent.height;
-                viewport-width: max(self.visible-width, root.terminal-grid-columns * 8px);
-                viewport-height: max(self.visible-height, root.terminal-grid-rows * 18px);
+                viewport-width: max(self.visible-width, root.terminal-grid-columns * root.terminal-cell-width);
+                viewport-height: max(self.visible-height, root.terminal-grid-rows * root.terminal-cell-height);
                 viewport-x: 0px;
                 viewport-y: 0px;
                 private property <int> follow-generation: root.terminal-update-generation;
-                private property <length> cursor-top: max(0, root.terminal-cursor-row) * 18px;
-                private property <length> cursor-bottom: self.cursor-top + 18px;
+                private property <length> cursor-top: max(0, root.terminal-cursor-row) * root.terminal-cell-height;
+                private property <length> cursor-bottom: self.cursor-top + root.terminal-cell-height;
                 changed follow-generation => {
                     if (root.terminal-cursor-row >= 0) {
                         if (self.cursor-top + self.viewport-y < 0px) {
@@ -511,19 +540,21 @@ component WorkspaceGroup inherits Rectangle {
                 terminal-canvas := Rectangle {
                     width: terminal-scroll.viewport-width;
                     height: terminal-scroll.viewport-height;
-                    background: #111318;
+                    background: #282c34;
                     for cell in root.terminal-cells: Rectangle {
-                        x: cell.column * 8px;
-                        y: cell.row * 18px;
-                        width: cell.column-span * 8px;
-                        height: 18px;
+                        x: cell.column * root.terminal-cell-width;
+                        y: cell.row * root.terminal-cell-height;
+                        width: cell.column-span * root.terminal-cell-width;
+                        height: root.terminal-cell-height;
                         visible: cell.column-span > 0;
                         background: cell.cursor ? cell.foreground : cell.background;
                         Text {
                             text: cell.glyph;
-                            color: cell.cursor ? cell.background : cell.foreground;
+                            color: cell.cursor
+                                ? cell.background
+                                : root.adjusted-font-color(cell.foreground, root.terminal-font-brightness);
                             font-family: "Cascadia Mono";
-                            font-size: 14px;
+                            font-size: root.terminal-font-size * 1px;
                             font-weight: cell.bold ? 700 : 500;
                             width: parent.width;
                             height: parent.height;
@@ -534,17 +565,17 @@ component WorkspaceGroup inherits Rectangle {
                 }
             }
             terminal-ime-input := TextInput {
-                x: max(0px, root.terminal-cursor-column * 8px + terminal-scroll.viewport-x);
-                y: max(0px, root.terminal-cursor-row * 18px + terminal-scroll.viewport-y);
-                width: max(18px, terminal-focus.width - self.x);
-                height: 18px;
+                x: max(0px, root.terminal-cursor-column * root.terminal-cell-width + terminal-scroll.viewport-x);
+                y: max(0px, root.terminal-cursor-row * root.terminal-cell-height + terminal-scroll.viewport-y);
+                width: max(root.terminal-cell-height, terminal-focus.width - self.x);
+                height: root.terminal-cell-height;
                 text: "";
                 single-line: true;
                 wrap: no-wrap;
                 font-family: "Cascadia Mono";
-                font-size: 14px;
+                font-size: root.terminal-font-size * 1px;
                 font-weight: 500;
-                color: #d8dee9;
+                color: root.adjusted-font-color(#ffffff, root.terminal-font-brightness);
                 selection-background-color: #264f78;
                 selection-foreground-color: #ffffff;
                 text-cursor-width: 0px;
@@ -606,6 +637,20 @@ component WorkspaceGroup inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Araseo";
+    in-out property <int> terminal-font-size: 14;
+    in-out property <int> editor-font-size: 14;
+    in-out property <int> tree-font-size: 12;
+    in-out property <int> terminal-font-brightness: 120;
+    in-out property <int> editor-font-brightness: 120;
+    in-out property <int> tree-font-brightness: 120;
+    in-out property <bool> font-menu-visible: false;
+    callback font-settings-changed();
+    changed terminal-font-size => { root.font-settings-changed(); }
+    changed editor-font-size => { root.font-settings-changed(); }
+    changed tree-font-size => { root.font-settings-changed(); }
+    changed terminal-font-brightness => { root.font-settings-changed(); }
+    changed editor-font-brightness => { root.font-settings-changed(); }
+    changed tree-font-brightness => { root.font-settings-changed(); }
     icon: @image-url("../assets/araseo-app-icon.png");
     no-frame: true;
     resize-border-width: root.maximized ? 0px : 5px;
@@ -617,6 +662,13 @@ export component AppWindow inherits Window {
     min-width: 800px;
     min-height: 600px;
     background: #181a1f;
+
+    function adjusted-font-color(source: color, brightness: int) -> color {
+        if brightness >= 100 {
+            return source.brighter((brightness - 100) / 100);
+        }
+        return source.darker((100 - brightness) / 100);
+    }
 
     in property <string> workspace-name: "No workspace";
     in property <[TreeEntry]> tree-entries;
@@ -798,97 +850,6 @@ export component AppWindow inherits Window {
         VerticalLayout {
             spacing: 0px;
 
-        Rectangle {
-            height: 34px;
-            background: #181a1f;
-            HorizontalLayout {
-                spacing: 1px;
-
-                Rectangle {
-                    width: root.sidebar-width;
-                    background: title-left-touch.has-hover ? #24272e : #181a1f;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        spacing: 8px;
-                        alignment: center;
-                        Image {
-                            source: @image-url("../assets/araseo-app-icon.png");
-                            width: 23px;
-                            height: 23px;
-                            image-fit: contain;
-                        }
-                        Text {
-                            text: "Araseo";
-                            color: #e6e8ec;
-                            font-size: 13px;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    title-left-touch := TouchArea {
-                        moved => { root.window-drag-requested(); }
-                        double-clicked => { root.maximized = !root.maximized; }
-                    }
-                }
-
-                Rectangle {
-                    horizontal-stretch: 1;
-                    background: title-drag-touch.has-hover ? #1d2026 : #181a1f;
-                    Text {
-                        x: 12px;
-                        width: parent.width - 24px;
-                        text: root.active-path;
-                        color: #777e89;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                        horizontal-alignment: center;
-                        overflow: elide;
-                    }
-                    title-drag-touch := TouchArea {
-                        moved => { root.window-drag-requested(); }
-                        double-clicked => { root.maximized = !root.maximized; }
-                    }
-                }
-
-                Rectangle {
-                    width: 46px;
-                    background: minimize-touch.has-hover ? #30333a : transparent;
-                    Text { text: "—"; color: #d7dae0; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
-                    minimize-touch := TouchArea { clicked => { root.minimized = true; } }
-                }
-                Rectangle {
-                    width: 46px;
-                    background: maximize-touch.has-hover ? #30333a : transparent;
-                    Text {
-                        text: root.maximized ? "❐" : "□";
-                        color: #d7dae0;
-                        font-family: "Segoe UI Symbol";
-                        font-size: 19px;
-                        font-weight: 500;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    maximize-touch := TouchArea { clicked => { root.maximized = !root.maximized; } }
-                }
-                Rectangle {
-                    width: 46px;
-                    background: close-touch.has-hover ? #c42b1c : transparent;
-                    Text {
-                        text: "×";
-                        color: #d7dae0;
-                        font-family: "Segoe UI Symbol";
-                        font-size: 22px;
-                        font-weight: 500;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    close-touch := TouchArea { clicked => { root.close(); } }
-                }
-            }
-        }
-
         HorizontalLayout {
             spacing: 1px;
             Rectangle {
@@ -898,11 +859,40 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     spacing: 0px;
                     Rectangle {
+                        height: 34px;
+                        background: title-left-touch.has-hover ? #24272e : #181a1f;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 8px;
+                            alignment: center;
+                            Image {
+                                source: @image-url("../assets/araseo-app-icon.png");
+                                width: 23px;
+                                height: 23px;
+                                image-fit: contain;
+                            }
+                            Text {
+                                text: "Araseo";
+                            color: root.adjusted-font-color(#e6e8ec, root.tree-font-brightness);
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        title-left-touch := TouchArea {
+                            moved => { root.window-drag-requested(); }
+                            double-clicked => { root.maximized = !root.maximized; }
+                        }
+                    }
+
+                    Rectangle {
                         height: 30px;
                         background: #292d35;
                         Text {
                             text: "FILES";
-                            color: #bbc0ca;
+                            color: root.adjusted-font-color(#bbc0ca, root.tree-font-brightness);
                             font-size: 11px;
                             vertical-alignment: center;
                             x: 10px;
@@ -913,7 +903,7 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             spacing: 0px;
                             for entry[index] in root.tree-entries: Rectangle {
-                                height: 25px;
+                                height: max(25px, root.tree-font-size * 1.7px);
                                 background: tree-touch.has-hover ? #343943 : transparent;
                                 HorizontalLayout {
                                     padding-left: entry.depth * 14px + 8px;
@@ -927,18 +917,24 @@ export component AppWindow inherits Window {
                                     }
                                     Text {
                                         text: entry.name;
-                                        color: entry.git-mark == "U" ? #65c466 : (entry.git-mark == "M" ? #e2b86b : #d5d8de);
+                                        color: root.adjusted-font-color(
+                                            entry.git-mark == "U" ? #65c466 : (entry.git-mark == "M" ? #e2b86b : #d5d8de),
+                                            root.tree-font-brightness,
+                                        );
                                         font-family: "Geist";
-                                        font-size: 12px;
+                                        font-size: root.tree-font-size * 1px;
                                         vertical-alignment: center;
                                         overflow: elide;
                                         horizontal-stretch: 1;
                                     }
                                     Text {
                                         text: entry.git-mark;
-                                        color: entry.git-mark == "U" ? #65c466 : #e2b86b;
+                                        color: root.adjusted-font-color(
+                                            entry.git-mark == "U" ? #65c466 : #e2b86b,
+                                            root.tree-font-brightness,
+                                        );
                                         font-family: "Geist";
-                                        font-size: 12px;
+                                        font-size: root.tree-font-size * 1px;
                                         font-weight: 500;
                                         vertical-alignment: center;
                                     }
@@ -967,6 +963,15 @@ export component AppWindow inherits Window {
                 private property <length> secondary-split-height: self.height - self.divider-size - self.primary-split-height;
 
                 primary-view := WorkspaceGroup {
+                    terminal-font-size: root.terminal-font-size;
+                    editor-font-size: root.editor-font-size;
+                    terminal-font-brightness: root.terminal-font-brightness;
+                    editor-font-brightness: root.editor-font-brightness;
+                    title-row: self.y == 0px;
+                    caption-reserve: self.y == 0px
+                        ? max(0px, self.x + self.width - (workspace-area.width - 140px)) : 0px;
+                    window-drag-requested => { root.window-drag-requested(); }
+                    window-maximize-requested => { root.maximized = !root.maximized; }
                     group-id: 0;
                     tabs: root.primary-tabs;
                     focused: root.focused-group == 0;
@@ -1026,6 +1031,15 @@ export component AppWindow inherits Window {
                 }
 
                 secondary-view := WorkspaceGroup {
+                    terminal-font-size: root.terminal-font-size;
+                    editor-font-size: root.editor-font-size;
+                    terminal-font-brightness: root.terminal-font-brightness;
+                    editor-font-brightness: root.editor-font-brightness;
+                    title-row: self.y == 0px;
+                    caption-reserve: self.y == 0px
+                        ? max(0px, self.x + self.width - (workspace-area.width - 140px)) : 0px;
+                    window-drag-requested => { root.window-drag-requested(); }
+                    window-maximize-requested => { root.maximized = !root.maximized; }
                     group-id: 1;
                     tabs: root.secondary-tabs;
                     focused: root.focused-group == 1;
@@ -1180,12 +1194,111 @@ export component AppWindow inherits Window {
                     color: white;
                     vertical-alignment: center;
                 }
+                Button { text: "Aa"; width: 38px; clicked => { root.font-menu-visible = !root.font-menu-visible; } }
                 Text { text: root.status-text; color: white; vertical-alignment: center; }
                 if root.save-conflict: Button { text: "Reload"; clicked => { root.reload-requested(); } }
                 if root.save-conflict: Button { text: "Overwrite"; clicked => { root.force-save-requested(); } }
             }
         }
     }
+
+        if root.font-menu-visible: TouchArea {
+            width: parent.width;
+            height: parent.height - 24px;
+            clicked => { root.font-menu-visible = false; }
+        }
+        if root.font-menu-visible: Rectangle {
+            x: parent.width - self.width - 8px;
+            y: parent.height - self.height - 30px;
+            width: 410px;
+            height: 280px;
+            background: #25282f;
+            border-color: #454a54;
+            border-width: 1px;
+            border-radius: 6px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Text { text: "Font appearance"; color: #ffffff; font-size: 14px; font-weight: 600; }
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: "Size (px)"; color: #aeb4bf; width: 110px; horizontal-alignment: center; }
+                    Text { text: "Brightness (%)"; color: #aeb4bf; width: 110px; horizontal-alignment: center; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Terminal"; color: #d4d4d4; vertical-alignment: center; horizontal-stretch: 1; }
+                    SpinBox { width: 110px; minimum: 10; maximum: 28; value <=> root.terminal-font-size; }
+                    SpinBox { width: 110px; minimum: 50; maximum: 150; value <=> root.terminal-font-brightness; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "File viewer"; color: #d4d4d4; vertical-alignment: center; horizontal-stretch: 1; }
+                    SpinBox { width: 110px; minimum: 10; maximum: 28; value <=> root.editor-font-size; }
+                    SpinBox { width: 110px; minimum: 50; maximum: 150; value <=> root.editor-font-brightness; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "File list"; color: #d4d4d4; vertical-alignment: center; horizontal-stretch: 1; }
+                    SpinBox { width: 110px; minimum: 10; maximum: 24; value <=> root.tree-font-size; }
+                    SpinBox { width: 110px; minimum: 50; maximum: 150; value <=> root.tree-font-brightness; }
+                }
+                HorizontalLayout {
+                    Button { text: "Reset"; clicked => {
+                        root.terminal-font-size = 14;
+                        root.editor-font-size = 14;
+                        root.tree-font-size = 12;
+                        root.terminal-font-brightness = 120;
+                        root.editor-font-brightness = 120;
+                        root.tree-font-brightness = 120;
+                    } }
+                    Button { text: "Close"; clicked => { root.font-menu-visible = false; } }
+                }
+            }
+        }
+
+        window-controls := HorizontalLayout {
+            x: root.width - self.width;
+            y: 0px;
+            width: 140px;
+            height: 34px;
+            spacing: 1px;
+            Rectangle {
+                width: 46px;
+                background: minimize-touch.has-hover ? #30333a : transparent;
+                Text { text: "—"; color: #d7dae0; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                minimize-touch := TouchArea { clicked => { root.minimized = true; } }
+            }
+            Rectangle {
+                width: 46px;
+                background: maximize-touch.has-hover ? #30333a : transparent;
+                Text {
+                    text: root.maximized ? "❐" : "□";
+                    color: #d7dae0;
+                    font-family: "Segoe UI Symbol";
+                    font-size: 19px;
+                    font-weight: 500;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                maximize-touch := TouchArea { clicked => { root.maximized = !root.maximized; } }
+            }
+            Rectangle {
+                width: 46px;
+                background: close-touch.has-hover ? #c42b1c : transparent;
+                Text {
+                    text: "×";
+                    color: #d7dae0;
+                    font-family: "Segoe UI Symbol";
+                    font-size: 22px;
+                    font-weight: 500;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                close-touch := TouchArea { clicked => { root.close(); } }
+            }
+        }
 
     }
 }
