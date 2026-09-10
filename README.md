@@ -21,6 +21,7 @@ full-scale IDE.
 
 - Lazy, expandable file tree with context-aware icons
 - Git status detection across multiple nested repositories
+- VS Code-style Git changes view with confirmed discard actions and side-by-side working-tree diffs
 - Unified file and terminal tabs, organized in Orca-style pane-local tab bars
 - Multiple independent WSL terminals with ANSI colors, Korean text, IME input, and visible start paths
 - Up to two drag-and-dock tab groups with independent tabs and resizable splits

@@ -137,6 +137,17 @@ mod tests {
             git_mark: "".into(),
             project_kind: "local".into(),
         }])));
+        ui.set_git_change_count(1);
+        ui.set_git_entries(ModelRc::new(VecModel::from(vec![GitEntry {
+            kind: "repository".into(),
+            name: "local-project".into(),
+            detail: "/workspace/local-project".into(),
+            path: "/workspace/local-project".into(),
+            status: "".into(),
+            count: 1,
+            icon: slint::Image::default(),
+            expanded: false,
+        }])));
         ui.set_primary_active_tab_id(0);
         ui.set_primary_active_kind("file".into());
         ui.set_primary_active_title("sample.js".into());
@@ -187,6 +198,21 @@ mod tests {
                 alt,
                 shift,
             ));
+        });
+        let opened_git_changes = Rc::new(RefCell::new(Vec::new()));
+        let observed_git_changes = opened_git_changes.clone();
+        ui.on_git_change_activated(move |path| {
+            observed_git_changes.borrow_mut().push(path.to_string());
+        });
+        let toggled_git_repositories = Rc::new(RefCell::new(Vec::new()));
+        let observed_repository_toggles = toggled_git_repositories.clone();
+        ui.on_git_repository_toggled(move |path| {
+            observed_repository_toggles.borrow_mut().push(path.to_string());
+        });
+        let discarded_git_changes = Rc::new(RefCell::new(Vec::new()));
+        let observed_discards = discarded_git_changes.clone();
+        ui.on_git_discard_requested(move |path| {
+            observed_discards.borrow_mut().push(path.to_string());
         });
         let docked_tabs = Rc::new(RefCell::new(Vec::new()));
         let observed_docked_tabs = docked_tabs.clone();
@@ -246,6 +272,7 @@ mod tests {
             None,
             "a file tab overlaps the FILES sidebar"
         );
+        ui.set_sidebar_view(0);
 
         assert_eq!(
             ui.get_tree_entries().row_data(0).unwrap().icon_label.as_str(),
@@ -1156,6 +1183,157 @@ mod tests {
         dispatch_click(&ui, 600.0, 400.0);
         assert!(!ui.get_font_menu_visible(), "clicking outside did not dismiss font appearance");
 
+        dispatch_click(&ui, 188.0, 50.0);
+        assert_eq!(
+            ui.get_sidebar_view(),
+            1,
+            "GIT did not replace the FILES view"
+        );
+        render(&window);
+        dispatch_click(&ui, 90.0, 125.0);
+        assert_eq!(
+            toggled_git_repositories.borrow().last().map(String::as_str),
+            Some("/workspace/local-project"),
+            "clicking a collapsed project did not request expansion",
+        );
+        assert!(
+            opened_git_changes.borrow().is_empty(),
+            "a collapsed project row was confused with a changed file",
+        );
+        ui.set_git_entries(ModelRc::new(VecModel::from(vec![
+            GitEntry {
+                kind: "repository".into(),
+                name: "local-project".into(),
+                detail: "/workspace/local-project".into(),
+                path: "/workspace/local-project".into(),
+                status: "".into(),
+                count: 1,
+                icon: slint::Image::default(),
+                expanded: true,
+            },
+            GitEntry {
+                kind: "change".into(),
+                name: "sample.js".into(),
+                detail: "src".into(),
+                path: "/workspace/local-project/src/sample.js".into(),
+                status: "M".into(),
+                count: 0,
+                icon: emoji::EmojiIcons::load_system().get("⚡"),
+                expanded: false,
+            },
+        ])));
+        render(&window);
+        dispatch_click(&ui, 90.0, 165.0);
+        assert_eq!(
+            opened_git_changes.borrow().last().map(String::as_str),
+            Some("/workspace/local-project/src/sample.js"),
+            "clicking a Git change did not request its diff",
+        );
+        dispatch_click(&ui, 210.0, 165.0);
+        assert!(
+            ui.get_discard_confirm_visible(),
+            "discard did not require confirmation"
+        );
+        dispatch_click(&ui, 748.0, 451.0);
+        assert_eq!(
+            discarded_git_changes.borrow().last().map(String::as_str),
+            Some("/workspace/local-project/src/sample.js"),
+            "confirmed discard was not forwarded",
+        );
+
+        ui.set_workspace_layout(0);
+        ui.set_secondary_tabs(ModelRc::new(VecModel::from(Vec::<TabEntry>::new())));
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 77,
+            title: "sample.js (Working Tree)".into(),
+            detail: "/workspace/local-project/src/sample.js".into(),
+            kind: "diff".into(),
+            group: 0,
+            active: true,
+            dirty: false,
+        }])));
+        ui.set_primary_active_tab_id(77);
+        ui.set_primary_active_kind("diff".into());
+        ui.set_diff_old_title("src/sample.js (HEAD)".into());
+        ui.set_diff_new_title("src/sample.js (Working Tree)".into());
+        ui.set_diff_rows(ModelRc::new(VecModel::from(vec![
+            DiffRow {
+                old_line: "1".into(),
+                new_line: "1".into(),
+                old_text: "const value = 1;".into(),
+                new_text: "const value = 1;".into(),
+                old_highlighted: highlight::highlighted(Path::new("sample.js"), "const value = 1;").unwrap(),
+                new_highlighted: highlight::highlighted(Path::new("sample.js"), "const value = 1;").unwrap(),
+                old_highlighted_enabled: true,
+                new_highlighted_enabled: true,
+                old_kind: "context".into(),
+                new_kind: "context".into(),
+            },
+            DiffRow {
+                old_line: "2".into(),
+                new_line: "2".into(),
+                old_text: "const oldName = value;".into(),
+                new_text: "const newName = value;".into(),
+                old_highlighted: highlight::highlighted(Path::new("sample.js"), "const oldName = value;").unwrap(),
+                new_highlighted: highlight::highlighted(Path::new("sample.js"), "const newName = value;").unwrap(),
+                old_highlighted_enabled: true,
+                new_highlighted_enabled: true,
+                old_kind: "removed".into(),
+                new_kind: "added".into(),
+            },
+            DiffRow {
+                old_line: "".into(),
+                new_line: "3".into(),
+                old_text: "".into(),
+                new_text: "console.log(newName);".into(),
+                old_highlighted: slint::StyledText::default(),
+                new_highlighted: highlight::highlighted(Path::new("sample.js"), "console.log(newName);").unwrap(),
+                old_highlighted_enabled: false,
+                new_highlighted_enabled: true,
+                old_kind: "empty".into(),
+                new_kind: "added".into(),
+            },
+        ])));
+        let diff_view = render(&window);
+        write_snapshot_if_requested("git-diff-view.png", &diff_view);
+        let (removed_pixels, added_pixels) = diff_view
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                let x = index % 1200;
+                let y = index / 1200;
+                (250..1200).contains(&x) && (88..138).contains(&y)
+            })
+            .fold((0usize, 0usize), |(removed, added), (_, pixel)| {
+                (
+                    removed + usize::from(pixel.red > pixel.green.saturating_add(20)),
+                    added + usize::from(pixel.green > pixel.red.saturating_add(12)),
+                )
+            });
+        assert!(
+            removed_pixels > 100,
+            "diff view did not render VS Code-style removed rows"
+        );
+        assert!(
+            added_pixels > 100,
+            "diff view did not render VS Code-style added rows"
+        );
+        let syntax_pixels = diff_view
+            .iter()
+            .enumerate()
+            .filter(|(index, pixel)| {
+                let x = index % 1200;
+                let y = index / 1200;
+                (297..1180).contains(&x)
+                    && (70..125).contains(&y)
+                    && pixel.blue > pixel.red.saturating_add(40)
+                    && pixel.blue > pixel.green.saturating_add(20)
+            })
+            .count();
+        assert!(
+            syntax_pixels > 10,
+            "diff view did not render file-viewer syntax colors"
+        );
     }
 
     fn dispatch_pointer(ui: &AppWindow, event: WindowEvent) {
