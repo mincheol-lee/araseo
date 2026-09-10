@@ -1,8 +1,10 @@
 use crate::tree::GitStatus;
 use crate::workspace::Workspace;
+use anyhow::{Context, bail};
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -167,7 +169,7 @@ impl StatusMonitor {
             command
                 .args(["-d", &workspace.distro, "--exec", "/usr/bin/python3", "-u", "-c"])
                 .arg(INOTIFY_MONITOR)
-                .arg(&workspace.linux_root);
+                .arg(wsl_path_argument(&workspace.linux_root));
             command
         } else {
             let mut command = Command::new("/usr/bin/python3");
@@ -264,6 +266,283 @@ pub struct StatusSnapshot {
     pub repositories: HashSet<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffLine {
+    pub old_number: Option<usize>,
+    pub new_number: Option<usize>,
+    pub old_text: String,
+    pub new_text: String,
+    pub old_kind: DiffKind,
+    pub new_kind: DiffKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiffKind {
+    Context,
+    Removed,
+    Added,
+    Empty,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileDiff {
+    pub repository: PathBuf,
+    pub path: PathBuf,
+    pub status: GitStatus,
+    pub lines: Vec<DiffLine>,
+}
+
+pub fn load_diff(
+    workspace: &Workspace,
+    repository: &Path,
+    path: &Path,
+    status: GitStatus,
+) -> anyhow::Result<FileDiff> {
+    let relative = validated_relative_path(workspace, repository, path)?;
+    let lines = if status == GitStatus::Untracked {
+        let text = fs::read_to_string(workspace.host_path(path)?)
+            .with_context(|| format!("cannot read untracked file: {}", path.display()))?;
+        inserted_lines(&text)
+    } else {
+        let mut command = git_command(workspace, repository)?;
+        command.args([
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--unified=1000000",
+            "HEAD",
+            "--",
+        ]);
+        if cfg!(windows) {
+            command.arg(wsl_path_argument(&relative));
+        } else {
+            command.arg(&relative);
+        }
+        let output = command
+            .output()
+            .with_context(|| format!("cannot load Git diff for {}", path.display()))?;
+        if !output.status.success() {
+            bail!(
+                "Git diff failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        parse_unified_diff(&String::from_utf8_lossy(&output.stdout))
+    };
+
+    let lines = if lines.is_empty() {
+        vec![DiffLine {
+            old_number: None,
+            new_number: None,
+            old_text: "Binary file or empty change".into(),
+            new_text: "Binary file or empty change".into(),
+            old_kind: DiffKind::Context,
+            new_kind: DiffKind::Context,
+        }]
+    } else {
+        lines
+    };
+
+    Ok(FileDiff {
+        repository: repository.to_path_buf(),
+        path: path.to_path_buf(),
+        status,
+        lines,
+    })
+}
+
+pub fn discard_change(
+    workspace: &Workspace,
+    repository: &Path,
+    path: &Path,
+    status: GitStatus,
+) -> anyhow::Result<()> {
+    let relative = validated_relative_path(workspace, repository, path)?;
+    let mut command = git_command(workspace, repository)?;
+    if status == GitStatus::Untracked {
+        command.args(["clean", "-f", "--"]);
+    } else {
+        command.args(["restore", "--source=HEAD", "--staged", "--worktree", "--"]);
+    }
+    if cfg!(windows) {
+        command.arg(wsl_path_argument(&relative));
+    } else {
+        command.arg(&relative);
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("cannot discard {}", path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "Discard failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn validated_relative_path(
+    workspace: &Workspace,
+    repository: &Path,
+    path: &Path,
+) -> anyhow::Result<PathBuf> {
+    repository
+        .strip_prefix(&workspace.linux_root)
+        .with_context(|| format!("repository is outside workspace: {}", repository.display()))?;
+    let relative = path
+        .strip_prefix(repository)
+        .with_context(|| format!("path is outside repository: {}", path.display()))?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        bail!("invalid Git path: {}", path.display());
+    }
+    Ok(relative.to_path_buf())
+}
+
+fn git_command(workspace: &Workspace, repository: &Path) -> anyhow::Result<Command> {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new(r"C:\Windows\System32\wsl.exe");
+        command
+            .args(["-d", &workspace.distro, "--cd"])
+            .arg(wsl_path_argument(repository))
+            .arg("git");
+        command
+    } else {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(workspace.host_path(repository)?);
+        command
+    };
+    hide_window(&mut command);
+    Ok(command)
+}
+
+fn inserted_lines(text: &str) -> Vec<DiffLine> {
+    text.lines()
+        .enumerate()
+        .map(|(index, text)| DiffLine {
+            old_number: None,
+            new_number: Some(index + 1),
+            old_text: String::new(),
+            new_text: text.to_string(),
+            old_kind: DiffKind::Empty,
+            new_kind: DiffKind::Added,
+        })
+        .collect()
+}
+
+fn wsl_path_argument(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn parse_unified_diff(patch: &str) -> Vec<DiffLine> {
+    let mut output = Vec::new();
+    let mut old_number = 0usize;
+    let mut new_number = 0usize;
+    let mut in_hunk = false;
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+
+    for line in patch.lines() {
+        if line.starts_with("@@ ") {
+            flush_changed_lines(&mut output, &mut removed, &mut added);
+            let Some((old, new)) = hunk_starts(line) else {
+                continue;
+            };
+            old_number = old;
+            new_number = new;
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk || line.starts_with("\\ No newline at end of file") {
+            continue;
+        }
+        let mut characters = line.chars();
+        let marker = characters.next().unwrap_or(' ');
+        let text = characters.as_str().to_string();
+        match marker {
+            ' ' => {
+                flush_changed_lines(&mut output, &mut removed, &mut added);
+                output.push(DiffLine {
+                    old_number: Some(old_number),
+                    new_number: Some(new_number),
+                    old_text: text.clone(),
+                    new_text: text,
+                    old_kind: DiffKind::Context,
+                    new_kind: DiffKind::Context,
+                });
+                old_number += 1;
+                new_number += 1;
+            }
+            '-' => {
+                removed.push((old_number, text));
+                old_number += 1;
+            }
+            '+' => {
+                added.push((new_number, text));
+                new_number += 1;
+            }
+            _ => {}
+        }
+    }
+    flush_changed_lines(&mut output, &mut removed, &mut added);
+    output
+}
+
+fn flush_changed_lines(
+    output: &mut Vec<DiffLine>,
+    removed: &mut Vec<(usize, String)>,
+    added: &mut Vec<(usize, String)>,
+) {
+    let count = removed.len().max(added.len());
+    for index in 0..count {
+        let old = removed.get(index);
+        let new = added.get(index);
+        output.push(DiffLine {
+            old_number: old.map(|(number, _)| *number),
+            new_number: new.map(|(number, _)| *number),
+            old_text: old.map(|(_, text)| text.clone()).unwrap_or_default(),
+            new_text: new.map(|(_, text)| text.clone()).unwrap_or_default(),
+            old_kind: if old.is_some() {
+                DiffKind::Removed
+            } else {
+                DiffKind::Empty
+            },
+            new_kind: if new.is_some() {
+                DiffKind::Added
+            } else {
+                DiffKind::Empty
+            },
+        });
+    }
+    removed.clear();
+    added.clear();
+}
+
+fn hunk_starts(header: &str) -> Option<(usize, usize)> {
+    let mut fields = header.split_whitespace();
+    (fields.next()? == "@@").then_some(())?;
+    let old = fields
+        .next()?
+        .strip_prefix('-')?
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    let new = fields
+        .next()?
+        .strip_prefix('+')?
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    Some((old, new))
+}
+
 impl Drop for StatusMonitor {
     fn drop(&mut self) {
         let _ = self.input.write_all(b"quit\n");
@@ -278,7 +557,7 @@ pub fn read_status(workspace: &Workspace) -> HashMap<PathBuf, GitStatus> {
         let mut command = Command::new(r"C:\Windows\System32\wsl.exe");
         command
             .args(["-d", &workspace.distro, "--cd"])
-            .arg(&workspace.linux_root)
+            .arg(wsl_path_argument(&workspace.linux_root))
             .args([
                 "git",
                 "status",
@@ -366,14 +645,24 @@ fn parse_porcelain(root: &std::path::Path, bytes: &[u8]) -> HashMap<PathBuf, Git
                 let Some(path_start) = nth_space(record, 8) else {
                     continue;
                 };
-                (GitStatus::Modified, &record[path_start + 1..])
+                let status = if record.get(2..4).is_some_and(|xy| xy.contains(&b'D')) {
+                    GitStatus::Deleted
+                } else {
+                    GitStatus::Modified
+                };
+                (status, &record[path_start + 1..])
             }
             Some(b'2') => {
                 let Some(path_start) = nth_space(record, 9) else {
                     continue;
                 };
                 let _original_path = records.next();
-                (GitStatus::Modified, &record[path_start + 1..])
+                let status = if record.get(2..4).is_some_and(|xy| xy.contains(&b'D')) {
+                    GitStatus::Deleted
+                } else {
+                    GitStatus::Modified
+                };
+                (status, &record[path_start + 1..])
             }
             _ => continue,
         };
@@ -400,10 +689,95 @@ mod tests {
         let root = PathBuf::from("/work");
         let parsed = parse_porcelain(
             &root,
-            b"1 .M N... 100644 100644 100644 abcdef abcdef src/main.rs\0? new file.txt\0",
+            b"1 .M N... 100644 100644 100644 abcdef abcdef src/main.rs\0? new file.txt\0\
+              1 .D N... 100644 100644 000000 abcdef 000000 old.txt\0",
         );
         assert_eq!(parsed[&root.join("src/main.rs")], GitStatus::Modified);
         assert_eq!(parsed[&root.join("new file.txt")], GitStatus::Untracked);
+        assert_eq!(parsed[&root.join("old.txt")], GitStatus::Deleted);
+    }
+
+    #[test]
+    fn aligns_unified_diff_changes_for_side_by_side_rendering() {
+        let lines = parse_unified_diff(
+            "diff --git a/sample.txt b/sample.txt\n--- a/sample.txt\n+++ b/sample.txt\n@@ -1,3 +1,4 @@\n same\n-old\n+new\n+added\n last\n",
+        );
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines[1],
+            DiffLine {
+                old_number: Some(2),
+                new_number: Some(2),
+                old_text: "old".into(),
+                new_text: "new".into(),
+                old_kind: DiffKind::Removed,
+                new_kind: DiffKind::Added,
+            }
+        );
+        assert_eq!(lines[2].old_kind, DiffKind::Empty);
+        assert_eq!(lines[2].new_text, "added");
+        assert_eq!(lines[3].old_number, Some(3));
+        assert_eq!(lines[3].new_number, Some(4));
+    }
+
+    #[test]
+    fn normalizes_windows_joined_paths_for_wsl_git_arguments() {
+        assert_eq!(
+            wsl_path_argument(Path::new(r"/home/minch\agent_ide\src\main.rs")),
+            "/home/minch/agent_ide/src/main.rs"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn loads_and_discards_tracked_and_untracked_changes() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("araseo-git-diff-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let tracked = root.join("tracked.txt");
+        let untracked = root.join("untracked.txt");
+        fs::write(&tracked, "same\nold\nlast\n").unwrap();
+        for arguments in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "araseo-harness@example.invalid"],
+            vec!["config", "user.name", "Araseo Harness"],
+            vec!["add", "."],
+            vec!["commit", "--quiet", "-m", "initial"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(arguments)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::write(&tracked, "same\nnew\nadded\nlast\n").unwrap();
+        fs::write(&untracked, "brand new\n").unwrap();
+
+        let workspace = Workspace::new("Ubuntu", root.clone()).unwrap();
+        let diff = load_diff(&workspace, &root, &tracked, GitStatus::Modified).unwrap();
+        assert!(
+            diff.lines
+                .iter()
+                .any(|line| line.old_text == "old" && line.new_text == "new")
+        );
+        let new_diff = load_diff(&workspace, &root, &untracked, GitStatus::Untracked).unwrap();
+        assert_eq!(new_diff.lines[0].new_text, "brand new");
+
+        discard_change(&workspace, &root, &tracked, GitStatus::Modified).unwrap();
+        discard_change(&workspace, &root, &untracked, GitStatus::Untracked).unwrap();
+        assert_eq!(fs::read_to_string(&tracked).unwrap(), "same\nold\nlast\n");
+        assert!(!untracked.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

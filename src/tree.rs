@@ -10,6 +10,7 @@ pub enum GitStatus {
     Clean,
     Modified,
     Untracked,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

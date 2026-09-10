@@ -71,6 +71,40 @@ pub fn markup_with_brightness(path: &Path, text: &str, brightness: i32) -> Optio
     Some(highlight_markup(language, text, brightness))
 }
 
+/// Highlight aligned diff lines while preserving lexer state across lines that
+/// are absent on one side of the diff.
+pub fn line_markup_with_brightness(
+    path: &Path,
+    lines: &[Option<&str>],
+    brightness: i32,
+) -> Option<Vec<Option<String>>> {
+    let text = lines
+        .iter()
+        .filter_map(|line| *line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !should_highlight(path, &text) {
+        return None;
+    }
+    let language = language_for(path)?;
+    let mut block_comment = false;
+    Some(
+        lines
+            .iter()
+            .map(|line| {
+                line.map(|line| {
+                    let mut output = String::with_capacity(line.len().saturating_mul(3));
+                    highlight_line(language, line, &mut block_comment, brightness, &mut output);
+                    if line.is_empty() {
+                        push_token(&mut output, "\u{200b}", TokenKind::Plain, brightness);
+                    }
+                    output
+                })
+            })
+            .collect(),
+    )
+}
+
 pub fn should_highlight(path: &Path, text: &str) -> bool {
     let Some(file_name) = path.file_name() else {
         return false;
@@ -523,6 +557,16 @@ mod tests {
         let dimmed = highlight_markup(Language::Rust, "let value = 1;", 50);
         assert!(dimmed.contains("#2b4e6b\">let"));
         assert!(dimmed.contains("#6a6a6a\">value"));
+    }
+
+    #[test]
+    fn diff_lines_share_file_highlighting_and_preserve_multiline_state() {
+        let lines = [Some("/* start"), None, Some("still a comment"), Some("*/ let value = 7;")];
+        let highlighted = line_markup_with_brightness(Path::new("sample.rs"), &lines, 100).unwrap();
+        assert!(highlighted[0].as_ref().unwrap().contains("#6a9955"));
+        assert!(highlighted[1].is_none());
+        assert!(highlighted[2].as_ref().unwrap().contains("#6a9955"));
+        assert!(highlighted[3].as_ref().unwrap().contains("#569cd6\">let"));
     }
 
     #[test]

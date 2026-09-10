@@ -32,12 +32,101 @@ export struct TerminalCell {
     column-span: int,
 }
 
+export struct GitEntry {
+    kind: string,
+    name: string,
+    detail: string,
+    path: string,
+    status: string,
+    count: int,
+    icon: image,
+    expanded: bool,
+}
+
+export struct DiffRow {
+    old-line: string,
+    new-line: string,
+    old-text: string,
+    new-text: string,
+    old-highlighted: styled-text,
+    new-highlighted: styled-text,
+    old-highlighted-enabled: bool,
+    new-highlighted-enabled: bool,
+    old-kind: string,
+    new-kind: string,
+}
+
+component DiffCell inherits Rectangle {
+    in property <string> line-number;
+    in property <string> code;
+    in property <styled-text> highlighted-code;
+    in property <bool> highlighted-enabled: false;
+    in property <string> change-kind;
+    in property <int> font-size: 14;
+    height: max(21px, root.font-size * 1.5px);
+    background: root.change-kind == "removed" ? #4b1818
+        : (root.change-kind == "added" ? #173d24
+        : (root.change-kind == "empty" ? #252526 : #1e1e1e));
+    clip: true;
+
+    HorizontalLayout {
+        spacing: 0px;
+        Rectangle {
+            width: 46px;
+            background: root.change-kind == "removed" ? #3d1717
+                : (root.change-kind == "added" ? #14331f : #1e1e1e);
+            Text {
+                text: root.line-number;
+                color: #858585;
+                font-family: "Cascadia Mono";
+                font-size: root.font-size * 1px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                x: 3px;
+                width: parent.width - 8px;
+            }
+        }
+        Rectangle {
+            width: 3px;
+            background: root.change-kind == "removed" ? #b54a4a
+                : (root.change-kind == "added" ? #3f9b57 : transparent);
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            if !root.highlighted-enabled: Text {
+                x: 8px;
+                width: parent.width - 10px;
+                text: root.code;
+                color: root.change-kind == "removed" ? #f1cccc
+                    : (root.change-kind == "added" ? #d2f0d8 : #d4d4d4);
+                font-family: "Cascadia Mono";
+                font-size: root.font-size * 1px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if root.highlighted-enabled: StyledText {
+                x: 8px;
+                width: parent.width - 10px;
+                height: parent.height;
+                text: root.highlighted-code;
+                default-color: #d4d4d4;
+                default-font-family: "Cascadia Mono";
+                default-font-size: root.font-size * 1px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
 component WorkspaceGroup inherits Rectangle {
     in property <int> group-id: 0;
     in property <int> terminal-font-size: 14;
     in property <int> editor-font-size: 14;
     in property <int> terminal-font-brightness: 120;
     in property <int> editor-font-brightness: 120;
+    in property <[DiffRow]> diff-rows;
+    in property <string> diff-old-title: "Original";
+    in property <string> diff-new-title: "Working Tree";
     private property <length> terminal-cell-width: round(root.terminal-font-size * 4 / 7) * 1px;
     private property <length> terminal-cell-height: ceil(root.terminal-font-size * 8 / 7) * 1px;
     in property <length> caption-reserve: 0px;
@@ -203,10 +292,10 @@ component WorkspaceGroup inherits Rectangle {
                                 local-tab-title := Text {
                                     x: 9px;
                                     width: parent.width - 43px;
-                                    text: (tab.kind == "terminal" ? ">_ " : "") + tab.title
+                                    text: (tab.kind == "terminal" ? ">_ " : (tab.kind == "diff" ? "↔ " : "")) + tab.title
                                         + (tab.dirty ? " ●" : "");
                                     color: tab.kind == "terminal" ? #82c7ff
-                                        : (parent.active ? #f1f1f1 : #aeb4bf);
+                                        : (tab.kind == "diff" ? #e2c08d : (parent.active ? #f1f1f1 : #aeb4bf));
                                     font-family: tab.kind == "terminal" ? "Cascadia Mono" : "Geist";
                                     font-size: 12px;
                                     vertical-alignment: center;
@@ -504,6 +593,87 @@ component WorkspaceGroup inherits Rectangle {
             }
         }
 
+        diff-layer := Rectangle {
+            visible: root.active-kind == "diff";
+            width: parent.width;
+            height: parent.height;
+            background: #1e1e1e;
+
+            VerticalLayout {
+                spacing: 0px;
+                Rectangle {
+                    height: 34px;
+                    background: #181818;
+                    border-width: 1px;
+                    border-color: #2b2b2b;
+                    HorizontalLayout {
+                        spacing: 1px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: #181818;
+                            Text {
+                                text: root.diff-old-title;
+                                color: #cccccc;
+                                font-family: "Geist";
+                                font-size: 12px;
+                                x: 12px;
+                                width: parent.width - 18px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        Rectangle { width: 1px; background: #3c3c3c; }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: #181818;
+                            Text {
+                                text: root.diff-new-title;
+                                color: #cccccc;
+                                font-family: "Geist";
+                                font-size: 12px;
+                                x: 12px;
+                                width: parent.width - 18px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+                diff-scroll := ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    viewport-width: self.visible-width;
+                    VerticalLayout {
+                        width: diff-scroll.visible-width;
+                        spacing: 0px;
+                        for row in root.diff-rows: HorizontalLayout {
+                            height: max(21px, root.editor-font-size * 1.5px);
+                            spacing: 1px;
+                            DiffCell {
+                                horizontal-stretch: 1;
+                                line-number: row.old-line;
+                                code: row.old-text;
+                                highlighted-code: row.old-highlighted;
+                                highlighted-enabled: row.old-highlighted-enabled;
+                                change-kind: row.old-kind;
+                                font-size: root.editor-font-size;
+                            }
+                            Rectangle { width: 1px; background: #3c3c3c; }
+                            DiffCell {
+                                horizontal-stretch: 1;
+                                line-number: row.new-line;
+                                code: row.new-text;
+                                highlighted-code: row.new-highlighted;
+                                highlighted-enabled: row.new-highlighted-enabled;
+                                change-kind: row.new-kind;
+                                font-size: root.editor-font-size;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         terminal-focus := FocusScope {
             visible: root.active-kind == "terminal";
             width: parent.width;
@@ -672,6 +842,8 @@ export component AppWindow inherits Window {
 
     in property <string> workspace-name: "No workspace";
     in property <[TreeEntry]> tree-entries;
+    in property <[GitEntry]> git-entries;
+    in property <int> git-change-count: 0;
     in property <[TabEntry]> primary-tabs;
     in property <[TabEntry]> secondary-tabs;
     in-out property <string> editor-text;
@@ -683,6 +855,12 @@ export component AppWindow inherits Window {
     in property <string> active-path: "";
     in property <string> status-text: "Ready";
     in property <bool> save-conflict: false;
+    in property <[DiffRow]> diff-rows;
+    in property <[DiffRow]> secondary-diff-rows;
+    in property <string> diff-old-title: "Original";
+    in property <string> diff-new-title: "Working Tree";
+    in property <string> secondary-diff-old-title: "Original";
+    in property <string> secondary-diff-new-title: "Working Tree";
     in property <[TerminalCell]> terminal-cells;
     in property <int> terminal-grid-columns: 80;
     in property <int> terminal-grid-rows: 24;
@@ -728,6 +906,10 @@ export component AppWindow inherits Window {
     in property <string> secondary-active-title: "";
     in property <string> secondary-active-detail: "";
     in-out property <int> focused-group: 0;
+    in-out property <int> sidebar-view: 0;
+    in-out property <bool> discard-confirm-visible: false;
+    in-out property <string> discard-confirm-path: "";
+    in-out property <string> discard-confirm-name: "";
     in-out property <bool> find-visible: false;
     out property <int> editor-selection-length: root.focused-group == 1
         ? (root.secondary-active-kind == "file" ? secondary-view.editor-selection-length : 0)
@@ -754,6 +936,9 @@ export component AppWindow inherits Window {
     private property <bool> has-secondary-group: root.secondary-tabs.length > 0;
 
     callback tree-activated(int);
+    callback git-repository-toggled(string);
+    callback git-change-activated(string);
+    callback git-discard-requested(string);
     callback tab-activated(int);
     callback tab-cycle(int);
     callback tab-close(int);
@@ -888,17 +1073,53 @@ export component AppWindow inherits Window {
                     }
 
                     Rectangle {
-                        height: 30px;
-                        background: #292d35;
-                        Text {
-                            text: "FILES";
-                            color: root.adjusted-font-color(#bbc0ca, root.tree-font-brightness);
-                            font-size: 11px;
-                            vertical-alignment: center;
-                            x: 10px;
+                        height: 32px;
+                        background: #181a1f;
+                        HorizontalLayout {
+                            spacing: 0px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                background: root.sidebar-view == 0 ? #2a2d34
+                                    : (files-view-touch.has-hover ? #24272e : #20232a);
+                                Text {
+                                    text: "FILES";
+                                    color: root.sidebar-view == 0 ? #ffffff : #aeb4bf;
+                                    font-size: 11px;
+                                    font-weight: root.sidebar-view == 0 ? 600 : 400;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    y: parent.height - 2px;
+                                    height: 2px;
+                                    width: parent.width;
+                                    background: root.sidebar-view == 0 ? #3794ff : transparent;
+                                }
+                                files-view-touch := TouchArea { clicked => { root.sidebar-view = 0; } }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                background: root.sidebar-view == 1 ? #2a2d34
+                                    : (git-view-touch.has-hover ? #24272e : #20232a);
+                                Text {
+                                    text: root.git-change-count > 0 ? "GIT  " + root.git-change-count : "GIT";
+                                    color: root.sidebar-view == 1 ? #ffffff : #aeb4bf;
+                                    font-size: 11px;
+                                    font-weight: root.sidebar-view == 1 ? 600 : 400;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    y: parent.height - 2px;
+                                    height: 2px;
+                                    width: parent.width;
+                                    background: root.sidebar-view == 1 ? #3794ff : transparent;
+                                }
+                                git-view-touch := TouchArea { clicked => { root.sidebar-view = 1; } }
+                            }
                         }
                     }
-                    ScrollView {
+                    if root.sidebar-view == 0: ScrollView {
                         vertical-stretch: 1;
                         VerticalLayout {
                             spacing: 0px;
@@ -944,6 +1165,180 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    if root.sidebar-view == 1: Rectangle {
+                        vertical-stretch: 1;
+                        background: #181a1f;
+                        VerticalLayout {
+                            spacing: 0px;
+                            Rectangle {
+                                height: 34px;
+                                background: #181818;
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    Text {
+                                        text: "SOURCE CONTROL";
+                                        color: #f0f0f0;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Rectangle {
+                                        width: 28px;
+                                        height: 18px;
+                                        border-radius: 9px;
+                                        background: #3a3d41;
+                                        Text {
+                                            text: root.git-change-count;
+                                            color: #f0f0f0;
+                                            font-size: 10px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                            ScrollView {
+                                vertical-stretch: 1;
+                                VerticalLayout {
+                                    spacing: 0px;
+                                    if root.git-entries.length == 0: Rectangle {
+                                        height: 64px;
+                                        Text {
+                                            text: "No changes";
+                                            color: #8c8c8c;
+                                            font-size: 12px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    for entry in root.git-entries: Rectangle {
+                                        height: entry.kind == "repository" ? 48px : 30px;
+                                        background: entry.kind == "repository"
+                                            ? (git-entry-touch.has-hover ? #303033 : #252526)
+                                            : (git-entry-touch.has-hover ? #2a2d2e : transparent);
+                                        if entry.kind == "repository": Rectangle {
+                                            x: 0px;
+                                            width: 3px;
+                                            height: parent.height;
+                                            background: entry.expanded ? #3794ff : #55575b;
+                                        }
+                                        if entry.kind == "change": Rectangle {
+                                            x: 14px;
+                                            width: 1px;
+                                            height: parent.height;
+                                            background: #3c3c3c;
+                                        }
+                                        git-entry-touch := TouchArea {
+                                            clicked => {
+                                                if (entry.kind == "repository") {
+                                                    root.git-repository-toggled(entry.path);
+                                                } else {
+                                                    root.git-change-activated(entry.path);
+                                                }
+                                            }
+                                        }
+                                        if entry.kind == "repository": HorizontalLayout {
+                                            padding-left: 10px;
+                                            padding-right: 10px;
+                                            spacing: 8px;
+                                            Text {
+                                                text: entry.expanded ? "⌄" : "›";
+                                                color: #f0f0f0;
+                                                font-size: 16px;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle {
+                                                horizontal-stretch: 1;
+                                                VerticalLayout {
+                                                    spacing: 0px;
+                                                    Text {
+                                                        text: entry.name;
+                                                        color: #f0f0f0;
+                                                        font-size: 12px;
+                                                        font-weight: 600;
+                                                        vertical-alignment: bottom;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: "PROJECT  ·  " + entry.detail;
+                                                        color: #8c8c8c;
+                                                        font-size: 9px;
+                                                        vertical-alignment: top;
+                                                        overflow: elide;
+                                                    }
+                                                }
+                                            }
+                                            Rectangle {
+                                                width: 28px;
+                                                height: 18px;
+                                                border-radius: 9px;
+                                                background: #3a3d41;
+                                                Text {
+                                                    text: entry.count;
+                                                    color: #cccccc;
+                                                    font-size: 10px;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                        if entry.kind == "change": HorizontalLayout {
+                                            padding-left: 25px;
+                                            padding-right: 5px;
+                                            spacing: 5px;
+                                            Image { source: entry.icon; width: 18px; height: 18px; image-fit: contain; }
+                                            Text {
+                                                text: entry.name;
+                                                color: #cccccc;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: entry.detail;
+                                                color: #8c8c8c;
+                                                font-size: 10px;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            Rectangle {
+                                                width: 24px;
+                                                height: 22px;
+                                                border-radius: 3px;
+                                                background: discard-touch.has-hover ? #3a3d41 : transparent;
+                                                Text {
+                                                    text: "↶";
+                                                    color: #cccccc;
+                                                    font-size: 15px;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                                discard-touch := TouchArea {
+                                                    clicked => {
+                                                        root.discard-confirm-path = entry.path;
+                                                        root.discard-confirm-name = entry.name;
+                                                        root.discard-confirm-visible = true;
+                                                    }
+                                                }
+                                            }
+                                            Text {
+                                                text: entry.status;
+                                                color: entry.status == "U" ? #73c991
+                                                    : (entry.status == "D" ? #f14c4c : #e2c08d);
+                                                font-family: "Cascadia Mono";
+                                                font-size: 12px;
+                                                font-weight: 600;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                 }
             }
 
@@ -967,6 +1362,9 @@ export component AppWindow inherits Window {
                     editor-font-size: root.editor-font-size;
                     terminal-font-brightness: root.terminal-font-brightness;
                     editor-font-brightness: root.editor-font-brightness;
+                    diff-rows: root.diff-rows;
+                    diff-old-title: root.diff-old-title;
+                    diff-new-title: root.diff-new-title;
                     title-row: self.y == 0px;
                     caption-reserve: self.y == 0px
                         ? max(0px, self.x + self.width - (workspace-area.width - 140px)) : 0px;
@@ -1035,6 +1433,9 @@ export component AppWindow inherits Window {
                     editor-font-size: root.editor-font-size;
                     terminal-font-brightness: root.terminal-font-brightness;
                     editor-font-brightness: root.editor-font-brightness;
+                    diff-rows: root.secondary-diff-rows;
+                    diff-old-title: root.secondary-diff-old-title;
+                    diff-new-title: root.secondary-diff-new-title;
                     title-row: self.y == 0px;
                     caption-reserve: self.y == 0px
                         ? max(0px, self.x + self.width - (workspace-area.width - 140px)) : 0px;
@@ -1254,6 +1655,48 @@ export component AppWindow inherits Window {
                         root.tree-font-brightness = 120;
                     } }
                     Button { text: "Close"; clicked => { root.font-menu-visible = false; } }
+                }
+            }
+        }
+
+        if root.discard-confirm-visible: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #000000;
+            opacity: 0.55;
+            TouchArea { clicked => { root.discard-confirm-visible = false; } }
+        }
+        if root.discard-confirm-visible: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 420px;
+            height: 170px;
+            background: #252526;
+            border-color: #454545;
+            border-width: 1px;
+            border-radius: 5px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text { text: "Discard changes?"; color: #f0f0f0; font-size: 15px; font-weight: 600; }
+                Text {
+                    text: "This will permanently discard changes in " + root.discard-confirm-name + ".";
+                    color: #cccccc;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    vertical-stretch: 1;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.discard-confirm-visible = false; } }
+                    Button {
+                        text: "Discard";
+                        clicked => {
+                            root.discard-confirm-visible = false;
+                            root.git-discard-requested(root.discard-confirm-path);
+                        }
+                    }
                 }
             }
         }

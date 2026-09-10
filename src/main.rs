@@ -32,6 +32,7 @@ slint::include_modules!();
 struct AppState {
     workspace: Workspace,
     expanded: HashSet<PathBuf>,
+    expanded_git_repositories: HashSet<PathBuf>,
     statuses: HashMap<PathBuf, GitStatus>,
     repositories: HashSet<PathBuf>,
     tree: Vec<FlatNode>,
@@ -46,11 +47,14 @@ struct AppState {
     emoji_icons: emoji::EmojiIcons,
     tree_loader: Background<Result<Vec<FlatNode>>>,
     file_loader: Background<Result<(Document, usize)>>,
+    diff_loader: Background<Result<(git::FileDiff, usize)>>,
+    git_action_loader: Background<Result<PathBuf>>,
     editor_views: RefCell<[editor_view::EditorView; 2]>,
 }
 
 enum TabContent {
     File(Document),
+    Diff(git::FileDiff),
     Terminal {
         session: TerminalSession,
         start_path: PathBuf,
@@ -88,6 +92,7 @@ fn main() -> Result<()> {
     let state = Rc::new(RefCell::new(AppState {
         workspace,
         expanded: HashSet::new(),
+        expanded_git_repositories: HashSet::new(),
         statuses,
         repositories: HashSet::new(),
         tree,
@@ -102,6 +107,8 @@ fn main() -> Result<()> {
         emoji_icons: emoji::EmojiIcons::default(),
         tree_loader: Background::default(),
         file_loader: Background::default(),
+        diff_loader: Background::default(),
+        git_action_loader: Background::default(),
         editor_views: RefCell::new(Default::default()),
     }));
 
@@ -192,6 +199,65 @@ fn main() -> Result<()> {
             }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_git_repository_toggled(move |path| {
+            let mut state = state.borrow_mut();
+            let path = PathBuf::from(path.as_str());
+            if !state.expanded_git_repositories.remove(&path) {
+                state.expanded_git_repositories.insert(path);
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_git_changes(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_git_change_activated(move |path| {
+            let mut state = state.borrow_mut();
+            if let Err(error) = open_git_diff(&mut state, PathBuf::from(path.as_str())) {
+                state.status = error.to_string();
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_git_discard_requested(move |path| {
+            let mut state = state.borrow_mut();
+            let path = PathBuf::from(path.as_str());
+            let Some(status) = state.statuses.get(&path).copied() else {
+                state.status = "Git change is no longer available".into();
+                if let Some(ui) = weak.upgrade() {
+                    sync_ui(&ui, &state);
+                }
+                return;
+            };
+            let Some(repository) = repository_for(&state.repositories, &path) else {
+                state.status = format!("Cannot find repository for {}", path.display());
+                if let Some(ui) = weak.upgrade() {
+                    sync_ui(&ui, &state);
+                }
+                return;
+            };
+            let workspace = state.workspace.clone();
+            let result_path = path.clone();
+            state.status = format!("Discarding {}...", path.display());
+            state.git_action_loader.request(move || {
+                git::discard_change(&workspace, &repository, &path, status)?;
+                Ok(result_path)
+            });
+            if let Some(ui) = weak.upgrade() {
+                ui.set_status_text(state.status.clone().into());
             }
         });
     }
@@ -471,6 +537,7 @@ fn main() -> Result<()> {
             if let Some(pixels) = icon_loader.poll() {
                 state.emoji_icons = emoji::EmojiIcons::from_pixels(pixels);
                 sync_tree(&ui, &state);
+                sync_git_changes(&ui, &state);
             }
             if let Some(result) = state.file_loader.poll() {
                 match result {
@@ -482,6 +549,41 @@ fn main() -> Result<()> {
                         });
                         state.tab_groups.add(tab_id, group);
                         state.status = "File opened".into();
+                    }
+                    Err(error) => state.status = error.to_string(),
+                }
+                sync_ui(&ui, &state);
+            }
+            if let Some(result) = state.diff_loader.poll() {
+                match result {
+                    Ok((diff, group)) => {
+                        if state.statuses.contains_key(&diff.path) {
+                            let tab_id = take_next_tab_id(&mut state);
+                            state.tabs.push(WorkspaceTab {
+                                id: tab_id,
+                                content: TabContent::Diff(diff),
+                            });
+                            state.tab_groups.add(tab_id, group);
+                            state.status = "Diff opened".into();
+                        } else {
+                            state.status = "Git change is no longer available".into();
+                        }
+                    }
+                    Err(error) => state.status = error.to_string(),
+                }
+                sync_ui(&ui, &state);
+            }
+            if let Some(result) = state.git_action_loader.poll() {
+                match result {
+                    Ok(path) => {
+                        close_diff_tabs(&mut state, &path);
+                        state.status = format!("Discarded changes in {}", path.display());
+                        if let Some(monitor) = state.git_monitor.as_mut() {
+                            let _ = monitor.force_refresh();
+                        } else {
+                            state.statuses = git::read_status(&state.workspace);
+                            refresh_tree(&mut state);
+                        }
                     }
                     Err(error) => state.status = error.to_string(),
                 }
@@ -577,6 +679,7 @@ fn main() -> Result<()> {
                 }
             };
             let previous_tree = state.tree.clone();
+            let previous_statuses = state.statuses.clone();
             let previous_repositories = state.repositories.clone();
             let previous_status = state.status.clone();
             let previous_save_conflict = state.save_conflict;
@@ -587,8 +690,12 @@ fn main() -> Result<()> {
             }
             refresh_tree(&mut state);
             let refreshed_groups = refresh_external_documents(&mut state);
-            if state.tree != previous_tree || state.repositories != previous_repositories {
+            if state.tree != previous_tree
+                || state.statuses != previous_statuses
+                || state.repositories != previous_repositories
+            {
                 sync_tree(&ui, &state);
+                sync_git_changes(&ui, &state);
             }
             for (group, refreshed) in refreshed_groups.into_iter().enumerate() {
                 if refreshed {
@@ -713,7 +820,8 @@ fn apply_history_change(
 
 fn cancel_file_open(state: &mut AppState) {
     state.file_loader.cancel();
-    if state.status.starts_with("Opening ") {
+    state.diff_loader.cancel();
+    if state.status.starts_with("Opening ") || state.status.starts_with("Loading diff for ") {
         state.status = "Ready".into();
     }
 }
@@ -734,6 +842,35 @@ fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
     state.file_loader.request(move || {
         let host_path = workspace.host_path(&linux_path)?;
         Ok((Document::open(linux_path, host_path)?, group))
+    });
+    Ok(())
+}
+
+fn open_git_diff(state: &mut AppState, path: PathBuf) -> Result<()> {
+    cancel_file_open(state);
+    if let Some(tab_id) = state.tabs.iter().find_map(|tab| match &tab.content {
+        TabContent::Diff(diff) if diff.path == path => Some(tab.id),
+        _ => None,
+    }) {
+        state.tab_groups.activate(tab_id);
+        return Ok(());
+    }
+
+    let status = state
+        .statuses
+        .get(&path)
+        .copied()
+        .with_context(|| format!("Git change is no longer available: {}", path.display()))?;
+    let repository = repository_for(&state.repositories, &path)
+        .with_context(|| format!("Cannot find repository for {}", path.display()))?;
+    let workspace = state.workspace.clone();
+    let group = state.tab_groups.focused_group();
+    state.status = format!("Loading diff for {}...", path.display());
+    state.diff_loader.request(move || {
+        Ok((
+            git::load_diff(&workspace, &repository, &path, status)?,
+            group,
+        ))
     });
     Ok(())
 }
@@ -773,6 +910,23 @@ fn close_tab(state: &mut AppState, tab_id: TabId) {
         state.save_conflict = None;
     }
     state.status = "Tab closed".into();
+}
+
+fn close_diff_tabs(state: &mut AppState, path: &std::path::Path) {
+    let tab_ids = state
+        .tabs
+        .iter()
+        .filter_map(|tab| match &tab.content {
+            TabContent::Diff(diff) if diff.path == path => Some(tab.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for tab_id in tab_ids {
+        state.tab_groups.remove(tab_id);
+        if let Some(index) = state.tabs.iter().position(|tab| tab.id == tab_id) {
+            state.tabs.remove(index);
+        }
+    }
 }
 
 fn save_tab(state: &mut AppState, tab_id: TabId, overwrite_external: bool) {
@@ -884,6 +1038,14 @@ fn focused_tab_id(state: &AppState) -> Option<TabId> {
     state.tab_groups.active(state.tab_groups.focused_group())
 }
 
+fn repository_for(repositories: &HashSet<PathBuf>, path: &std::path::Path) -> Option<PathBuf> {
+    repositories
+        .iter()
+        .filter(|repository| path.starts_with(repository))
+        .max_by_key(|repository| repository.components().count())
+        .cloned()
+}
+
 fn document_ref(state: &AppState, tab_id: TabId) -> Option<&Document> {
     state.tabs.iter().find_map(|tab| {
         if tab.id != tab_id {
@@ -891,7 +1053,7 @@ fn document_ref(state: &AppState, tab_id: TabId) -> Option<&Document> {
         }
         match &tab.content {
             TabContent::File(document) => Some(document),
-            TabContent::Terminal { .. } => None,
+            TabContent::Diff(_) | TabContent::Terminal { .. } => None,
         }
     })
 }
@@ -903,7 +1065,7 @@ fn document_mut(state: &mut AppState, tab_id: TabId) -> Option<&mut Document> {
         }
         match &mut tab.content {
             TabContent::File(document) => Some(document),
-            TabContent::Terminal { .. } => None,
+            TabContent::Diff(_) | TabContent::Terminal { .. } => None,
         }
     })
 }
@@ -915,7 +1077,7 @@ fn terminal_ref(state: &AppState, tab_id: TabId) -> Option<&TerminalSession> {
         }
         match &tab.content {
             TabContent::Terminal { session, .. } => Some(session),
-            TabContent::File(_) => None,
+            TabContent::File(_) | TabContent::Diff(_) => None,
         }
     })
 }
@@ -927,7 +1089,7 @@ fn terminal_mut(state: &mut AppState, tab_id: TabId) -> Option<&mut TerminalSess
         }
         match &mut tab.content {
             TabContent::Terminal { session, .. } => Some(session),
-            TabContent::File(_) => None,
+            TabContent::File(_) | TabContent::Diff(_) => None,
         }
     })
 }
@@ -964,6 +1126,7 @@ fn sync_ui(ui: &AppWindow, state: &AppState) {
     ui.set_save_conflict(state.save_conflict.is_some());
     ui.set_focused_group(state.tab_groups.focused_group() as i32);
     sync_tree(ui, state);
+    sync_git_changes(ui, state);
     sync_tabs(ui, state);
     sync_group(ui, state, 0);
     sync_group(ui, state, 1);
@@ -995,6 +1158,14 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                     sync_editor_view(ui, state, document, 0, ui.get_editor_text());
                     clear_terminal_group(ui, 0);
                 }
+                TabContent::Diff(diff) => {
+                    state.editor_views.borrow_mut()[0].clear();
+                    ui.set_primary_active_kind("diff".into());
+                    ui.set_syntax_highlight_enabled(false);
+                    ui.set_highlighted_text(slint::StyledText::default());
+                    sync_diff(ui, diff, 0);
+                    clear_terminal_group(ui, 0);
+                }
                 TabContent::Terminal { session, .. } => {
                     state.editor_views.borrow_mut()[0].clear();
                     ui.set_primary_active_kind("terminal".into());
@@ -1019,6 +1190,14 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                     sync_editor_view(ui, state, document, 1, ui.get_secondary_editor_text());
                     clear_terminal_group(ui, 1);
                 }
+                TabContent::Diff(diff) => {
+                    state.editor_views.borrow_mut()[1].clear();
+                    ui.set_secondary_active_kind("diff".into());
+                    ui.set_secondary_syntax_highlight_enabled(false);
+                    ui.set_secondary_highlighted_text(slint::StyledText::default());
+                    sync_diff(ui, diff, 1);
+                    clear_terminal_group(ui, 1);
+                }
                 TabContent::Terminal { session, .. } => {
                     state.editor_views.borrow_mut()[1].clear();
                     ui.set_secondary_active_kind("terminal".into());
@@ -1038,6 +1217,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
             ui.set_line_numbers("1".into());
             ui.set_syntax_highlight_enabled(false);
             ui.set_highlighted_text(slint::StyledText::default());
+            ui.set_diff_rows(ModelRc::new(VecModel::from(Vec::<DiffRow>::new())));
             clear_terminal_group(ui, 0);
         }
         (1, None) => {
@@ -1050,6 +1230,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
             ui.set_secondary_line_numbers("1".into());
             ui.set_secondary_syntax_highlight_enabled(false);
             ui.set_secondary_highlighted_text(slint::StyledText::default());
+            ui.set_secondary_diff_rows(ModelRc::new(VecModel::from(Vec::<DiffRow>::new())));
             clear_terminal_group(ui, 1);
         }
         _ => {}
@@ -1088,6 +1269,85 @@ fn sync_editor_view(
             ui.set_secondary_syntax_highlight_enabled(false);
         }
         _ => {}
+    }
+}
+
+fn sync_diff(ui: &AppWindow, diff: &git::FileDiff, group: usize) {
+    let old_lines = diff
+        .lines
+        .iter()
+        .map(|line| line.old_number.map(|_| line.old_text.as_str()))
+        .collect::<Vec<_>>();
+    let new_lines = diff
+        .lines
+        .iter()
+        .map(|line| line.new_number.map(|_| line.new_text.as_str()))
+        .collect::<Vec<_>>();
+    let brightness = ui.get_editor_font_brightness();
+    let old_markup = highlight::line_markup_with_brightness(&diff.path, &old_lines, brightness);
+    let new_markup = highlight::line_markup_with_brightness(&diff.path, &new_lines, brightness);
+    let rows = diff
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let old_highlighted = old_markup
+                .as_ref()
+                .and_then(|lines| lines[index].as_ref())
+                .and_then(|markup| slint::StyledText::from_markdown(markup).ok());
+            let new_highlighted = new_markup
+                .as_ref()
+                .and_then(|lines| lines[index].as_ref())
+                .and_then(|markup| slint::StyledText::from_markdown(markup).ok());
+            DiffRow {
+                old_line: line
+                    .old_number
+                    .map(|number| number.to_string())
+                    .unwrap_or_default()
+                    .into(),
+                new_line: line
+                    .new_number
+                    .map(|number| number.to_string())
+                    .unwrap_or_default()
+                    .into(),
+                old_text: line.old_text.clone().into(),
+                new_text: line.new_text.clone().into(),
+                old_highlighted_enabled: old_highlighted.is_some(),
+                new_highlighted_enabled: new_highlighted.is_some(),
+                old_highlighted: old_highlighted.unwrap_or_default(),
+                new_highlighted: new_highlighted.unwrap_or_default(),
+                old_kind: diff_kind_name(line.old_kind).into(),
+                new_kind: diff_kind_name(line.new_kind).into(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let relative = diff
+        .path
+        .strip_prefix(&diff.repository)
+        .unwrap_or(&diff.path);
+    let relative = relative.to_string_lossy();
+    let old_title = format!("{relative} (HEAD)");
+    let new_title = match diff.status {
+        GitStatus::Deleted => format!("{relative} (Deleted)"),
+        _ => format!("{relative} (Working Tree)"),
+    };
+    if group == 0 {
+        ui.set_diff_rows(ModelRc::new(VecModel::from(rows)));
+        ui.set_diff_old_title(old_title.into());
+        ui.set_diff_new_title(new_title.into());
+    } else {
+        ui.set_secondary_diff_rows(ModelRc::new(VecModel::from(rows)));
+        ui.set_secondary_diff_old_title(old_title.into());
+        ui.set_secondary_diff_new_title(new_title.into());
+    }
+}
+
+fn diff_kind_name(kind: git::DiffKind) -> &'static str {
+    match kind {
+        git::DiffKind::Context => "context",
+        git::DiffKind::Removed => "removed",
+        git::DiffKind::Added => "added",
+        git::DiffKind::Empty => "empty",
     }
 }
 
@@ -1248,6 +1508,14 @@ fn clear_terminal_group(ui: &AppWindow, group: usize) {
 fn tab_title(tab: &WorkspaceTab) -> String {
     match &tab.content {
         TabContent::File(document) => document.title(),
+        TabContent::Diff(diff) => {
+            let name = diff
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Diff");
+            format!("{name} (Working Tree)")
+        }
         TabContent::Terminal {
             start_path, number, ..
         } => {
@@ -1263,6 +1531,7 @@ fn tab_title(tab: &WorkspaceTab) -> String {
 fn tab_detail(tab: &WorkspaceTab) -> String {
     match &tab.content {
         TabContent::File(document) => document.linux_path.to_string_lossy().to_string(),
+        TabContent::Diff(diff) => diff.path.to_string_lossy().to_string(),
         TabContent::Terminal { start_path, .. } => start_path.to_string_lossy().to_string(),
     }
 }
@@ -1300,6 +1569,7 @@ fn sync_tree(ui: &AppWindow, state: &AppState) {
                     GitStatus::Clean => "",
                     GitStatus::Modified => "M",
                     GitStatus::Untracked => "U",
+                    GitStatus::Deleted => "D",
                 }
                 .into(),
                 project_kind: project_kind.into(),
@@ -1307,6 +1577,78 @@ fn sync_tree(ui: &AppWindow, state: &AppState) {
         })
         .collect::<Vec<_>>();
     ui.set_tree_entries(ModelRc::new(VecModel::from(entries)));
+}
+
+fn sync_git_changes(ui: &AppWindow, state: &AppState) {
+    let mut repositories = state.repositories.iter().cloned().collect::<Vec<_>>();
+    repositories.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+    let mut entries = Vec::new();
+    let mut change_count = 0usize;
+
+    for repository in repositories {
+        let mut changes = state
+            .statuses
+            .iter()
+            .filter(|(path, _)| {
+                repository_for(&state.repositories, path).as_ref() == Some(&repository)
+            })
+            .map(|(path, status)| (path.clone(), *status))
+            .collect::<Vec<_>>();
+        changes.sort_by_key(|(path, _)| path.to_string_lossy().to_ascii_lowercase());
+        if changes.is_empty() {
+            continue;
+        }
+        change_count += changes.len();
+        let repository_name = repository
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Repository");
+        entries.push(GitEntry {
+            kind: "repository".into(),
+            name: repository_name.into(),
+            detail: repository.to_string_lossy().to_string().into(),
+            path: repository.to_string_lossy().to_string().into(),
+            status: "".into(),
+            count: changes.len() as i32,
+            icon: slint::Image::default(),
+            expanded: state.expanded_git_repositories.contains(&repository),
+        });
+
+        if !state.expanded_git_repositories.contains(&repository) {
+            continue;
+        }
+        for (path, status) in changes {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file");
+            let relative = path.strip_prefix(&repository).unwrap_or(&path);
+            let detail = relative
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|parent| parent.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let icon_label = tree::icon_for(name, false, false, "");
+            entries.push(GitEntry {
+                kind: "change".into(),
+                name: name.into(),
+                detail: detail.into(),
+                path: path.to_string_lossy().to_string().into(),
+                status: match status {
+                    GitStatus::Modified => "M",
+                    GitStatus::Untracked => "U",
+                    GitStatus::Deleted => "D",
+                    GitStatus::Clean => "",
+                }
+                .into(),
+                count: 0,
+                icon: state.emoji_icons.get(icon_label),
+                expanded: false,
+            });
+        }
+    }
+    ui.set_git_change_count(change_count.min(i32::MAX as usize) as i32);
+    ui.set_git_entries(ModelRc::new(VecModel::from(entries)));
 }
 
 fn sync_tabs(ui: &AppWindow, state: &AppState) {
@@ -1321,6 +1663,7 @@ fn sync_tabs(ui: &AppWindow, state: &AppState) {
                 detail: tab_detail(tab).into(),
                 kind: match tab.content {
                     TabContent::File(_) => "file",
+                    TabContent::Diff(_) => "diff",
                     TabContent::Terminal { .. } => "terminal",
                 }
                 .into(),
