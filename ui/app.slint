@@ -2,6 +2,7 @@ import { Button, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
 
 export struct TreeEntry {
     name: string,
+    path: string,
     icon: image,
     icon-label: string,
     depth: int,
@@ -170,6 +171,9 @@ component WorkspaceGroup inherits Rectangle {
     out property <bool> copy-feedback-active: false;
     private property <int> editor-selection-anchor: 0;
     private property <int> editor-selection-cursor: 0;
+    private property <bool> terminal-context-visible: false;
+    private property <length> terminal-context-x: 0px;
+    private property <length> terminal-context-y: 0px;
 
     callback editor-edited(string, int);
     callback editor-selection-changed(int, int, int);
@@ -778,6 +782,10 @@ component WorkspaceGroup inherits Rectangle {
                     if (event.text == Key.Backtab) { root.terminal-key(root.active-tab-id, "<BACKTAB>", false, false, false); return accept; }
                     if (event.text == Key.Tab) { root.terminal-key(root.active-tab-id, "<TAB>", false, false, false); return accept; }
                     if (event.text == Key.Escape) { root.terminal-key(root.active-tab-id, "<ESCAPE>", false, false, false); return accept; }
+                    if (event.modifiers.control && (event.text == "v" || event.text == "V")) {
+                        self.paste();
+                        return accept;
+                    }
                     if (event.modifiers.control || event.modifiers.alt) {
                         root.terminal-key(root.active-tab-id, event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
                         return accept;
@@ -786,7 +794,22 @@ component WorkspaceGroup inherits Rectangle {
                 }
             }
             terminal-click := TouchArea {
-                clicked => { root.group-focused(root.group-id); root.focus-terminal(); }
+                clicked => {
+                    root.terminal-context-visible = false;
+                    root.group-focused(root.group-id);
+                    root.focus-terminal();
+                }
+                pointer-event(event) => {
+                    if (event.button == PointerEventButton.right
+                        && event.kind == PointerEventKind.down) {
+                        root.group-focused(root.group-id);
+                        root.terminal-context-x = min(content-stack.width - 132px,
+                            self.absolute-position.x + self.mouse-x - content-stack.absolute-position.x);
+                        root.terminal-context-y = min(content-stack.height - 40px,
+                            self.absolute-position.y + self.mouse-y - content-stack.absolute-position.y);
+                        root.terminal-context-visible = true;
+                    }
+                }
             }
         }
 
@@ -799,6 +822,36 @@ component WorkspaceGroup inherits Rectangle {
                 color: #737985;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+            }
+        }
+        if root.terminal-context-visible: TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.terminal-context-visible = false; }
+        }
+        if root.terminal-context-visible: Rectangle {
+            x: root.terminal-context-x;
+            y: root.terminal-context-y;
+            width: 132px;
+            height: 34px;
+            background: #252526;
+            border-width: 1px;
+            border-color: #454545;
+            border-radius: 3px;
+            Text {
+                text: "Paste   Ctrl+V";
+                color: #f0f0f0;
+                font-size: 11px;
+                x: 10px;
+                width: parent.width - 20px;
+                vertical-alignment: center;
+            }
+            terminal-paste-touch := TouchArea {
+                clicked => {
+                    root.terminal-context-visible = false;
+                    terminal-ime-input.focus();
+                    terminal-ime-input.paste();
+                }
             }
         }
         }
@@ -840,6 +893,18 @@ export component AppWindow inherits Window {
         return source.darker((100 - brightness) / 100);
     }
 
+    function submit-tree-create() {
+        if (root.tree-create-name == "" || root.tree-action-pending) {
+            return;
+        }
+        root.tree-create-visible = false;
+        root.tree-create-requested(
+            root.tree-create-target,
+            root.tree-create-name,
+            root.tree-create-is-directory
+        );
+    }
+
     in property <string> workspace-name: "No workspace";
     in property <[TreeEntry]> tree-entries;
     in property <[GitEntry]> git-entries;
@@ -855,6 +920,7 @@ export component AppWindow inherits Window {
     in property <string> active-path: "";
     in property <string> status-text: "Ready";
     in property <bool> save-conflict: false;
+    in property <bool> tree-action-pending: false;
     in property <[DiffRow]> diff-rows;
     in property <[DiffRow]> secondary-diff-rows;
     in property <string> diff-old-title: "Original";
@@ -910,6 +976,19 @@ export component AppWindow inherits Window {
     in-out property <bool> discard-confirm-visible: false;
     in-out property <string> discard-confirm-path: "";
     in-out property <string> discard-confirm-name: "";
+    in-out property <bool> tree-context-visible: false;
+    in-out property <string> tree-context-path: "";
+    in-out property <string> tree-context-name: "";
+    in-out property <bool> tree-context-is-directory: false;
+    in-out property <length> tree-context-x: 0px;
+    in-out property <length> tree-context-y: 0px;
+    in-out property <bool> tree-create-visible: false;
+    in-out property <bool> tree-create-is-directory: false;
+    in-out property <string> tree-create-target: "";
+    in-out property <string> tree-create-name: "";
+    in-out property <bool> tree-delete-visible: false;
+    in-out property <string> tree-delete-path: "";
+    in-out property <string> tree-delete-name: "";
     in-out property <bool> find-visible: false;
     out property <int> editor-selection-length: root.focused-group == 1
         ? (root.secondary-active-kind == "file" ? secondary-view.editor-selection-length : 0)
@@ -936,6 +1015,9 @@ export component AppWindow inherits Window {
     private property <bool> has-secondary-group: root.secondary-tabs.length > 0;
 
     callback tree-activated(int);
+    callback tree-create-requested(string, string, bool);
+    callback tree-delete-requested(string);
+    callback tree-path-copied(string);
     callback git-repository-toggled(string);
     callback git-change-activated(string);
     callback git-discard-requested(string);
@@ -953,7 +1035,6 @@ export component AppWindow inherits Window {
     callback terminal-key(int, string, bool, bool, bool);
     callback terminal-text(int, string);
     callback terminal-output-ready(int);
-    callback terminal-paste(string);
     callback new-terminal-requested(int);
     callback tab-dock-requested(int, int);
     callback focused-group-changed(int);
@@ -1083,10 +1164,12 @@ export component AppWindow inherits Window {
                                     : (files-view-touch.has-hover ? #24272e : #20232a);
                                 Text {
                                     text: "FILES";
+                                    x: root.sidebar-view == 0 ? 8px : 0px;
+                                    width: root.sidebar-view == 0 ? parent.width - 54px : parent.width;
                                     color: root.sidebar-view == 0 ? #ffffff : #aeb4bf;
                                     font-size: 11px;
                                     font-weight: root.sidebar-view == 0 ? 600 : 400;
-                                    horizontal-alignment: center;
+                                    horizontal-alignment: root.sidebar-view == 0 ? left : center;
                                     vertical-alignment: center;
                                 }
                                 Rectangle {
@@ -1095,7 +1178,40 @@ export component AppWindow inherits Window {
                                     width: parent.width;
                                     background: root.sidebar-view == 0 ? #3794ff : transparent;
                                 }
-                                files-view-touch := TouchArea { clicked => { root.sidebar-view = 0; } }
+                                files-view-touch := TouchArea {
+                                    width: root.sidebar-view == 0 ? parent.width - 50px : parent.width;
+                                    clicked => { root.sidebar-view = 0; }
+                                }
+                                if root.sidebar-view == 0: Rectangle {
+                                    x: parent.width - 48px;
+                                    width: 24px;
+                                    background: new-file-touch.has-hover ? #41454d : transparent;
+                                    Text { text: "F+"; color: #d7dae0; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                    new-file-touch := TouchArea {
+                                        enabled: !root.tree-action-pending;
+                                        clicked => {
+                                            root.tree-create-target = "";
+                                            root.tree-create-name = "";
+                                            root.tree-create-is-directory = false;
+                                            root.tree-create-visible = true;
+                                        }
+                                    }
+                                }
+                                if root.sidebar-view == 0: Rectangle {
+                                    x: parent.width - 24px;
+                                    width: 24px;
+                                    background: new-folder-touch.has-hover ? #41454d : transparent;
+                                    Text { text: "D+"; color: #d7dae0; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                    new-folder-touch := TouchArea {
+                                        enabled: !root.tree-action-pending;
+                                        clicked => {
+                                            root.tree-create-target = "";
+                                            root.tree-create-name = "";
+                                            root.tree-create-is-directory = true;
+                                            root.tree-create-visible = true;
+                                        }
+                                    }
+                                }
                             }
                             Rectangle {
                                 horizontal-stretch: 1;
@@ -1160,7 +1276,25 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                 }
-                                tree-touch := TouchArea { clicked => { root.tree-activated(index); } }
+                                tree-touch := TouchArea {
+                                    clicked => {
+                                        root.tree-context-visible = false;
+                                        root.tree-activated(index);
+                                    }
+                                    pointer-event(event) => {
+                                        if (event.button == PointerEventButton.right
+                                            && event.kind == PointerEventKind.down) {
+                                            root.tree-context-path = entry.path;
+                                            root.tree-context-name = entry.name;
+                                            root.tree-context-is-directory = entry.is-directory;
+                                            root.tree-context-x = min(root.width - 198px,
+                                                self.absolute-position.x + self.mouse-x);
+                                            root.tree-context-y = min(root.height - 166px,
+                                                self.absolute-position.y + self.mouse-y);
+                                            root.tree-context-visible = true;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1602,6 +1736,193 @@ export component AppWindow inherits Window {
             }
         }
     }
+
+        clipboard-staging := TextInput {
+            visible: false;
+            width: 1px;
+            height: 1px;
+            text: "";
+        }
+
+        if root.tree-context-visible: TouchArea {
+            width: parent.width;
+            height: parent.height - 24px;
+            clicked => { root.tree-context-visible = false; }
+        }
+        if root.tree-context-visible: Rectangle {
+            x: root.tree-context-x;
+            y: root.tree-context-y;
+            width: 198px;
+            height: 158px;
+            background: #252526;
+            border-color: #454545;
+            border-width: 1px;
+            border-radius: 4px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 4px;
+                spacing: 0px;
+                Rectangle {
+                    height: 26px;
+                    Text {
+                        text: root.tree-context-name;
+                        color: #8c8c8c;
+                        font-size: 10px;
+                        x: 8px;
+                        width: parent.width - 16px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                Rectangle {
+                    height: 30px;
+                    background: context-new-file-touch.has-hover ? #094771 : transparent;
+                    Text { text: "New File"; color: #f0f0f0; x: 8px; vertical-alignment: center; }
+                    context-new-file-touch := TouchArea {
+                        enabled: !root.tree-action-pending;
+                        clicked => {
+                            root.tree-context-visible = false;
+                            root.tree-create-target = root.tree-context-path;
+                            root.tree-create-name = "";
+                            root.tree-create-is-directory = false;
+                            root.tree-create-visible = true;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 30px;
+                    background: context-new-folder-touch.has-hover ? #094771 : transparent;
+                    Text { text: "New Folder"; color: #f0f0f0; x: 8px; vertical-alignment: center; }
+                    context-new-folder-touch := TouchArea {
+                        enabled: !root.tree-action-pending;
+                        clicked => {
+                            root.tree-context-visible = false;
+                            root.tree-create-target = root.tree-context-path;
+                            root.tree-create-name = "";
+                            root.tree-create-is-directory = true;
+                            root.tree-create-visible = true;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 30px;
+                    background: context-copy-touch.has-hover ? #094771 : transparent;
+                    Text { text: "Copy Path"; color: #f0f0f0; x: 8px; vertical-alignment: center; }
+                    context-copy-touch := TouchArea {
+                        clicked => {
+                            root.tree-context-visible = false;
+                            clipboard-staging.text = root.tree-context-path;
+                            clipboard-staging.select-all();
+                            clipboard-staging.copy();
+                            root.tree-path-copied(root.tree-context-path);
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 30px;
+                    background: context-delete-touch.has-hover ? #5a1d1d : transparent;
+                    Text { text: "Delete"; color: #f48771; x: 8px; vertical-alignment: center; }
+                    context-delete-touch := TouchArea {
+                        enabled: !root.tree-action-pending;
+                        clicked => {
+                            root.tree-context-visible = false;
+                            root.tree-delete-path = root.tree-context-path;
+                            root.tree-delete-name = root.tree-context-name;
+                            root.tree-delete-visible = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.tree-create-visible: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #000000;
+            opacity: 0.55;
+            TouchArea { clicked => { root.tree-create-visible = false; } }
+        }
+        if root.tree-create-visible: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 420px;
+            height: 172px;
+            background: #252526;
+            border-color: #454545;
+            border-width: 1px;
+            border-radius: 5px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text {
+                    text: root.tree-create-is-directory ? "New Folder" : "New File";
+                    color: #f0f0f0;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+                create-entry-name := LineEdit {
+                    text <=> root.tree-create-name;
+                    placeholder-text: root.tree-create-is-directory ? "Folder name" : "File name";
+                    horizontal-stretch: 1;
+                    accepted => { root.submit-tree-create(); }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.tree-create-visible = false; } }
+                    Button {
+                        text: "Create";
+                        enabled: root.tree-create-name != "" && !root.tree-action-pending;
+                        clicked => { root.submit-tree-create(); }
+                    }
+                }
+            }
+        }
+
+        if root.tree-delete-visible: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #000000;
+            opacity: 0.55;
+            TouchArea { clicked => { root.tree-delete-visible = false; } }
+        }
+        if root.tree-delete-visible: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 420px;
+            height: 170px;
+            background: #252526;
+            border-color: #454545;
+            border-width: 1px;
+            border-radius: 5px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text { text: "Delete " + root.tree-delete-name + "?"; color: #f0f0f0; font-size: 15px; font-weight: 600; }
+                Text {
+                    text: root.tree-context-is-directory
+                        ? "This permanently deletes the folder and everything inside it."
+                        : "This permanently deletes the file.";
+                    color: #cccccc;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    vertical-stretch: 1;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.tree-delete-visible = false; } }
+                    Button {
+                        text: "Delete";
+                        enabled: !root.tree-action-pending;
+                        clicked => {
+                            root.tree-delete-visible = false;
+                            root.tree-delete-requested(root.tree-delete-path);
+                        }
+                    }
+                }
+            }
+        }
 
         if root.font-menu-visible: TouchArea {
             width: parent.width;

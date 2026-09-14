@@ -49,7 +49,18 @@ struct AppState {
     file_loader: Background<Result<(Document, usize)>>,
     diff_loader: Background<Result<(git::FileDiff, usize)>>,
     git_action_loader: Background<Result<PathBuf>>,
+    tree_action_loader: Background<Result<TreeActionResult>>,
+    tree_action_pending: bool,
     editor_views: RefCell<[editor_view::EditorView; 2]>,
+}
+
+enum TreeActionResult {
+    Created {
+        path: PathBuf,
+        parent: PathBuf,
+        is_directory: bool,
+    },
+    Deleted(PathBuf),
 }
 
 enum TabContent {
@@ -109,6 +120,8 @@ fn main() -> Result<()> {
         file_loader: Background::default(),
         diff_loader: Background::default(),
         git_action_loader: Background::default(),
+        tree_action_loader: Background::default(),
+        tree_action_pending: false,
         editor_views: RefCell::new(Default::default()),
     }));
 
@@ -199,6 +212,97 @@ fn main() -> Result<()> {
             }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_tree_create_requested(move |target, name, is_directory| {
+            let mut state = state.borrow_mut();
+            if state.tree_action_pending {
+                state.status = "A file tree action is already running".into();
+            } else {
+                let parent = if target.is_empty() {
+                    Some(state.workspace.linux_root.clone())
+                } else {
+                    tree_node_for_ui_path(&state, target.as_str()).and_then(|node| {
+                        if node.is_directory {
+                            Some(node.linux_path)
+                        } else {
+                            node.linux_path.parent().map(PathBuf::from)
+                        }
+                    })
+                };
+                if let Some(parent) = parent {
+                    let workspace = state.workspace.clone();
+                    let result_parent = parent.clone();
+                    let result_name = name.to_string();
+                    state.tree_action_pending = true;
+                    state.status = format!(
+                        "Creating {} {}...",
+                        if is_directory { "folder" } else { "file" },
+                        result_name
+                    );
+                    state.tree_action_loader.request(move || {
+                        let path = tree::create_entry(
+                            &workspace,
+                            &parent,
+                            &result_name,
+                            is_directory,
+                        )?;
+                        Ok(TreeActionResult::Created {
+                            path,
+                            parent: result_parent,
+                            is_directory,
+                        })
+                    });
+                } else {
+                    state.status = "The selected file tree item is no longer available".into();
+                }
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_tree_delete_requested(move |path| {
+            let mut state = state.borrow_mut();
+            if state.tree_action_pending {
+                state.status = "A file tree action is already running".into();
+            } else if let Some(node) = tree_node_for_ui_path(&state, path.as_str()) {
+                if has_dirty_document_at_or_below(&state, &node.linux_path) {
+                    state.status = "Save or close modified files before deleting".into();
+                } else {
+                    let workspace = state.workspace.clone();
+                    let path = node.linux_path;
+                    let result_path = path.clone();
+                    state.tree_action_pending = true;
+                    state.status = format!("Deleting {}...", path.display());
+                    state.tree_action_loader.request(move || {
+                        tree::delete_entry(&workspace, &path)?;
+                        Ok(TreeActionResult::Deleted(result_path))
+                    });
+                }
+            } else {
+                state.status = "The selected file tree item is no longer available".into();
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_tree_path_copied(move |path| {
+            let mut state = state.borrow_mut();
+            state.status = format!("Copied path: {path}");
+            if let Some(ui) = weak.upgrade() {
+                ui.set_status_text(state.status.clone().into());
             }
         });
     }
@@ -475,8 +579,6 @@ fn main() -> Result<()> {
                 .set_focused_group(usize::try_from(group).unwrap_or(0));
         });
     }
-    ui.on_terminal_paste(|_| {});
-
     let loading_timer = Timer::default();
     {
         let weak = ui.as_weak();
@@ -584,6 +686,38 @@ fn main() -> Result<()> {
                             state.statuses = git::read_status(&state.workspace);
                             refresh_tree(&mut state);
                         }
+                    }
+                    Err(error) => state.status = error.to_string(),
+                }
+                sync_ui(&ui, &state);
+            }
+            if let Some(result) = state.tree_action_loader.poll() {
+                state.tree_action_pending = false;
+                match result {
+                    Ok(TreeActionResult::Created {
+                        path,
+                        parent,
+                        is_directory,
+                    }) => {
+                        state.expanded.insert(parent);
+                        refresh_tree(&mut state);
+                        if let Some(monitor) = state.git_monitor.as_mut() {
+                            let _ = monitor.force_refresh();
+                        }
+                        if is_directory {
+                            state.status = format!("Created folder {}", path.display());
+                        } else if let Err(error) = open_document(&mut state, path) {
+                            state.status = error.to_string();
+                        }
+                    }
+                    Ok(TreeActionResult::Deleted(path)) => {
+                        close_file_tabs_at_or_below(&mut state, &path);
+                        state.expanded.retain(|expanded| !expanded.starts_with(&path));
+                        refresh_tree(&mut state);
+                        if let Some(monitor) = state.git_monitor.as_mut() {
+                            let _ = monitor.force_refresh();
+                        }
+                        state.status = format!("Deleted {}", path.display());
                     }
                     Err(error) => state.status = error.to_string(),
                 }
@@ -929,6 +1063,48 @@ fn close_diff_tabs(state: &mut AppState, path: &std::path::Path) {
     }
 }
 
+fn tree_node_for_ui_path(state: &AppState, path: &str) -> Option<FlatNode> {
+    state
+        .tree
+        .iter()
+        .find(|node| tree::linux_path_text(&node.linux_path) == path)
+        .cloned()
+}
+
+fn has_dirty_document_at_or_below(state: &AppState, path: &std::path::Path) -> bool {
+    state.tabs.iter().any(|tab| {
+        matches!(
+            &tab.content,
+            TabContent::File(document)
+                if document.dirty && document.linux_path.starts_with(path)
+        )
+    })
+}
+
+fn close_file_tabs_at_or_below(state: &mut AppState, path: &std::path::Path) {
+    let tab_ids = state
+        .tabs
+        .iter()
+        .filter_map(|tab| {
+            let matches = match &tab.content {
+                TabContent::File(document) => document.linux_path.starts_with(path),
+                TabContent::Diff(diff) => diff.path.starts_with(path),
+                TabContent::Terminal { .. } => false,
+            };
+            matches.then_some(tab.id)
+        })
+        .collect::<Vec<_>>();
+    for tab_id in tab_ids {
+        state.tab_groups.remove(tab_id);
+        if let Some(index) = state.tabs.iter().position(|tab| tab.id == tab_id) {
+            state.tabs.remove(index);
+        }
+        if state.save_conflict == Some(tab_id) {
+            state.save_conflict = None;
+        }
+    }
+}
+
 fn save_tab(state: &mut AppState, tab_id: TabId, overwrite_external: bool) {
     let Some(document) = document_mut(state, tab_id) else {
         return;
@@ -1124,6 +1300,7 @@ fn sync_ui(ui: &AppWindow, state: &AppState) {
     );
     ui.set_status_text(state.status.clone().into());
     ui.set_save_conflict(state.save_conflict.is_some());
+    ui.set_tree_action_pending(state.tree_action_pending);
     ui.set_focused_group(state.tab_groups.focused_group() as i32);
     sync_tree(ui, state);
     sync_git_changes(ui, state);
@@ -1560,6 +1737,7 @@ fn sync_tree(ui: &AppWindow, state: &AppState) {
             );
             TreeEntry {
                 name: node.name.clone().into(),
+                path: tree::linux_path_text(&node.linux_path).into(),
                 icon: state.emoji_icons.get(icon_label),
                 icon_label: icon_label.into(),
                 depth: node.depth,

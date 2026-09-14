@@ -1,7 +1,8 @@
 use crate::workspace::Workspace;
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -21,6 +22,66 @@ pub struct FlatNode {
     pub is_directory: bool,
     pub is_expanded: bool,
     pub git_status: GitStatus,
+}
+
+pub fn create_entry(
+    workspace: &Workspace,
+    parent: &Path,
+    name: &str,
+    is_directory: bool,
+) -> Result<PathBuf> {
+    validate_entry_name(name)?;
+    let parent_host = workspace.host_path(parent)?;
+    if !parent_host.is_dir() {
+        bail!("parent folder is not accessible: {}", parent.display());
+    }
+    let linux_path = parent.join(name);
+    let host_path = parent_host.join(name);
+    if is_directory {
+        fs::create_dir(&host_path)
+            .with_context(|| format!("cannot create folder: {}", linux_path.display()))?;
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&host_path)
+            .and_then(|mut file| file.flush())
+            .with_context(|| format!("cannot create file: {}", linux_path.display()))?;
+    }
+    Ok(linux_path)
+}
+
+pub fn delete_entry(workspace: &Workspace, path: &Path) -> Result<()> {
+    if path == workspace.linux_root {
+        bail!("the workspace root cannot be deleted");
+    }
+    let host_path = workspace.host_path(path)?;
+    let metadata = fs::symlink_metadata(&host_path)
+        .with_context(|| format!("cannot access {}", path.display()))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(&host_path)
+            .with_context(|| format!("cannot delete folder: {}", path.display()))?;
+    } else {
+        fs::remove_file(&host_path)
+            .with_context(|| format!("cannot delete file: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub fn linux_path_text(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn validate_entry_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.chars().any(|character| matches!(character, '/' | '\\' | '\0'))
+        || name.trim() != name
+    {
+        bail!("enter a valid file or folder name");
+    }
+    Ok(())
 }
 
 /// Returns a compact, context-aware emoji for the file tree. Project identity
@@ -245,6 +306,26 @@ mod tests {
         assert_eq!(status("untracked.rs"), GitStatus::Untracked);
         assert_eq!(status("clean.rs"), GitStatus::Clean);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creates_and_deletes_workspace_entries_without_overwriting() {
+        let root = temporary_directory("actions");
+        fs::create_dir_all(&root).unwrap();
+        let workspace = Workspace::new("Ubuntu", root.clone()).unwrap();
+
+        let folder = create_entry(&workspace, &root, "new folder", true).unwrap();
+        let file = create_entry(&workspace, &folder, "sample.rs", false).unwrap();
+        assert_eq!(file, folder.join("sample.rs"));
+        assert!(root.join("new folder/sample.rs").is_file());
+        assert!(create_entry(&workspace, &folder, "sample.rs", false).is_err());
+        assert!(create_entry(&workspace, &root, "../escape", false).is_err());
+
+        delete_entry(&workspace, &folder).unwrap();
+        assert!(!folder.exists());
+        assert!(delete_entry(&workspace, &root).is_err());
+        assert_eq!(linux_path_text(Path::new(r"/work\nested\file.rs")), "/work/nested/file.rs");
         fs::remove_dir_all(root).unwrap();
     }
 
