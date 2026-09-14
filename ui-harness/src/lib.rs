@@ -1103,6 +1103,83 @@ mod tests {
         ui.set_primary_active_title("agent_ide".into());
         ui.set_primary_active_detail("/home/minch/agent_ide".into());
         ui.set_focused_group(0);
+        render(&window);
+
+        // Dragging a tree entry only pastes when it is released over the
+        // content of an active terminal pane. The same path is also copied to
+        // the platform clipboard so a later manual paste stays consistent.
+        *clipboard.borrow_mut() = "unchanged".into();
+        *activated_tree_entry.borrow_mut() = None;
+        let terminal_text_before_missed_drop = terminal_text.borrow().len();
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(60.0, 76.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(120.0, 180.0),
+            },
+        );
+        assert!(ui.get_tree_dragging());
+        assert_eq!(ui.get_tree_drop_terminal_id(), -1);
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(120.0, 180.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert!(!ui.get_tree_dragging());
+        assert_eq!(terminal_text.borrow().len(), terminal_text_before_missed_drop);
+        assert_eq!(clipboard.borrow().as_str(), "unchanged");
+        assert_eq!(*activated_tree_entry.borrow(), None);
+
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(60.0, 76.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(600.0, 300.0),
+            },
+        );
+        assert!(ui.get_tree_dragging());
+        assert_eq!(ui.get_tree_drop_terminal_id(), 1);
+        write_snapshot_if_requested("tree-terminal-drop.png", &render(&window));
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(600.0, 300.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert!(!ui.get_tree_dragging());
+        assert_eq!(ui.get_tree_drop_terminal_id(), -1);
+        assert_eq!(clipboard.borrow().as_str(), "/workspace/local-project");
+        assert_eq!(
+            *activated_tree_entry.borrow(),
+            None,
+            "dragging a tree entry also activated it as a click"
+        );
+        assert_eq!(
+            terminal_text.borrow().last(),
+            Some(&(1, "/workspace/local-project".to_string())),
+            "dropping a tree path did not paste it into the target terminal"
+        );
+        assert_eq!(
+            copied_tree_paths.borrow().last().map(String::as_str),
+            Some("/workspace/local-project"),
+            "terminal drop did not report the copied path"
+        );
+
         ui.set_terminal_grid_columns(80);
         ui.set_terminal_grid_rows(40);
         ui.set_terminal_cursor_row(0);

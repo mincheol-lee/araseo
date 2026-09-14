@@ -982,6 +982,13 @@ export component AppWindow inherits Window {
     in-out property <bool> tree-context-is-directory: false;
     in-out property <length> tree-context-x: 0px;
     in-out property <length> tree-context-y: 0px;
+    in-out property <bool> tree-dragging: false;
+    in-out property <string> tree-drag-path: "";
+    in-out property <string> tree-drag-name: "";
+    in-out property <length> tree-drag-x: 0px;
+    in-out property <length> tree-drag-y: 0px;
+    in-out property <int> tree-drop-terminal-id: -1;
+    private property <int> tree-drop-group: -1;
     in-out property <bool> tree-create-visible: false;
     in-out property <bool> tree-create-is-directory: false;
     in-out property <string> tree-create-target: "";
@@ -1098,6 +1105,62 @@ export component AppWindow inherits Window {
     function cancel-tab-drag() {
         root.dragging-tab = -1;
         root.dock-preview = -1;
+    }
+
+    function update-tree-drag(path: string, name: string, x: length, y: length) {
+        root.tree-context-visible = false;
+        root.tree-dragging = true;
+        root.tree-drag-path = path;
+        root.tree-drag-name = name;
+        root.tree-drag-x = x;
+        root.tree-drag-y = y;
+        root.tree-drop-terminal-id = -1;
+        root.tree-drop-group = -1;
+
+        let local-x = x - workspace-area.absolute-position.x;
+        let local-y = y - workspace-area.absolute-position.y;
+        if (primary-view.visible && root.primary-active-kind == "terminal"
+            && local-x >= primary-view.x && local-x <= primary-view.x + primary-view.width
+            && local-y >= primary-view.y + 36px && local-y <= primary-view.y + primary-view.height) {
+            root.tree-drop-terminal-id = root.primary-active-tab-id;
+            root.tree-drop-group = 0;
+        } else if (secondary-view.visible && root.secondary-active-kind == "terminal"
+            && local-x >= secondary-view.x && local-x <= secondary-view.x + secondary-view.width
+            && local-y >= secondary-view.y + 36px && local-y <= secondary-view.y + secondary-view.height) {
+            root.tree-drop-terminal-id = root.secondary-active-tab-id;
+            root.tree-drop-group = 1;
+        }
+    }
+
+    function finish-tree-drag(path: string, name: string, x: length, y: length) {
+        if (!root.tree-dragging || root.tree-drag-path != path) {
+            root.cancel-tree-drag();
+            return;
+        }
+        root.update-tree-drag(path, name, x, y);
+        let terminal-id = root.tree-drop-terminal-id;
+        let terminal-group = root.tree-drop-group;
+        root.tree-dragging = false;
+        root.tree-drop-terminal-id = -1;
+        root.tree-drop-group = -1;
+        if (terminal-id >= 0) {
+            clipboard-staging.text = path;
+            clipboard-staging.select-all();
+            clipboard-staging.copy();
+            root.focused-group = terminal-group;
+            root.focused-group-changed(terminal-group);
+            root.terminal-text(terminal-id, path);
+            root.tree-path-copied(path);
+            root.focus-terminal();
+        }
+    }
+
+    function cancel-tree-drag() {
+        root.tree-dragging = false;
+        root.tree-drag-path = "";
+        root.tree-drag-name = "";
+        root.tree-drop-terminal-id = -1;
+        root.tree-drop-group = -1;
     }
 
     shortcut-scope := FocusScope {
@@ -1277,13 +1340,36 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 tree-touch := TouchArea {
+                                    private property <bool> drag-armed: false;
+                                    private property <length> press-x: 0px;
+                                    private property <length> press-y: 0px;
+                                    mouse-cursor: move;
                                     clicked => {
                                         root.tree-context-visible = false;
                                         root.tree-activated(index);
                                     }
+                                    moved => {
+                                        if (!self.pressed || !self.drag-armed
+                                            || (abs(self.mouse-x - self.press-x) < 5px
+                                                && abs(self.mouse-y - self.press-y) < 5px)) {
+                                            return;
+                                        }
+                                        root.update-tree-drag(
+                                            entry.path,
+                                            entry.name,
+                                            self.absolute-position.x + self.mouse-x,
+                                            self.absolute-position.y + self.mouse-y
+                                        );
+                                    }
                                     pointer-event(event) => {
-                                        if (event.button == PointerEventButton.right
+                                        if (event.button == PointerEventButton.left
                                             && event.kind == PointerEventKind.down) {
+                                            self.drag-armed = true;
+                                            self.press-x = self.mouse-x;
+                                            self.press-y = self.mouse-y;
+                                        } else if (event.button == PointerEventButton.right
+                                            && event.kind == PointerEventKind.down) {
+                                            self.drag-armed = false;
                                             root.tree-context-path = entry.path;
                                             root.tree-context-name = entry.name;
                                             root.tree-context-is-directory = entry.is-directory;
@@ -1292,6 +1378,17 @@ export component AppWindow inherits Window {
                                             root.tree-context-y = min(root.height - 166px,
                                                 self.absolute-position.y + self.mouse-y);
                                             root.tree-context-visible = true;
+                                        } else if (event.kind == PointerEventKind.up && self.drag-armed) {
+                                            root.finish-tree-drag(
+                                                entry.path,
+                                                entry.name,
+                                                self.absolute-position.x + self.mouse-x,
+                                                self.absolute-position.y + self.mouse-y
+                                            );
+                                            self.drag-armed = false;
+                                        } else if (event.kind == PointerEventKind.cancel) {
+                                            self.drag-armed = false;
+                                            root.cancel-tree-drag();
                                         }
                                     }
                                 }
@@ -1694,6 +1791,26 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                if root.tree-dragging && root.tree-drop-terminal-id >= 0: Rectangle {
+                    x: root.tree-drop-group == 1 ? secondary-view.x : primary-view.x;
+                    y: (root.tree-drop-group == 1 ? secondary-view.y : primary-view.y) + 36px;
+                    width: root.tree-drop-group == 1 ? secondary-view.width : primary-view.width;
+                    height: (root.tree-drop-group == 1 ? secondary-view.height : primary-view.height) - 36px;
+                    background: #315f8a55;
+                    border-width: 2px;
+                    border-color: #79b8f3;
+
+                    Text {
+                        text: "Drop to paste path";
+                        color: #ffffff;
+                        font-family: "Geist";
+                        font-size: 14px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
                 if root.dragging-tab >= 0 && root.dock-preview >= 0: Rectangle {
                     x: root.dock-preview == 1 ? workspace-area.width / 2
                         : (root.dock-preview == 4 ? primary-view.x
@@ -1754,6 +1871,28 @@ export component AppWindow inherits Window {
             }
         }
     }
+
+        if root.tree-dragging: Rectangle {
+            x: min(root.width - self.width - 8px, root.tree-drag-x + 12px);
+            y: min(root.height - self.height - 28px, root.tree-drag-y + 12px);
+            width: 240px;
+            height: 32px;
+            background: root.tree-drop-terminal-id >= 0 ? #24547b : #30343c;
+            border-width: 1px;
+            border-color: root.tree-drop-terminal-id >= 0 ? #79b8f3 : #555b66;
+            border-radius: 4px;
+
+            Text {
+                x: 9px;
+                width: parent.width - 18px;
+                text: (root.tree-drop-terminal-id >= 0 ? "Paste  " : "Drag  ") + root.tree-drag-name;
+                color: #f0f0f0;
+                font-family: "Geist";
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
 
         clipboard-staging := TextInput {
             visible: false;
