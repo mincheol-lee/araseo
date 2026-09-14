@@ -1008,7 +1008,7 @@ export component AppWindow inherits Window {
     out property <length> secondary-group-width: secondary-view.width;
     out property <length> secondary-group-height: secondary-view.height;
     out property <bool> secondary-group-visible: secondary-view.visible;
-    private property <length> sidebar-width: 250px;
+    in-out property <length> sidebar-width: 250px;
     private property <int> dragging-tab: -1;
     private property <int> dock-preview: -1;
     private property <int> restore-layout: 0;
@@ -1117,7 +1117,7 @@ export component AppWindow inherits Window {
             spacing: 0px;
 
         HorizontalLayout {
-            spacing: 1px;
+            spacing: 0px;
             Rectangle {
                 horizontal-stretch: 0;
                 width: root.sidebar-width;
@@ -1473,6 +1473,24 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                }
+            }
+
+            sidebar-divider := Rectangle {
+                width: 6px;
+                background: sidebar-divider-touch.pressed || sidebar-divider-touch.has-hover
+                    ? #5686b3 : #313640;
+
+                sidebar-divider-touch := TouchArea {
+                    mouse-cursor: ew-resize;
+                    moved => {
+                        if (!self.pressed) { return; }
+                        let pointer-x = self.absolute-position.x + self.mouse-x;
+                        root.sidebar-width = max(170px, min(
+                            min(600px, root.width - 320px),
+                            pointer-x
+                        ));
+                    }
                 }
             }
 

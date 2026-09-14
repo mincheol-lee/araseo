@@ -283,7 +283,8 @@ mod tests {
         assert!(*window_drags.borrow() > 0, "blank tab space must drag the window");
 
         // Tabs share the top row with the fixed window controls.
-        // The file tree must remain a separate fixed sidebar.
+        // The file tree must remain a separate sidebar and its divider must
+        // resize the tree without overlapping the editor.
         dispatch_click(&ui, 150.0, 51.0);
         assert_eq!(ui.get_primary_group_y(), 0.0);
         assert!(ui.get_primary_editor_surface_height() > 700.0);
@@ -292,6 +293,67 @@ mod tests {
             None,
             "a file tab overlaps the FILES sidebar"
         );
+
+        let initial_sidebar_width = ui.get_sidebar_width();
+        let initial_workspace_width = ui.get_primary_group_width();
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(initial_sidebar_width + 2.0, 400.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(370.0, 400.0),
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(370.0, 400.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        render(&window);
+        assert!(
+            ui.get_sidebar_width() > initial_sidebar_width + 100.0,
+            "dragging the file-tree divider did not widen the sidebar"
+        );
+        assert!(
+            ui.get_primary_group_width() < initial_workspace_width - 100.0,
+            "resizing the file tree did not give the remaining width to the workspace"
+        );
+
+        let widened_sidebar_width = ui.get_sidebar_width();
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(widened_sidebar_width + 2.0, 400.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(40.0, 400.0),
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(40.0, 400.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert_eq!(
+            ui.get_sidebar_width(),
+            170.0,
+            "the file-tree divider ignored its minimum width"
+        );
+        ui.set_sidebar_width(250.0);
+        render(&window);
         ui.set_sidebar_view(0);
 
         assert_eq!(
@@ -729,23 +791,24 @@ mod tests {
         );
 
         let split_ratio_before_drag = ui.get_panel_split_ratio();
+        let split_divider_x = ui.get_sidebar_width() + 6.0 + ui.get_primary_group_width();
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
-                position: LogicalPosition::new(724.0, 400.0),
+                position: LogicalPosition::new(split_divider_x + 2.0, 400.0),
                 button: PointerEventButton::Left,
             },
         );
         dispatch_pointer(
             &ui,
             WindowEvent::PointerMoved {
-                position: LogicalPosition::new(850.0, 400.0),
+                position: LogicalPosition::new(split_divider_x + 126.0, 400.0),
             },
         );
         dispatch_pointer(
             &ui,
             WindowEvent::PointerReleased {
-                position: LogicalPosition::new(850.0, 400.0),
+                position: LogicalPosition::new(split_divider_x + 126.0, 400.0),
                 button: PointerEventButton::Left,
             },
         );
@@ -1076,8 +1139,9 @@ mod tests {
         assert!(ui.get_terminal_columns() * 8.0 <= ui.get_primary_terminal_surface_width());
         assert!(ui.get_terminal_rows() * 16.0 <= ui.get_primary_terminal_surface_height());
         let fitted_terminal = render(&window);
+        let workspace_left = (ui.get_sidebar_width() + 6.0).round() as usize;
         for y in 762..776 {
-            for x in 251..1200 {
+            for x in workspace_left..1200 {
                 assert_eq!(fitted_terminal[y * 1200 + x],
                     TestPixel::from_rgb(0x28, 0x2c, 0x34),
                     "unexpected terminal bottom stripe at ({x}, {y})");
@@ -1115,7 +1179,7 @@ mod tests {
             .filter(|(index, pixel)| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (250..258).contains(&x)
+                (workspace_left..workspace_left + 8).contains(&x)
                     && (36..52).contains(&y)
                     && pixel.red > 120
                     && pixel.red > pixel.green.saturating_add(60)
@@ -1127,7 +1191,7 @@ mod tests {
             .filter(|(index, pixel)| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (810..818).contains(&x)
+                (workspace_left + 70 * 8..workspace_left + 71 * 8).contains(&x)
                     && (596..612).contains(&y)
                     && pixel.green > 120
                     && pixel.green > pixel.red.saturating_add(60)
@@ -1143,7 +1207,7 @@ mod tests {
         ui.set_terminal_grid_columns(160);
         let resizing_terminal = render(&window);
         for y in 762..776 {
-            for x in 251..1200 {
+            for x in workspace_left..1200 {
                 assert_eq!(resizing_terminal[y * 1200 + x],
                     TestPixel::from_rgb(0x28, 0x2c, 0x34),
                     "horizontal scrollbar appeared during terminal resize at ({x}, {y})");
