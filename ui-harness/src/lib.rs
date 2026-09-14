@@ -129,6 +129,7 @@ mod tests {
         }])));
         ui.set_tree_entries(ModelRc::new(VecModel::from(vec![TreeEntry {
             name: "local-project".into(),
+            path: "/workspace/local-project".into(),
             icon: emoji::EmojiIcons::load_system().get("🧩"),
             icon_label: "🧩".into(),
             depth: 0,
@@ -198,6 +199,25 @@ mod tests {
                 alt,
                 shift,
             ));
+        });
+        let tree_creates = Rc::new(RefCell::new(Vec::new()));
+        let observed_tree_creates = tree_creates.clone();
+        ui.on_tree_create_requested(move |target, name, is_directory| {
+            observed_tree_creates.borrow_mut().push((
+                target.to_string(),
+                name.to_string(),
+                is_directory,
+            ));
+        });
+        let tree_deletes = Rc::new(RefCell::new(Vec::new()));
+        let observed_tree_deletes = tree_deletes.clone();
+        ui.on_tree_delete_requested(move |path| {
+            observed_tree_deletes.borrow_mut().push(path.to_string());
+        });
+        let copied_tree_paths = Rc::new(RefCell::new(Vec::new()));
+        let observed_tree_path_copies = copied_tree_paths.clone();
+        ui.on_tree_path_copied(move |path| {
+            observed_tree_path_copies.borrow_mut().push(path.to_string());
         });
         let opened_git_changes = Rc::new(RefCell::new(Vec::new()));
         let observed_git_changes = opened_git_changes.clone();
@@ -294,6 +314,72 @@ mod tests {
         assert!(
             colored_emoji_pixels > 5,
             "tree emoji reached the UI but was not rendered in color"
+        );
+
+        dispatch_click(&ui, 72.0, 51.0);
+        assert!(
+            ui.get_tree_create_visible() && !ui.get_tree_create_is_directory(),
+            "the FILES toolbar did not open the new-file dialog"
+        );
+        write_snapshot_if_requested("new-file-dialog.png", &render(&window));
+        ui.set_tree_create_name("new.rs".into());
+        render(&window);
+        dispatch_click(&ui, 760.0, 451.0);
+        assert_eq!(
+            tree_creates.borrow().last(),
+            Some(&("".to_string(), "new.rs".to_string(), false)),
+            "the root file creation request was not forwarded"
+        );
+
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        assert!(ui.get_tree_context_visible(), "right-click did not open the file-tree menu");
+        write_snapshot_if_requested("file-tree-context-menu.png", &render(&window));
+        dispatch_click(&ui, 100.0, 181.0);
+        assert_eq!(clipboard.borrow().as_str(), "/workspace/local-project");
+        assert_eq!(
+            copied_tree_paths.borrow().last().map(String::as_str),
+            Some("/workspace/local-project"),
+            "Copy Path did not copy the selected Linux path"
+        );
+
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_click(&ui, 100.0, 151.0);
+        assert!(
+            ui.get_tree_create_visible() && ui.get_tree_create_is_directory(),
+            "New Folder did not open a folder creation dialog"
+        );
+        assert_eq!(ui.get_tree_create_target().as_str(), "/workspace/local-project");
+        ui.set_tree_create_visible(false);
+
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_click(&ui, 100.0, 211.0);
+        assert!(ui.get_tree_delete_visible(), "Delete did not require confirmation");
+        dispatch_click(&ui, 748.0, 451.0);
+        assert_eq!(
+            tree_deletes.borrow().last().map(String::as_str),
+            Some("/workspace/local-project"),
+            "confirmed file-tree deletion was not forwarded"
         );
 
         let before_close_hover = render(&window);
@@ -1083,6 +1169,16 @@ mod tests {
         assert!(
             ui.get_terminal_ime_active(),
             "terminal focus did not activate its IME-capable TextInput"
+        );
+        *clipboard.borrow_mut() = "/workspace/local-project".into();
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: "v".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: "v".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        assert_eq!(
+            terminal_text.borrow().last(),
+            Some(&(1, "/workspace/local-project".to_string())),
+            "Control+V did not paste a copied file-tree path into the terminal"
         );
         ui.window().dispatch_event(WindowEvent::KeyPressed { text: "한글".into() });
         ui.window().dispatch_event(WindowEvent::KeyReleased { text: "한글".into() });
