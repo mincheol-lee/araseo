@@ -587,6 +587,7 @@ fn main() -> Result<()> {
             let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
             if let Some(result) = startup_loader.poll() {
+                let mut focus_startup_terminal = false;
                 match result {
                     Ok((monitor, terminal)) => {
                         if state.status == "Starting workspace..." {
@@ -613,7 +614,8 @@ fn main() -> Result<()> {
                                         number,
                                     },
                                 });
-                                state.tab_groups.add_background(tab_id, 0);
+                                focus_startup_terminal =
+                                    state.tab_groups.add_background(tab_id, 0);
                             }
                             Err(error) => state.status = format!("Terminal unavailable: {error}"),
                         }
@@ -621,6 +623,9 @@ fn main() -> Result<()> {
                     Err(error) => state.status = error.to_string(),
                 }
                 sync_ui(&ui, &state);
+                if focus_startup_terminal {
+                    ui.invoke_focus_terminal();
+                }
             }
             if let Some(result) = state.tree_loader.poll() {
                 match result {

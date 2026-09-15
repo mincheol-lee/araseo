@@ -34,8 +34,9 @@ impl TabGroups {
     }
 
     /// A terminal prepared during startup must not steal a file pane that the
-    /// user has already opened while startup work was running.
-    pub fn add_background(&mut self, id: TabId, group: usize) {
+    /// user has already opened while startup work was running. Returns whether
+    /// the new terminal is both active and in the focused group.
+    pub fn add_background(&mut self, id: TabId, group: usize) -> bool {
         let group = group.min(1);
         let previous = self.active[group];
         let focused = self.focused_group;
@@ -44,6 +45,7 @@ impl TabGroups {
             self.activate(previous);
         }
         self.set_focused_group(focused);
+        self.active[group] == Some(id) && self.focused_group == group
     }
 
     pub fn remove(&mut self, id: TabId) -> bool {
@@ -170,11 +172,11 @@ mod tests {
     #[test]
     fn startup_terminal_does_not_steal_an_open_file_or_split_focus() {
         let mut tabs = TabGroups::default();
-        tabs.add_background(0, 0);
+        assert!(tabs.add_background(0, 0));
         assert_eq!(tabs.active(0), Some(0));
         tabs.add(1, 0);
         tabs.add(2, 1);
-        tabs.add_background(3, 0);
+        assert!(!tabs.add_background(3, 0));
         assert_eq!(tabs.active(0), Some(1));
         assert_eq!(tabs.active(1), Some(2));
         assert_eq!(tabs.focused_group(), 1);
