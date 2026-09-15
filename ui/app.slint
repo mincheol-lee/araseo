@@ -107,12 +107,16 @@ component DiffCell inherits Rectangle {
             }
             if root.highlighted-enabled: StyledText {
                 x: 8px;
-                width: parent.width - 10px;
+                // StyledText always word-wraps at its assigned width. Give it
+                // its natural single-line width and let DiffCell clip the
+                // overflow, matching the file viewer's no-wrap behavior.
+                width: max(parent.width - 10px, self.preferred-width);
                 height: parent.height;
                 text: root.highlighted-code;
                 default-color: #d4d4d4;
                 default-font-family: "Cascadia Mono";
                 default-font-size: root.font-size * 1px;
+                horizontal-alignment: left;
                 vertical-alignment: center;
             }
         }

@@ -1493,6 +1493,8 @@ mod tests {
         ui.set_primary_active_kind("diff".into());
         ui.set_diff_old_title("src/sample.js (HEAD)".into());
         ui.set_diff_new_title("src/sample.js (Working Tree)".into());
+        let long_old_diff_line = "  return <button className=\"small-button\" type=\"button\" onClick={copy} disabled={!value}>{labels.copy}</button>";
+        let long_new_diff_line = "  return <Tooltip label={labels.copy}><Button className=\"copy-button\" variant=\"ghost\" size=\"icon\" onClick={copy} disabled={!value}>{labels.copy}</Button></Tooltip>";
         ui.set_diff_rows(ModelRc::new(VecModel::from(vec![
             DiffRow {
                 old_line: "1".into(),
@@ -1530,9 +1532,69 @@ mod tests {
                 old_kind: "empty".into(),
                 new_kind: "added".into(),
             },
+            DiffRow {
+                old_line: "4".into(),
+                new_line: "4".into(),
+                old_text: long_old_diff_line.into(),
+                new_text: long_new_diff_line.into(),
+                old_highlighted: highlight::highlighted(
+                    Path::new("sample.jsx"),
+                    long_old_diff_line,
+                )
+                .unwrap(),
+                new_highlighted: highlight::highlighted(
+                    Path::new("sample.jsx"),
+                    long_new_diff_line,
+                )
+                .unwrap(),
+                old_highlighted_enabled: true,
+                new_highlighted_enabled: true,
+                old_kind: "removed".into(),
+                new_kind: "added".into(),
+            },
+            DiffRow {
+                old_line: "5".into(),
+                new_line: "5".into(),
+                old_text: "afterLongLine();".into(),
+                new_text: "afterLongLine();".into(),
+                old_highlighted: highlight::highlighted(
+                    Path::new("sample.jsx"),
+                    "afterLongLine();",
+                )
+                .unwrap(),
+                new_highlighted: highlight::highlighted(
+                    Path::new("sample.jsx"),
+                    "afterLongLine();",
+                )
+                .unwrap(),
+                old_highlighted_enabled: true,
+                new_highlighted_enabled: true,
+                old_kind: "context".into(),
+                new_kind: "context".into(),
+            },
         ])));
         let diff_view = render(&window);
         write_snapshot_if_requested("git-diff-view.png", &diff_view);
+        let diff_row_height = (ui.get_editor_font_size() as f32 * 1.5)
+            .max(21.0)
+            .round() as usize;
+        let long_line_top = 70 + 3 * diff_row_height;
+        let long_line_start_pixels = diff_view
+            .iter()
+            .enumerate()
+            .filter(|(index, pixel)| {
+                let x = index % 1200;
+                let y = index / 1200;
+                (workspace_left + 57..workspace_left + 140).contains(&x)
+                    && (long_line_top..long_line_top + diff_row_height).contains(&y)
+                    && pixel.blue > pixel.red.saturating_add(40)
+                    && pixel.blue > pixel.green.saturating_add(15)
+            })
+            .count();
+        assert!(
+            long_line_start_pixels > 5,
+            "a long highlighted diff line wrapped and displayed its middle instead of its start"
+        );
         let (removed_pixels, added_pixels) = diff_view
             .iter()
             .enumerate()
