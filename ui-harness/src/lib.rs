@@ -1118,6 +1118,16 @@ mod tests {
         let terminal_text_before_missed_drop = terminal_text.borrow().len();
         dispatch_pointer(
             &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(60.0, 76.0),
+            },
+        );
+        assert!(
+            !ui.get_tree_dragging(),
+            "hovering a file-tree entry unexpectedly entered drag mode"
+        );
+        dispatch_pointer(
+            &ui,
             WindowEvent::PointerPressed {
                 position: LogicalPosition::new(60.0, 76.0),
                 button: PointerEventButton::Left,
