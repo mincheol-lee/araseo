@@ -293,7 +293,7 @@ impl TerminalSession {
     }
 
     pub fn cursor_row(&self) -> i32 {
-        if self.parser.screen().hide_cursor() {
+        if self.parser.screen().hide_cursor() || self.parser.screen().scrollback() > 0 {
             -1
         } else {
             self.parser.screen().cursor_position().0.into()
@@ -301,18 +301,25 @@ impl TerminalSession {
     }
 
     pub fn cursor_column(&self) -> i32 {
-        if self.parser.screen().hide_cursor() {
+        if self.parser.screen().hide_cursor() || self.parser.screen().scrollback() > 0 {
             -1
         } else {
             self.parser.screen().cursor_position().1.into()
         }
     }
 
-    pub fn write(&self, bytes: &[u8]) {
+    pub fn scroll_scrollback(&mut self, rows: i32) -> bool {
+        scroll_screen(self.parser.screen_mut(), rows)
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> bool {
+        let returned_to_bottom = self.parser.screen().scrollback() > 0;
+        self.parser.screen_mut().set_scrollback(0);
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.write_all(bytes);
             let _ = writer.flush();
         }
+        returned_to_bottom
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
@@ -371,7 +378,8 @@ fn poll_output(
 
 fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
     let (rows, columns) = screen.size();
-    let cursor_position = (!screen.hide_cursor()).then(|| screen.cursor_position());
+    let cursor_position = (!screen.hide_cursor() && screen.scrollback() == 0)
+        .then(|| screen.cursor_position());
     let mut cells = Vec::new();
     for row in 0..rows {
         for column in 0..columns {
@@ -417,6 +425,17 @@ fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
         }
     }
     cells
+}
+
+fn scroll_screen(screen: &mut vt100::Screen, rows: i32) -> bool {
+    let current = screen.scrollback();
+    let requested = if rows >= 0 {
+        current.saturating_add(rows as usize)
+    } else {
+        current.saturating_sub(rows.unsigned_abs() as usize)
+    };
+    screen.set_scrollback(requested);
+    screen.scrollback() != current
 }
 
 impl Drop for TerminalSession {
@@ -610,6 +629,23 @@ mod tests {
         assert_eq!(cell_column_span(screen.cell(0, 0)), 2);
         assert_eq!(cell_column_span(screen.cell(0, 1)), 0);
         assert_eq!(cell_column_span(screen.cell(0, 2)), 1);
+    }
+
+    #[test]
+    fn scrolls_through_retained_output_and_hides_the_live_cursor() {
+        let mut parser = vt100::Parser::new(3, 12, 20);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert!(!parser.screen().contents().contains("one"));
+
+        assert!(scroll_screen(parser.screen_mut(), 2));
+        assert!(parser.screen().scrollback() > 0);
+        assert!(parser.screen().contents().contains("one"));
+        assert!(display_cells(parser.screen()).iter().all(|cell| !cell.cursor));
+
+        assert!(scroll_screen(parser.screen_mut(), -20));
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert!(parser.screen().contents().contains("four"));
     }
 
     #[test]

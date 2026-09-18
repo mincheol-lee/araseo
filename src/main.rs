@@ -494,24 +494,63 @@ fn main() -> Result<()> {
         });
     }
     {
+        let weak = ui.as_weak();
         let state = state.clone();
         ui.on_terminal_key(move |tab_id, text, control, alt, shift| {
             let Ok(tab_id) = TabId::try_from(tab_id) else {
                 return;
             };
-            if let Some(terminal) = terminal_ref(&state.borrow(), tab_id) {
-                terminal.write(&terminal::encode_key(&text, control, alt, shift));
+            let mut state = state.borrow_mut();
+            let visible_group = state
+                .tab_groups
+                .group_of(tab_id)
+                .filter(|group| state.tab_groups.active(*group) == Some(tab_id));
+            let returned_to_bottom = terminal_mut(&mut state, tab_id).is_some_and(|terminal| {
+                terminal.write(&terminal::encode_key(&text, control, alt, shift))
+            });
+            if returned_to_bottom && let (Some(ui), Some(group)) = (weak.upgrade(), visible_group) {
+                sync_group(&ui, &state, group);
             }
         });
     }
     {
+        let weak = ui.as_weak();
         let state = state.clone();
         ui.on_terminal_text(move |tab_id, text| {
             let Ok(tab_id) = TabId::try_from(tab_id) else {
                 return;
             };
-            if let Some(terminal) = terminal_ref(&state.borrow(), tab_id) {
-                terminal.write(text.as_bytes());
+            let mut state = state.borrow_mut();
+            let visible_group = state
+                .tab_groups
+                .group_of(tab_id)
+                .filter(|group| state.tab_groups.active(*group) == Some(tab_id));
+            let returned_to_bottom = terminal_mut(&mut state, tab_id)
+                .is_some_and(|terminal| terminal.write(text.as_bytes()));
+            if returned_to_bottom && let (Some(ui), Some(group)) = (weak.upgrade(), visible_group) {
+                sync_group(&ui, &state, group);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_terminal_scrollback(move |tab_id, rows| {
+            let Ok(tab_id) = TabId::try_from(tab_id) else {
+                return;
+            };
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let mut state = state.borrow_mut();
+            let visible_group = state
+                .tab_groups
+                .group_of(tab_id)
+                .filter(|group| state.tab_groups.active(*group) == Some(tab_id));
+            let changed = terminal_mut(&mut state, tab_id)
+                .is_some_and(|terminal| terminal.scroll_scrollback(rows));
+            if changed && let Some(group) = visible_group {
+                sync_group(&ui, &state, group);
             }
         });
     }
