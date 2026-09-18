@@ -188,6 +188,7 @@ component WorkspaceGroup inherits Rectangle {
     callback find-visibility-requested(int, bool);
     callback terminal-key(int, string, bool, bool, bool);
     callback terminal-text(int, string);
+    callback terminal-scrollback(int, int);
     callback tab-activated(int);
     callback tab-close(int);
     callback new-terminal-requested(int);
@@ -798,6 +799,14 @@ component WorkspaceGroup inherits Rectangle {
                 }
             }
             terminal-click := TouchArea {
+                scroll-event(event) => {
+                    let delta = event.delta-y != 0px ? event.delta-y : event.delta-x;
+                    if (delta != 0px) {
+                        root.terminal-scrollback(root.active-tab-id, delta > 0px ? 3 : -3);
+                        return accept;
+                    }
+                    return reject;
+                }
                 clicked => {
                     root.terminal-context-visible = false;
                     root.group-focused(root.group-id);
@@ -1045,6 +1054,7 @@ export component AppWindow inherits Window {
     callback find-requested(int, string);
     callback terminal-key(int, string, bool, bool, bool);
     callback terminal-text(int, string);
+    callback terminal-scrollback(int, int);
     callback terminal-output-ready(int);
     callback new-terminal-requested(int);
     callback tab-dock-requested(int, int);
@@ -1668,6 +1678,7 @@ export component AppWindow inherits Window {
                         root.terminal-key(tab-id, text, control, alt, shift);
                     }
                     terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
+                    terminal-scrollback(tab-id, rows) => { root.terminal-scrollback(tab-id, rows); }
                     tab-activated(tab-id) => { root.tab-activated(tab-id); }
                     tab-close(tab-id) => { root.tab-close(tab-id); }
                     new-terminal-requested(group) => { root.new-terminal-requested(group); }
@@ -1739,6 +1750,7 @@ export component AppWindow inherits Window {
                         root.terminal-key(tab-id, text, control, alt, shift);
                     }
                     terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
+                    terminal-scrollback(tab-id, rows) => { root.terminal-scrollback(tab-id, rows); }
                     tab-activated(tab-id) => { root.tab-activated(tab-id); }
                     tab-close(tab-id) => { root.tab-close(tab-id); }
                     new-terminal-requested(group) => { root.new-terminal-requested(group); }

@@ -200,6 +200,11 @@ mod tests {
                 shift,
             ));
         });
+        let terminal_scrolls = Rc::new(RefCell::new(Vec::new()));
+        let observed_terminal_scrolls = terminal_scrolls.clone();
+        ui.on_terminal_scrollback(move |tab_id, rows| {
+            observed_terminal_scrolls.borrow_mut().push((tab_id, rows));
+        });
         let tree_creates = Rc::new(RefCell::new(Vec::new()));
         let observed_tree_creates = tree_creates.clone();
         ui.on_tree_create_requested(move |target, name, is_directory| {
@@ -1249,6 +1254,16 @@ mod tests {
         assert!(
             ui.get_terminal_scroll_offset().abs() < 0.1,
             "the initial terminal prompt was scrolled out of view"
+        );
+        ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position: LogicalPosition::new(600.0, 300.0),
+            delta_x: 0.0,
+            delta_y: 120.0,
+        });
+        assert_eq!(
+            terminal_scrolls.borrow().last(),
+            Some(&(1, 3)),
+            "mouse wheel over the terminal did not request retained output"
         );
         let top_left_cell_pixels = terminal_ui
             .iter()
