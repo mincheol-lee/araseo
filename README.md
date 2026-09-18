@@ -20,7 +20,7 @@ full-scale IDE.
 ## Current Features
 
 - Lazy, expandable file tree with context-aware icons
-- File-tree creation, confirmed deletion, path copying, terminal paste, and drag-to-terminal paths
+- File-tree creation, confirmed deletion, path copying, Explorer file drops, terminal paste, and drag-to-terminal paths
 - Git status detection across multiple nested repositories
 - VS Code-style Git changes view with confirmed discard actions and side-by-side working-tree diffs
 - Unified file and terminal tabs, organized in Orca-style pane-local tab bars

@@ -1,8 +1,8 @@
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -66,6 +66,71 @@ pub fn delete_entry(workspace: &Workspace, path: &Path) -> Result<()> {
             .with_context(|| format!("cannot delete file: {}", path.display()))?;
     }
     Ok(())
+}
+
+pub fn copy_external_file(
+    workspace: &Workspace,
+    target_directory: &Path,
+    source: &Path,
+) -> Result<PathBuf> {
+    let source_metadata = fs::metadata(source)
+        .with_context(|| format!("cannot access dropped file {}", source.display()))?;
+    if !source_metadata.is_file() {
+        bail!("only files can be dropped into the file tree");
+    }
+    let file_name = source
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("the dropped file has no name")?;
+    let target_host = workspace.host_path(target_directory)?;
+    if !target_host.is_dir() {
+        bail!("drop target is not a folder: {}", target_directory.display());
+    }
+
+    let destination = target_host.join(file_name);
+    let destination_linux = target_directory.join(file_name);
+    let mut input = File::open(source)
+        .with_context(|| format!("cannot open dropped file {}", source.display()))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .with_context(|| {
+            format!(
+                "a file named {} already exists in {}",
+                file_name.to_string_lossy(),
+                target_directory.display()
+            )
+        })?;
+    if let Err(error) = io::copy(&mut input, &mut output).and_then(|_| output.flush()) {
+        drop(output);
+        let _ = fs::remove_file(&destination);
+        return Err(error).with_context(|| {
+            format!(
+                "cannot copy {} to {}",
+                source.display(),
+                destination_linux.display()
+            )
+        });
+    }
+    Ok(destination_linux)
+}
+
+pub fn external_drop_target(
+    tree: &[FlatNode],
+    workspace_root: &Path,
+    content_y: f32,
+    row_height: f32,
+) -> Option<PathBuf> {
+    if content_y < 0.0 || !row_height.is_finite() || row_height <= 0.0 {
+        return None;
+    }
+    let index = (content_y / row_height).floor() as usize;
+    match tree.get(index) {
+        Some(node) if node.is_directory => Some(node.linux_path.clone()),
+        Some(node) => node.linux_path.parent().map(PathBuf::from),
+        None => Some(workspace_root.to_path_buf()),
+    }
 }
 
 pub fn linux_path_text(path: &Path) -> String {
@@ -327,6 +392,54 @@ mod tests {
         assert!(delete_entry(&workspace, &root).is_err());
         assert_eq!(linux_path_text(Path::new(r"/work\nested\file.rs")), "/work/nested/file.rs");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copies_external_files_without_overwriting_existing_entries() {
+        let root = temporary_directory("external-copy-workspace");
+        let source_root = temporary_directory("external-copy-source");
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("dropped file.txt");
+        fs::write(&source, "from explorer").unwrap();
+        let workspace = Workspace::new("Ubuntu", root.clone()).unwrap();
+
+        let copied = copy_external_file(&workspace, &root.join("target"), &source).unwrap();
+        assert_eq!(copied, root.join("target/dropped file.txt"));
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "from explorer");
+        assert!(copy_external_file(&workspace, &root.join("target"), &source).is_err());
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "from explorer");
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
+    fn resolves_external_drop_rows_to_folders_and_blank_space_to_the_workspace() {
+        let root = PathBuf::from("/workspace");
+        let tree = vec![
+            FlatNode {
+                name: "src".into(),
+                linux_path: root.join("src"),
+                depth: 0,
+                is_directory: true,
+                is_expanded: true,
+                git_status: GitStatus::Clean,
+            },
+            FlatNode {
+                name: "main.rs".into(),
+                linux_path: root.join("src/main.rs"),
+                depth: 1,
+                is_directory: false,
+                is_expanded: false,
+                git_status: GitStatus::Clean,
+            },
+        ];
+
+        assert_eq!(external_drop_target(&tree, &root, 4.0, 25.0), Some(root.join("src")));
+        assert_eq!(external_drop_target(&tree, &root, 30.0, 25.0), Some(root.join("src")));
+        assert_eq!(external_drop_target(&tree, &root, 80.0, 25.0), Some(root.clone()));
+        assert_eq!(external_drop_target(&tree, &root, -1.0, 25.0), None);
     }
 
     #[test]

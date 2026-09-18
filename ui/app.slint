@@ -1016,6 +1016,12 @@ export component AppWindow inherits Window {
     out property <bool> copy-feedback-active: root.focused-group == 1
         ? (root.secondary-active-kind == "file" && secondary-view.copy-feedback-active)
         : (root.primary-active-kind == "file" && primary-view.copy-feedback-active);
+    out property <length> file-tree-x: 0px;
+    out property <length> file-tree-y: 66px;
+    out property <length> file-tree-width: root.sidebar-width;
+    out property <length> file-tree-height: max(0px, root.height - 90px);
+    in-out property <length> file-tree-scroll-offset: 0px;
+    out property <length> file-tree-row-height: max(25px, root.tree-font-size * 1.7px);
     in-out property <int> workspace-layout: 0;
     in-out property <float> panel-split-ratio: 0.64;
     out property <length> primary-group-x: primary-view.x;
@@ -1312,12 +1318,13 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if root.sidebar-view == 0: ScrollView {
+                    if root.sidebar-view == 0: file-tree-scroll := ScrollView {
                         vertical-stretch: 1;
+                        viewport-y <=> root.file-tree-scroll-offset;
                         VerticalLayout {
                             spacing: 0px;
                             for entry[index] in root.tree-entries: Rectangle {
-                                height: max(25px, root.tree-font-size * 1.7px);
+                                height: root.file-tree-row-height;
                                 background: tree-touch.has-hover ? #343943 : transparent;
                                 HorizontalLayout {
                                     padding-left: entry.depth * 14px + 8px;

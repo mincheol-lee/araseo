@@ -301,6 +301,11 @@ mod tests {
 
         let initial_sidebar_width = ui.get_sidebar_width();
         let initial_workspace_width = ui.get_primary_group_width();
+        assert_eq!(ui.get_file_tree_x(), 0.0);
+        assert_eq!(ui.get_file_tree_y(), 66.0);
+        assert_eq!(ui.get_file_tree_width(), initial_sidebar_width);
+        assert_eq!(ui.get_file_tree_height(), 710.0);
+        assert!(ui.get_file_tree_row_height() >= 25.0);
         dispatch_pointer(
             &ui,
             WindowEvent::PointerPressed {
