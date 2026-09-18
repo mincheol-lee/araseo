@@ -61,6 +61,10 @@ enum TreeActionResult {
         is_directory: bool,
     },
     Deleted(PathBuf),
+    Copied {
+        path: PathBuf,
+        parent: PathBuf,
+    },
 }
 
 enum TabContent {
@@ -130,6 +134,7 @@ fn main() -> Result<()> {
     icon_loader.request(emoji::EmojiIcons::load_pixels);
 
     let ui = AppWindow::new()?;
+    install_windows_file_drop(&ui, state.clone());
     if let Some(path) = appearance::settings_path() {
         let sizes = appearance::FontSizes::load(&path);
         ui.set_terminal_font_size(sizes.terminal);
@@ -763,6 +768,14 @@ fn main() -> Result<()> {
                         }
                         state.status = format!("Deleted {}", path.display());
                     }
+                    Ok(TreeActionResult::Copied { path, parent }) => {
+                        state.expanded.insert(parent);
+                        refresh_tree(&mut state);
+                        if let Some(monitor) = state.git_monitor.as_mut() {
+                            let _ = monitor.force_refresh();
+                        }
+                        state.status = format!("Copied {}", path.display());
+                    }
                     Err(error) => state.status = error.to_string(),
                 }
                 sync_ui(&ui, &state);
@@ -893,6 +906,111 @@ fn main() -> Result<()> {
     drop(timer);
     drop(workspace_timer);
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_file_drop(ui: &AppWindow, state: Rc<RefCell<AppState>>) {
+    use slint::winit_030::{EventResult, winit};
+
+    let weak = ui.as_weak();
+    ui.window().on_winit_window_event(move |window, event| {
+        if let winit::event::WindowEvent::DroppedFile(source) = event
+            && let Some(ui) = weak.upgrade()
+            && let Some((x, y)) = windows_cursor_position(window)
+        {
+            begin_external_file_copy(&ui, &state, source.clone(), x, y);
+        }
+        EventResult::Propagate
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_windows_file_drop(_ui: &AppWindow, _state: Rc<RefCell<AppState>>) {}
+
+#[cfg(target_os = "windows")]
+fn windows_cursor_position(window: &slint::Window) -> Option<(f32, f32)> {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    window
+        .with_winit_window(|window| {
+            let handle = window.window_handle().ok()?;
+            let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                return None;
+            };
+            let hwnd = handle.hwnd.get() as HWND;
+            let mut point = POINT { x: 0, y: 0 };
+            if unsafe { GetCursorPos(&mut point) } == 0
+                || unsafe { ScreenToClient(hwnd, &mut point) } == 0
+            {
+                return None;
+            }
+            let scale = window.scale_factor() as f32;
+            Some((point.x as f32 / scale, point.y as f32 / scale))
+        })
+        .flatten()
+}
+
+#[cfg(target_os = "windows")]
+fn begin_external_file_copy(
+    ui: &AppWindow,
+    state: &Rc<RefCell<AppState>>,
+    source: PathBuf,
+    x: f32,
+    y: f32,
+) {
+    let mut state = state.borrow_mut();
+    let Some(parent) = external_file_drop_parent(ui, &state, x, y) else {
+        return;
+    };
+    if state.tree_action_pending {
+        state.status = "A file tree action is already running".into();
+    } else {
+        let workspace = state.workspace.clone();
+        let result_parent = parent.clone();
+        let name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.display().to_string());
+        state.tree_action_pending = true;
+        state.status = format!("Copying {name} to {}...", parent.display());
+        state.tree_action_loader.request(move || {
+            let path = tree::copy_external_file(&workspace, &parent, &source)?;
+            Ok(TreeActionResult::Copied {
+                path,
+                parent: result_parent,
+            })
+        });
+    }
+    sync_ui(ui, &state);
+}
+
+#[cfg(target_os = "windows")]
+fn external_file_drop_parent(
+    ui: &AppWindow,
+    state: &AppState,
+    x: f32,
+    y: f32,
+) -> Option<PathBuf> {
+    if ui.get_sidebar_view() != 0 {
+        return None;
+    }
+    let left = ui.get_file_tree_x();
+    let top = ui.get_file_tree_y();
+    let width = ui.get_file_tree_width();
+    let height = ui.get_file_tree_height();
+    if x < left || x >= left + width || y < top || y >= top + height {
+        return None;
+    }
+    let content_y = y - top - ui.get_file_tree_scroll_offset();
+    tree::external_drop_target(
+        &state.tree,
+        &state.workspace.linux_root,
+        content_y,
+        ui.get_file_tree_row_height(),
+    )
 }
 
 fn parse_args() -> Result<(String, PathBuf, Option<PathBuf>)> {
