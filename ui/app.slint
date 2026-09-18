@@ -1357,7 +1357,7 @@ export component AppWindow inherits Window {
                                     private property <bool> drag-armed: false;
                                     private property <length> press-x: 0px;
                                     private property <length> press-y: 0px;
-                                    mouse-cursor: move;
+                                    mouse-cursor: root.tree-dragging ? grabbing : default;
                                     clicked => {
                                         root.tree-context-visible = false;
                                         root.tree-activated(index);
