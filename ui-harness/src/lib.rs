@@ -1726,6 +1726,112 @@ mod tests {
             syntax_pixels > 10,
             "diff view did not render file-viewer syntax colors"
         );
+
+        // The production window can render a nested third pane and route its
+        // input through the same WorkspaceGroup implementation.
+        ui.set_dynamic_panes(true);
+        ui.set_primary_layout_x(0.0);
+        ui.set_primary_layout_y(0.0);
+        ui.set_primary_layout_width(0.5);
+        ui.set_primary_layout_height(1.0);
+        ui.set_primary_layout_visible(true);
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 50,
+            title: "main.rs".into(),
+            detail: "/workspace/main.rs".into(),
+            kind: "file".into(),
+            group: 0,
+            active: true,
+            dirty: false,
+        }])));
+        ui.set_primary_active_tab_id(50);
+        ui.set_secondary_layout_x(0.5);
+        ui.set_secondary_layout_y(0.0);
+        ui.set_secondary_layout_width(0.5);
+        ui.set_secondary_layout_height(0.5);
+        ui.set_secondary_layout_visible(true);
+        ui.set_primary_active_kind("file".into());
+        ui.set_secondary_active_kind("file".into());
+        ui.set_extra_panes(ModelRc::new(VecModel::from(vec![PaneEntry {
+            group: 2,
+            x: 0.5,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+            visible: true,
+            tabs: ModelRc::new(VecModel::from(vec![TabEntry {
+                id: 52,
+                title: "Terminal 2".into(),
+                detail: "/workspace".into(),
+                kind: "terminal".into(),
+                group: 2,
+                active: true,
+                dirty: false,
+            }])),
+            active_tab_id: 52,
+            active_kind: "terminal".into(),
+            active_title: "Terminal 2".into(),
+            ..PaneEntry::default()
+        }])));
+        ui.set_pane_dividers(ModelRc::new(VecModel::from(vec![
+            DividerEntry { id: 0, horizontal: true, x: 0.5, y: 0.0, width: 0.0, height: 1.0 },
+            DividerEntry { id: 1, horizontal: false, x: 0.5, y: 0.5, width: 0.5, height: 0.0 },
+        ])));
+        let nested_view = render(&window);
+        write_snapshot_if_requested("nested-panes.png", &nested_view);
+        assert!(ui.get_secondary_group_x() > ui.get_primary_group_x());
+        assert!((ui.get_primary_group_width() - ui.get_workspace_area_width() * 0.5).abs() < 1.0);
+
+        let nested_dock = Rc::new(RefCell::new(None));
+        let observed_dock = nested_dock.clone();
+        ui.on_pane_dock_requested(move |tab, group, zone| {
+            *observed_dock.borrow_mut() = Some((tab, group, zone));
+        });
+        ui.on_dock_target_requested(|_, _, _| DockTarget {
+            group: 2, zone: 3, x: 0.5, y: 0.75, width: 0.5, height: 0.25,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(300.0, 17.0),
+            button: PointerEventButton::Left,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved {
+            position: LogicalPosition::new(850.0, 600.0),
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(850.0, 600.0),
+            button: PointerEventButton::Left,
+        });
+        assert_eq!(*nested_dock.borrow(), Some((50, 2, 3)));
+
+        ui.set_focused_group(2);
+        ui.invoke_focus_terminal();
+        render(&window);
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: "확장".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: "확장".into() });
+        assert_eq!(terminal_text.borrow().last(), Some(&(52, "확장".to_string())));
+
+        let panes = ui.get_extra_panes();
+        let model = panes.as_any().downcast_ref::<VecModel<PaneEntry>>().unwrap();
+        let mut third = model.row_data(0).unwrap();
+        third.active_tab_id = 53;
+        third.active_kind = "file".into();
+        third.editor_text = "gamma".into();
+        third.tabs = ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 53,
+            title: "third.rs".into(),
+            detail: "/workspace/third.rs".into(),
+            kind: "file".into(),
+            group: 2,
+            active: true,
+            dirty: false,
+        }]));
+        model.set_row_data(0, third);
+        render(&window);
+        dispatch_click(&ui, 800.0, 450.0);
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: "X".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: "X".into() });
+        assert!(model.row_data(0).unwrap().editor_text.contains('X'));
+        assert_eq!(ui.get_editor_text().as_str(), "Brightness sample text");
     }
 
     fn dispatch_pointer(ui: &AppWindow, event: WindowEvent) {

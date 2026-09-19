@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tabs::{TabGroups, TabId};
+use tabs::{Axis, Dock, Rect, TabGroups, TabId};
 use terminal::TerminalSession;
 use tree::{FlatNode, GitStatus};
 use workspace::Workspace;
@@ -52,6 +52,9 @@ struct AppState {
     tree_action_loader: Background<Result<TreeActionResult>>,
     tree_action_pending: bool,
     editor_views: RefCell<[editor_view::EditorView; 2]>,
+    extra_editor_views: RefCell<HashMap<usize, editor_view::EditorView>>,
+    extra_terminal_sizes: HashMap<usize, (u16, u16)>,
+    maximized_group: Option<usize>,
 }
 
 enum TreeActionResult {
@@ -133,6 +136,9 @@ fn main() -> Result<()> {
         tree_action_loader: Background::default(),
         tree_action_pending: false,
         editor_views: RefCell::new(Default::default()),
+        extra_editor_views: RefCell::new(HashMap::new()),
+        extra_terminal_sizes: HashMap::new(),
+        maximized_group: None,
     }));
 
     refresh_tree(&mut state.borrow_mut());
@@ -140,6 +146,8 @@ fn main() -> Result<()> {
     icon_loader.request(emoji::EmojiIcons::load_pixels);
 
     let ui = AppWindow::new()?;
+    ui.set_dynamic_panes(true);
+    ui.set_extra_panes(ModelRc::new(VecModel::from(Vec::<PaneEntry>::new())));
     install_windows_file_drop(&ui, state.clone());
     if let Some(path) = appearance::settings_path() {
         let sizes = appearance::FontSizes::load(&path);
@@ -165,7 +173,7 @@ fn main() -> Result<()> {
                 ui.set_status_text(format!("Could not save font settings: {error}").into());
             }
             let state = state.borrow();
-            for group in 0..2 {
+            for group in state.tab_groups.groups() {
                 sync_group(&ui, &state, group);
             }
         });
@@ -256,12 +264,8 @@ fn main() -> Result<()> {
                         result_name
                     );
                     state.tree_action_loader.request(move || {
-                        let path = tree::create_entry(
-                            &workspace,
-                            &parent,
-                            &result_name,
-                            is_directory,
-                        )?;
+                        let path =
+                            tree::create_entry(&workspace, &parent, &result_name, is_directory)?;
                         Ok(TreeActionResult::Created {
                             path,
                             parent: result_parent,
@@ -621,7 +625,7 @@ fn main() -> Result<()> {
         let state = state.clone();
         ui.on_new_terminal_requested(move |group| {
             let mut state = state.borrow_mut();
-            let group = usize::try_from(group).unwrap_or(0).min(1);
+            let group = usize::try_from(group).unwrap_or(0);
             match open_terminal(&mut state, group) {
                 Ok(tab_id) => {
                     if let Some(ui) = weak.upgrade()
@@ -639,16 +643,198 @@ fn main() -> Result<()> {
         });
     }
     {
+        let state = state.clone();
+        let weak = ui.as_weak();
+        ui.on_dock_target_requested(move |tab_id, x, y| {
+            let Some(ui) = weak.upgrade() else {
+                return invalid_dock_target();
+            };
+            let state = state.borrow();
+            let Some(source) = TabId::try_from(tab_id)
+                .ok()
+                .and_then(|id| state.tab_groups.group_of(id))
+            else {
+                return invalid_dock_target();
+            };
+            let (local_x, local_y, width, height) = workspace_pointer(&ui, x, y);
+            let Some((group, rect)) = visible_panes(&state)
+                .into_iter()
+                .find(|(_, rect)| rect.contains(local_x, local_y))
+            else {
+                return invalid_dock_target();
+            };
+            let within_x = (local_x - rect.x) / rect.width;
+            let within_y = (local_y - rect.y) / rect.height;
+            let zone = if within_x < 0.25 {
+                0
+            } else if within_x > 0.75 {
+                1
+            } else if within_y < 0.25 {
+                2
+            } else if within_y > 0.75 {
+                3
+            } else {
+                4
+            };
+            if source == group && (zone == 4 || state.tab_groups.group_ids(source).len() == 1) {
+                return invalid_dock_target();
+            }
+            if zone <= 1 && rect.width * width < 486.0
+                || (zone == 2 || zone == 3) && rect.height * height < 326.0
+            {
+                return invalid_dock_target();
+            }
+            let mut preview = rect;
+            match zone {
+                0 => preview.width *= 0.5,
+                1 => {
+                    preview.x += preview.width * 0.5;
+                    preview.width *= 0.5;
+                }
+                2 => preview.height *= 0.5,
+                3 => {
+                    preview.y += preview.height * 0.5;
+                    preview.height *= 0.5;
+                }
+                _ => {}
+            }
+            DockTarget {
+                group: group as i32,
+                zone,
+                x: preview.x,
+                y: preview.y,
+                width: preview.width,
+                height: preview.height,
+            }
+        });
+    }
+    {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_tab_dock_requested(move |tab_id, zone| {
+        ui.on_pane_dock_requested(move |tab_id, target, zone| {
+            let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
+            let (Ok(id), Ok(target), Some(dock)) = (
+                TabId::try_from(tab_id),
+                usize::try_from(target),
+                Dock::from_zone(zone),
+            ) else {
+                return;
+            };
             cancel_file_open(&mut state);
-            if let Ok(tab_id) = TabId::try_from(tab_id) {
-                state.tab_groups.dock(tab_id, zone);
-            }
-            if let Some(ui) = weak.upgrade() {
+            if state.tab_groups.dock_into(id, target, dock) {
+                state.maximized_group = None;
                 sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_pane_divider_dragged(move |id, x, y| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Ok(id) = usize::try_from(id) else { return };
+            let mut state = state.borrow_mut();
+            let (_, dividers) = state.tab_groups.layout();
+            let Some(divider) = dividers.into_iter().find(|item| item.id == id) else {
+                return;
+            };
+            let (local_x, local_y, width, height) = workspace_pointer(&ui, x, y);
+            let (position, start, span, pixels, minimum) = match divider.axis {
+                Axis::Horizontal => (
+                    local_x,
+                    divider.parent.x,
+                    divider.parent.width,
+                    width,
+                    240.0,
+                ),
+                Axis::Vertical => (
+                    local_y,
+                    divider.parent.y,
+                    divider.parent.height,
+                    height,
+                    160.0,
+                ),
+            };
+            let minimum_fraction = ((minimum + 3.0) / (span * pixels).max(1.0)).min(0.5);
+            let ratio = ((position - start) / span).clamp(minimum_fraction, 1.0 - minimum_fraction);
+            if state
+                .tab_groups
+                .set_split_ratio(id, (ratio * 1000.0) as u16)
+            {
+                sync_layout(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_pane_maximize_requested(move |group| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Ok(group) = usize::try_from(group) else {
+                return;
+            };
+            let mut state = state.borrow_mut();
+            if !state.tab_groups.groups().contains(&group) {
+                return;
+            }
+            state.maximized_group = if state.maximized_group == Some(group) {
+                None
+            } else {
+                Some(group)
+            };
+            sync_layout(&ui, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = ui.as_weak();
+        ui.on_tree_target_requested(move |x, y| {
+            let Some(ui) = weak.upgrade() else { return -1 };
+            let state = state.borrow();
+            let (x, y, _, _) = workspace_pointer(&ui, x, y);
+            visible_panes(&state)
+                .into_iter()
+                .find_map(|(group, rect)| {
+                    let id = state.tab_groups.active(group)?;
+                    let is_terminal = matches!(
+                        state
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.id == id)
+                            .map(|tab| &tab.content),
+                        Some(TabContent::Terminal { .. })
+                    );
+                    (is_terminal
+                        && rect.contains(x, y)
+                        && y >= rect.y + 36.0 / ui.get_workspace_area_height().max(1.0))
+                    .then_some(group as i32)
+                })
+                .unwrap_or(-1)
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_pane_terminal_size_changed(move |group, rows, columns| {
+            let Ok(group) = usize::try_from(group) else {
+                return;
+            };
+            let mut state = state.borrow_mut();
+            let size = (
+                rows.round().clamp(2.0, u16::MAX as f32) as u16,
+                columns.round().clamp(20.0, u16::MAX as f32) as u16,
+            );
+            if state.extra_terminal_sizes.insert(group, size) == Some(size) {
+                return;
+            }
+            let Some(id) = state.tab_groups.active(group) else {
+                return;
+            };
+            if terminal_mut(&mut state, id).is_some_and(|terminal| terminal.resize(size.0, size.1))
+                && let Some(ui) = weak.upgrade()
+            {
+                sync_group(&ui, &state, group);
             }
         });
     }
@@ -696,8 +882,7 @@ fn main() -> Result<()> {
                                         number,
                                     },
                                 });
-                                focus_startup_terminal =
-                                    state.tab_groups.add_background(tab_id, 0);
+                                focus_startup_terminal = state.tab_groups.add_background(tab_id, 0);
                             }
                             Err(error) => state.status = format!("Terminal unavailable: {error}"),
                         }
@@ -799,7 +984,9 @@ fn main() -> Result<()> {
                     }
                     Ok(TreeActionResult::Deleted(path)) => {
                         close_file_tabs_at_or_below(&mut state, &path);
-                        state.expanded.retain(|expanded| !expanded.starts_with(&path));
+                        state
+                            .expanded
+                            .retain(|expanded| !expanded.starts_with(&path));
                         refresh_tree(&mut state);
                         if let Some(monitor) = state.git_monitor.as_mut() {
                             let _ = monitor.force_refresh();
@@ -844,11 +1031,8 @@ fn main() -> Result<()> {
                             if let TabContent::File(document) = &mut tab.content {
                                 document.linux_path =
                                     tree::rebased_path(&document.linux_path, &from, &to);
-                                document.host_path = tree::rebased_path(
-                                    &document.host_path,
-                                    &from_host,
-                                    &to_host,
-                                );
+                                document.host_path =
+                                    tree::rebased_path(&document.host_path, &from_host, &to_host);
                             }
                         }
                         refresh_tree(&mut state);
@@ -882,6 +1066,16 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            for (&group, view) in state.extra_editor_views.borrow_mut().iter_mut() {
+                if let Some(highlighted) = view.poll(Instant::now()) {
+                    let enabled = highlighted.is_some();
+                    let text = highlighted.unwrap_or_default();
+                    edit_extra_pane(&ui, group, |pane| {
+                        pane.highlighted_text = text;
+                        pane.syntax_highlight_enabled = enabled;
+                    });
+                }
+            }
         });
     }
 
@@ -891,7 +1085,7 @@ fn main() -> Result<()> {
         let state = state.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = weak.upgrade() else { return };
-            let terminal_sizes = [
+            let fixed_terminal_sizes = [
                 (
                     ui.get_terminal_rows().round().clamp(2.0, u16::MAX as f32) as u16,
                     ui.get_terminal_columns()
@@ -908,30 +1102,32 @@ fn main() -> Result<()> {
                 ),
             ];
             let mut state = state.borrow_mut();
-            let active = [state.tab_groups.active(0), state.tab_groups.active(1)];
-            let mut changed_groups = [false, false];
+            let active = state
+                .tab_groups
+                .groups()
+                .into_iter()
+                .filter_map(|group| state.tab_groups.active(group).map(|id| (id, group)))
+                .collect::<HashMap<_, _>>();
+            let mut changed_groups = HashSet::new();
+            let extra_sizes = state.extra_terminal_sizes.clone();
             for tab in &mut state.tabs {
                 if let TabContent::Terminal { session, .. } = &mut tab.content {
-                    let visible_group = if active[0] == Some(tab.id) {
-                        Some(0)
-                    } else if active[1] == Some(tab.id) {
-                        Some(1)
-                    } else {
-                        None
-                    };
+                    let visible_group = active.get(&tab.id).copied();
                     let resized = visible_group.is_some_and(|group| {
-                        let (rows, columns) = terminal_sizes[group];
+                        let (rows, columns) = if group < 2 {
+                            fixed_terminal_sizes[group]
+                        } else {
+                            extra_sizes.get(&group).copied().unwrap_or((24, 80))
+                        };
                         session.resize(rows, columns)
                     });
                     if resized && let Some(group) = visible_group {
-                        changed_groups[group] = true;
+                        changed_groups.insert(group);
                     }
                 }
             }
-            for (group, changed) in changed_groups.into_iter().enumerate() {
-                if changed {
-                    sync_group(&ui, &state, group);
-                }
+            for group in changed_groups {
+                sync_group(&ui, &state, group);
             }
         });
     }
@@ -977,10 +1173,8 @@ fn main() -> Result<()> {
                 sync_tree(&ui, &state);
                 sync_git_changes(&ui, &state);
             }
-            for (group, refreshed) in refreshed_groups.into_iter().enumerate() {
-                if refreshed {
-                    sync_group(&ui, &state, group);
-                }
+            for group in refreshed_groups {
+                sync_group(&ui, &state, group);
             }
             if state.status != previous_status {
                 ui.set_status_text(state.status.clone().into());
@@ -1077,12 +1271,7 @@ fn begin_external_file_copy(
 }
 
 #[cfg(target_os = "windows")]
-fn external_file_drop_parent(
-    ui: &AppWindow,
-    state: &AppState,
-    x: f32,
-    y: f32,
-) -> Option<PathBuf> {
+fn external_file_drop_parent(ui: &AppWindow, state: &AppState, x: f32, y: f32) -> Option<PathBuf> {
     if ui.get_sidebar_view() != 0 {
         return None;
     }
@@ -1191,11 +1380,16 @@ fn apply_history_change(
             if group == 0 {
                 ui.set_editor_cursor_offset(cursor.min(i32::MAX as usize) as i32);
                 ui.set_editor_cursor_generation(ui.get_editor_cursor_generation().wrapping_add(1));
-            } else {
+            } else if group == 1 {
                 ui.set_secondary_editor_cursor_offset(cursor.min(i32::MAX as usize) as i32);
                 ui.set_secondary_editor_cursor_generation(
                     ui.get_secondary_editor_cursor_generation().wrapping_add(1),
                 );
+            } else {
+                edit_extra_pane(&ui, group, |pane| {
+                    pane.editor_cursor_offset = cursor.min(i32::MAX as usize) as i32;
+                    pane.editor_cursor_generation = pane.editor_cursor_generation.wrapping_add(1);
+                });
             }
             state.syncing_editor.set(false);
             sync_tabs(&ui, &state);
@@ -1415,9 +1609,14 @@ fn reload_tab(state: &mut AppState, tab_id: TabId) {
     }
 }
 
-fn refresh_external_documents(state: &mut AppState) -> [bool; 2] {
-    let active = [state.tab_groups.active(0), state.tab_groups.active(1)];
-    let mut refreshed_groups = [false, false];
+fn refresh_external_documents(state: &mut AppState) -> HashSet<usize> {
+    let active = state
+        .tab_groups
+        .groups()
+        .into_iter()
+        .filter_map(|group| state.tab_groups.active(group).map(|id| (id, group)))
+        .collect::<HashMap<_, _>>();
+    let mut refreshed_groups = HashSet::new();
     let mut reloaded = 0usize;
     let mut conflict = None;
     let mut refresh_error = None;
@@ -1433,10 +1632,8 @@ fn refresh_external_documents(state: &mut AppState) -> [bool; 2] {
             Ok(ExternalRefresh::Reloaded) => {
                 reloaded += 1;
                 resolved_conflict |= state.save_conflict == Some(tab.id);
-                for (group, active_id) in active.into_iter().enumerate() {
-                    if active_id == Some(tab.id) {
-                        refreshed_groups[group] = true;
-                    }
+                if let Some(group) = active.get(&tab.id) {
+                    refreshed_groups.insert(*group);
                 }
             }
             Ok(ExternalRefresh::Conflict) => {
@@ -1557,6 +1754,153 @@ fn refresh_tree(state: &mut AppState) {
         .request(move || tree::build_tree(&workspace, &expanded, &statuses));
 }
 
+fn workspace_pointer(ui: &AppWindow, x: f32, y: f32) -> (f32, f32, f32, f32) {
+    let width = ui.get_workspace_area_width().max(1.0);
+    let height = ui.get_workspace_area_height().max(1.0);
+    (
+        (x - ui.get_workspace_area_x()) / width,
+        (y - ui.get_workspace_area_y()) / height,
+        width,
+        height,
+    )
+}
+
+fn invalid_dock_target() -> DockTarget {
+    DockTarget {
+        group: -1,
+        zone: -1,
+        ..DockTarget::default()
+    }
+}
+
+fn visible_panes(state: &AppState) -> Vec<(usize, Rect)> {
+    if let Some(group) = state
+        .maximized_group
+        .filter(|group| state.tab_groups.groups().contains(group))
+    {
+        return vec![(
+            group,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        )];
+    }
+    state.tab_groups.layout().0
+}
+
+fn edit_extra_pane(ui: &AppWindow, group: usize, edit: impl FnOnce(&mut PaneEntry)) {
+    let panes = ui.get_extra_panes();
+    let model = panes
+        .as_any()
+        .downcast_ref::<VecModel<PaneEntry>>()
+        .expect("extra panes use a VecModel");
+    let index = group - 2;
+    while model.row_count() <= index {
+        let mut pane = PaneEntry::default();
+        pane.group = (model.row_count() + 2) as i32;
+        model.push(pane);
+    }
+    let mut pane = model.row_data(index).unwrap();
+    edit(&mut pane);
+    model.set_row_data(index, pane);
+}
+
+fn extra_pane(ui: &AppWindow, group: usize) -> Option<PaneEntry> {
+    ui.get_extra_panes().row_data(group.checked_sub(2)?)
+}
+
+fn sync_layout(ui: &AppWindow, state: &AppState) {
+    let maximized = state
+        .maximized_group
+        .filter(|group| state.tab_groups.groups().contains(group));
+    ui.set_maximized_pane(maximized.map_or(-1, |group| group as i32));
+    let layout = visible_panes(state).into_iter().collect::<HashMap<_, _>>();
+    ui.set_primary_layout_visible(layout.contains_key(&0));
+    ui.set_secondary_layout_visible(layout.contains_key(&1));
+    if let Some(rect) = layout.get(&0) {
+        ui.set_primary_layout_x(rect.x);
+        ui.set_primary_layout_y(rect.y);
+        ui.set_primary_layout_width(rect.width);
+        ui.set_primary_layout_height(rect.height);
+    }
+    if let Some(rect) = layout.get(&1) {
+        ui.set_secondary_layout_x(rect.x);
+        ui.set_secondary_layout_y(rect.y);
+        ui.set_secondary_layout_width(rect.width);
+        ui.set_secondary_layout_height(rect.height);
+    }
+    let panes = ui.get_extra_panes();
+    let model = panes
+        .as_any()
+        .downcast_ref::<VecModel<PaneEntry>>()
+        .expect("extra panes use a VecModel");
+    for group in layout.keys().copied().filter(|group| *group >= 2) {
+        while model.row_count() <= group - 2 {
+            let mut pane = PaneEntry::default();
+            pane.group = (model.row_count() + 2) as i32;
+            model.push(pane);
+        }
+    }
+    for index in 0..model.row_count() {
+        let mut pane = model.row_data(index).unwrap();
+        let rect = layout.get(&(index + 2));
+        let visible = rect.is_some();
+        let changed = pane.visible != visible
+            || rect.is_some_and(|rect| {
+                pane.x != rect.x
+                    || pane.y != rect.y
+                    || pane.width != rect.width
+                    || pane.height != rect.height
+            });
+        if changed {
+            pane.visible = visible;
+            if let Some(rect) = rect {
+                pane.x = rect.x;
+                pane.y = rect.y;
+                pane.width = rect.width;
+                pane.height = rect.height;
+            }
+            model.set_row_data(index, pane);
+        }
+    }
+    let dividers = if maximized.is_some() {
+        Vec::new()
+    } else {
+        state
+            .tab_groups
+            .layout()
+            .1
+            .into_iter()
+            .map(|divider| DividerEntry {
+                id: divider.id as i32,
+                horizontal: divider.axis == Axis::Horizontal,
+                x: divider.rect.x,
+                y: divider.rect.y,
+                width: divider.rect.width,
+                height: divider.rect.height,
+            })
+            .collect::<Vec<_>>()
+    };
+    let current = ui.get_pane_dividers();
+    if let Some(model) = current.as_any().downcast_ref::<VecModel<DividerEntry>>()
+        && model.row_count() == dividers.len()
+        && dividers.iter().enumerate().all(|(index, divider)| {
+            model
+                .row_data(index)
+                .is_some_and(|current| current.id == divider.id)
+        })
+    {
+        for (index, divider) in dividers.into_iter().enumerate() {
+            model.set_row_data(index, divider);
+        }
+    } else {
+        ui.set_pane_dividers(ModelRc::new(VecModel::from(dividers)));
+    }
+}
+
 fn sync_ui(ui: &AppWindow, state: &AppState) {
     ui.set_workspace_name(
         state
@@ -1570,11 +1914,13 @@ fn sync_ui(ui: &AppWindow, state: &AppState) {
     ui.set_save_conflict(state.save_conflict.is_some());
     ui.set_tree_action_pending(state.tree_action_pending);
     ui.set_focused_group(state.tab_groups.focused_group() as i32);
+    sync_layout(ui, state);
     sync_tree(ui, state);
     sync_git_changes(ui, state);
     sync_tabs(ui, state);
-    sync_group(ui, state, 0);
-    sync_group(ui, state, 1);
+    for group in state.tab_groups.groups() {
+        sync_group(ui, state, group);
+    }
 
     let active_path = focused_tab_id(state)
         .and_then(|tab_id| state.tabs.iter().find(|tab| tab.id == tab_id))
@@ -1584,6 +1930,10 @@ fn sync_ui(ui: &AppWindow, state: &AppState) {
 }
 
 fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
+    if group >= 2 {
+        sync_extra_group(ui, state, group);
+        return;
+    }
     let active_id = state.tab_groups.active(group);
     let active_tab = active_id.and_then(|id| state.tabs.iter().find(|tab| tab.id == id));
 
@@ -1682,6 +2032,71 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
     }
 }
 
+fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
+    let active = state
+        .tab_groups
+        .active(group)
+        .and_then(|id| state.tabs.iter().find(|tab| tab.id == id));
+    let Some(tab) = active else {
+        state.extra_editor_views.borrow_mut().remove(&group);
+        edit_extra_pane(ui, group, |pane| {
+            pane.active_tab_id = -1;
+            pane.active_kind = "".into();
+            pane.active_title = "".into();
+            pane.active_detail = "".into();
+            pane.editor_text = "".into();
+            pane.highlighted_text = slint::StyledText::default();
+            pane.syntax_highlight_enabled = false;
+            pane.diff_rows = ModelRc::new(VecModel::from(Vec::<DiffRow>::new()));
+        });
+        clear_terminal_group(ui, group);
+        return;
+    };
+    edit_extra_pane(ui, group, |pane| {
+        pane.active_tab_id = tab.id as i32;
+        pane.active_title = tab_title(tab).into();
+        pane.active_detail = tab_detail(tab).into();
+        pane.active_kind = match tab.content {
+            TabContent::File(_) => "file",
+            TabContent::Diff(_) => "diff",
+            TabContent::Terminal { .. } => "terminal",
+        }
+        .into();
+    });
+    match &tab.content {
+        TabContent::File(document) => {
+            state.syncing_editor.set(true);
+            edit_extra_pane(ui, group, |pane| {
+                if pane.editor_text.as_str() != document.text {
+                    pane.editor_text = document.text.clone().into();
+                }
+            });
+            state.syncing_editor.set(false);
+            if let Some(pane) = extra_pane(ui, group) {
+                sync_editor_view(ui, state, document, group, pane.editor_text);
+            }
+            clear_terminal_group(ui, group);
+        }
+        TabContent::Diff(diff) => {
+            state.extra_editor_views.borrow_mut().remove(&group);
+            edit_extra_pane(ui, group, |pane| {
+                pane.syntax_highlight_enabled = false;
+                pane.highlighted_text = slint::StyledText::default();
+            });
+            sync_diff(ui, diff, group);
+            clear_terminal_group(ui, group);
+        }
+        TabContent::Terminal { session, .. } => {
+            state.extra_editor_views.borrow_mut().remove(&group);
+            edit_extra_pane(ui, group, |pane| {
+                pane.syntax_highlight_enabled = false;
+                pane.highlighted_text = slint::StyledText::default();
+            });
+            sync_terminal(ui, session, group);
+        }
+    }
+}
+
 fn sync_editor_view(
     ui: &AppWindow,
     state: &AppState,
@@ -1689,12 +2104,26 @@ fn sync_editor_view(
     group: usize,
     text: slint::SharedString,
 ) {
-    let (changed, numbers) = state.editor_views.borrow_mut()[group].update(
-        &document.linux_path,
-        text,
-        ui.get_editor_font_brightness(),
-        Instant::now(),
-    );
+    let (changed, numbers) = if group < 2 {
+        state.editor_views.borrow_mut()[group].update(
+            &document.linux_path,
+            text,
+            ui.get_editor_font_brightness(),
+            Instant::now(),
+        )
+    } else {
+        state
+            .extra_editor_views
+            .borrow_mut()
+            .entry(group)
+            .or_default()
+            .update(
+                &document.linux_path,
+                text,
+                ui.get_editor_font_brightness(),
+                Instant::now(),
+            )
+    };
     if !changed {
         return;
     }
@@ -1713,7 +2142,13 @@ fn sync_editor_view(
             ui.set_secondary_highlighted_text(slint::StyledText::default());
             ui.set_secondary_syntax_highlight_enabled(false);
         }
-        _ => {}
+        _ => edit_extra_pane(ui, group, |pane| {
+            if let Some(numbers) = numbers {
+                pane.line_numbers = numbers;
+            }
+            pane.highlighted_text = slint::StyledText::default();
+            pane.syntax_highlight_enabled = false;
+        }),
     }
 }
 
@@ -1780,10 +2215,16 @@ fn sync_diff(ui: &AppWindow, diff: &git::FileDiff, group: usize) {
         ui.set_diff_rows(ModelRc::new(VecModel::from(rows)));
         ui.set_diff_old_title(old_title.into());
         ui.set_diff_new_title(new_title.into());
-    } else {
+    } else if group == 1 {
         ui.set_secondary_diff_rows(ModelRc::new(VecModel::from(rows)));
         ui.set_secondary_diff_old_title(old_title.into());
         ui.set_secondary_diff_new_title(new_title.into());
+    } else {
+        edit_extra_pane(ui, group, |pane| {
+            pane.diff_rows = ModelRc::new(VecModel::from(rows));
+            pane.diff_old_title = old_title.into();
+            pane.diff_new_title = new_title.into();
+        });
     }
 }
 
@@ -1829,7 +2270,7 @@ fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
             ui.set_terminal_cells(model)
         });
         ui.set_terminal_update_generation(ui.get_terminal_update_generation().wrapping_add(1));
-    } else {
+    } else if group == 1 {
         ui.set_secondary_terminal_grid_rows(rows.into());
         ui.set_secondary_terminal_grid_columns(columns.into());
         ui.set_secondary_terminal_cursor_row(terminal.cursor_row());
@@ -1841,6 +2282,17 @@ fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
             ui.get_secondary_terminal_update_generation()
                 .wrapping_add(1),
         );
+    } else {
+        edit_extra_pane(ui, group, |pane| {
+            pane.terminal_grid_rows = rows.into();
+            pane.terminal_grid_columns = columns.into();
+            pane.terminal_cursor_row = terminal.cursor_row();
+            pane.terminal_cursor_column = terminal.cursor_column();
+            update_terminal_model(pane.terminal_cells.clone(), cells, |model| {
+                pane.terminal_cells = model;
+            });
+            pane.terminal_update_generation = pane.terminal_update_generation.wrapping_add(1);
+        });
     }
 }
 
@@ -1941,12 +2393,20 @@ fn clear_terminal_group(ui: &AppWindow, group: usize) {
         });
         ui.set_terminal_cursor_row(-1);
         ui.set_terminal_cursor_column(-1);
-    } else {
+    } else if group == 1 {
         update_terminal_model(ui.get_secondary_terminal_cells(), Vec::new(), |model| {
             ui.set_secondary_terminal_cells(model)
         });
         ui.set_secondary_terminal_cursor_row(-1);
         ui.set_secondary_terminal_cursor_column(-1);
+    } else {
+        edit_extra_pane(ui, group, |pane| {
+            update_terminal_model(pane.terminal_cells.clone(), Vec::new(), |model| {
+                pane.terminal_cells = model;
+            });
+            pane.terminal_cursor_row = -1;
+            pane.terminal_cursor_column = -1;
+        });
     }
 }
 
@@ -2121,4 +2581,14 @@ fn sync_tabs(ui: &AppWindow, state: &AppState) {
     };
     ui.set_primary_tabs(ModelRc::new(VecModel::from(tabs_for_group(0))));
     ui.set_secondary_tabs(ModelRc::new(VecModel::from(tabs_for_group(1))));
+    for group in state
+        .tab_groups
+        .groups()
+        .into_iter()
+        .filter(|group| *group >= 2)
+    {
+        edit_extra_pane(ui, group, |pane| {
+            pane.tabs = ModelRc::new(VecModel::from(tabs_for_group(group)));
+        });
+    }
 }

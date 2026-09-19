@@ -25,7 +25,7 @@ full-scale IDE.
 - VS Code-style Git changes view with confirmed discard actions and side-by-side working-tree diffs
 - Unified file and terminal tabs, organized in Orca-style pane-local tab bars
 - Multiple independent WSL terminals with ANSI colors, Korean text, IME input, and visible start paths
-- Up to two drag-and-dock tab groups with independent tabs and resizable splits
+- Repeatable horizontal and vertical tab-pane splits with independent tabs and resizable dividers
 - WSL-aware CLI arguments and Linux-to-UNC path mapping
 - Headless behavioral Harness for editor isolation, multiple terminals, docking layouts, Git, and UI regressions
 
@@ -34,6 +34,11 @@ full-scale IDE.
 Araseo is an active personal project. More editor, terminal, Git, workspace,
 and quality-of-life features will continue to be added while keeping startup,
 resource usage, and the overall interface lightweight.
+
+To split a pane, open another file or terminal tab and drag its tab to the
+left, right, top, or bottom edge of the target pane. Drop in the center to
+move the tab into that pane. You can repeat this on any pane; closing or moving
+its last tab removes the empty pane. Drag a divider to resize its two sides.
 
 Workspace startup, file opening, tree scanning, and emoji preparation run on
 background workers. Rapid file selections keep the latest requested file;
