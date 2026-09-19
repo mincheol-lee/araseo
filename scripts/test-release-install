@@ -37,6 +37,37 @@ chmod +x "$release_directory/araseo"
     sha256sum araseo.exe araseo | sed 's/$/\r/' > SHA256SUMS
 )
 
+# A WSL interop process can consume the stdin that sh is using as its script.
+# Exercise the documented curl | sh invocation with a fake PowerShell that
+# fails if it receives any of that input.
+fake_bin=$test_root/fake-bin
+mkdir -p "$fake_bin"
+cat > "$fake_bin/powershell.exe" <<'EOF'
+#!/bin/sh
+if IFS= read -r leaked_line; then
+    echo "PowerShell consumed installer input: $leaked_line" >&2
+    exit 1
+fi
+printf 'C:\\Users\\Test\\AppData\\Local\r\n'
+EOF
+cat > "$fake_bin/wslpath" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$ARASEO_TEST_LOCAL_APP_DATA"
+EOF
+chmod +x "$fake_bin/powershell.exe" "$fake_bin/wslpath"
+piped_install_directory=$test_root/windows/Programs/Araseo
+piped_bin_directory=$test_root/piped-bin
+curl -fsSL "file://$repository_root/scripts/install.sh" | \
+    PATH="$fake_bin:$PATH" \
+    ARASEO_TEST_LOCAL_APP_DATA=$test_root/windows \
+    ARASEO_INSTALL_DIR= \
+    ARASEO_RELEASE_URL=file://$release_directory \
+    ARASEO_BIN_DIR=$piped_bin_directory \
+    XDG_CONFIG_HOME=$test_root/piped-config \
+    sh
+test -x "$piped_install_directory/araseo.exe"
+test -x "$piped_bin_directory/araseo"
+
 ARASEO_RELEASE_URL=file://$release_directory \
 ARASEO_INSTALL_DIR=$install_directory \
 ARASEO_BIN_DIR=$bin_directory \

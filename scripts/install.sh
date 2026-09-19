@@ -13,7 +13,7 @@ Install or update Araseo for the current WSL user. By default, the newest
 stable GitHub release is installed.
 
 Options:
-  --version TAG  Install a specific release, for example v0.1.4
+  --version TAG  Install a specific release, for example v0.1.5
   --uninstall    Remove Araseo from the current Windows and WSL user
   -h, --help     Show this help
 EOF
@@ -60,7 +60,7 @@ windows_install_directory() {
 
     windows_local_app_data=$(powershell.exe -NoProfile -NonInteractive -Command \
         '[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)' \
-        2>/dev/null | tr -d '\r' | sed -n '1p')
+        </dev/null 2>/dev/null | tr -d '\r' | sed -n '1p')
     [ -n "$windows_local_app_data" ] || {
         echo "Windows returned an empty LocalAppData path." >&2
         exit 1

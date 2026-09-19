@@ -17,7 +17,7 @@ find_installed_executable() {
     if command -v powershell.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
         windows_local_app_data=$(powershell.exe -NoProfile -NonInteractive -Command \
             '[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)' \
-            2>/dev/null | tr -d '\r' | sed -n '1p')
+            </dev/null 2>/dev/null | tr -d '\r' | sed -n '1p')
         if [ -n "$windows_local_app_data" ]; then
             local_app_data=$(wslpath -u "$windows_local_app_data")
             printf '%s/Programs/Araseo/araseo.exe\n' "$local_app_data"
