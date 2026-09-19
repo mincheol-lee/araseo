@@ -68,6 +68,36 @@ pub fn delete_entry(workspace: &Workspace, path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn rename_entry(workspace: &Workspace, path: &Path, new_name: &str) -> Result<PathBuf> {
+    validate_entry_name(new_name)?;
+    if path == workspace.linux_root {
+        bail!("the workspace root cannot be renamed");
+    }
+    let parent = path.parent().context("the file tree item has no parent")?;
+    let destination = parent.join(new_name);
+    let source_host = workspace.host_path(path)?;
+    fs::symlink_metadata(&source_host)
+        .with_context(|| format!("cannot access {}", path.display()))?;
+    if destination == path {
+        return Ok(destination);
+    }
+    let destination_host = workspace.host_path(&destination)?;
+    match fs::symlink_metadata(&destination_host) {
+        Ok(_) => bail!("a file or folder named {new_name} already exists"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("cannot check the new name"),
+    }
+    fs::rename(&source_host, &destination_host).with_context(|| {
+        format!("cannot rename {} to {}", path.display(), destination.display())
+    })?;
+    Ok(destination)
+}
+
+pub fn rebased_path(path: &Path, from: &Path, to: &Path) -> PathBuf {
+    path.strip_prefix(from)
+        .map_or_else(|_| path.to_path_buf(), |relative| to.join(relative))
+}
+
 pub fn copy_external_file(
     workspace: &Workspace,
     target_directory: &Path,
@@ -391,6 +421,65 @@ mod tests {
         assert!(!folder.exists());
         assert!(delete_entry(&workspace, &root).is_err());
         assert_eq!(linux_path_text(Path::new(r"/work\nested\file.rs")), "/work/nested/file.rs");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renames_files_and_folders_without_overwriting_or_escaping_workspace() {
+        let root = temporary_directory("rename");
+        fs::create_dir_all(root.join("folder/nested")).unwrap();
+        fs::write(root.join("folder/nested/한글.txt"), "original").unwrap();
+        fs::write(root.join("folder/nested/occupied.txt"), "other").unwrap();
+        fs::write(root.join("occupied.txt"), "keep").unwrap();
+        let workspace = Workspace::new("Ubuntu", root.clone()).unwrap();
+
+        let original = root.join("folder/nested/한글.txt");
+        assert!(rename_entry(&workspace, &original, "occupied.txt").is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("folder/nested/occupied.txt")).unwrap(),
+            "other"
+        );
+        let renamed_file = rename_entry(&workspace, &original, "renamed.txt").unwrap();
+        assert_eq!(fs::read_to_string(&renamed_file).unwrap(), "original");
+        assert!(rename_entry(&workspace, &renamed_file, "../escape").is_err());
+        assert!(rename_entry(&workspace, &renamed_file, "").is_err());
+        assert!(rename_entry(&workspace, &renamed_file, "renamed.txt ").is_err());
+        assert_eq!(
+            rename_entry(&workspace, &renamed_file, "renamed.txt").unwrap(),
+            renamed_file
+        );
+        assert!(rename_entry(&workspace, &root.join("occupied.txt"), "folder").is_err());
+        assert_eq!(fs::read_to_string(root.join("occupied.txt")).unwrap(), "keep");
+
+        let old_folder = root.join("folder");
+        let mut document =
+            crate::document::Document::open(renamed_file.clone(), renamed_file.clone()).unwrap();
+        document.set_text("edited while open".into());
+        let new_folder = rename_entry(&workspace, &old_folder, "renamed folder").unwrap();
+        assert_eq!(new_folder, root.join("renamed folder"));
+        assert_eq!(
+            fs::read_to_string(new_folder.join("nested/renamed.txt")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            rebased_path(&renamed_file, &old_folder, &new_folder),
+            new_folder.join("nested/renamed.txt")
+        );
+        document.linux_path = rebased_path(&document.linux_path, &old_folder, &new_folder);
+        document.host_path = rebased_path(&document.host_path, &old_folder, &new_folder);
+        document.save(false).unwrap();
+        assert_eq!(
+            fs::read_to_string(&document.host_path).unwrap(),
+            "edited while open"
+        );
+        assert_eq!(document.title(), "renamed.txt");
+        assert_eq!(
+            rebased_path(&root.join("occupied.txt"), &old_folder, &new_folder),
+            root.join("occupied.txt")
+        );
+        assert!(rename_entry(&workspace, &root, "outside").is_err());
+        assert!(rename_entry(&workspace, &root.join("missing"), "other").is_err());
+
         fs::remove_dir_all(root).unwrap();
     }
 
