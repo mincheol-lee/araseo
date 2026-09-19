@@ -3,7 +3,41 @@ set -eu
 
 script_path=$(readlink -f "$0")
 repository_root=$(dirname "$(dirname "$script_path")")
-araseo_executable=${ARASEO_EXE:-${AIDE_EXE:-$repository_root/dist/araseo.exe}}
+config_file=${ARASEO_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/araseo/executable}
+
+find_installed_executable() {
+    if [ -r "$config_file" ]; then
+        IFS= read -r configured_executable < "$config_file"
+        if [ -n "$configured_executable" ]; then
+            printf '%s\n' "$configured_executable"
+            return
+        fi
+    fi
+
+    if command -v powershell.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+        windows_local_app_data=$(powershell.exe -NoProfile -NonInteractive -Command \
+            '[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)' \
+            2>/dev/null | tr -d '\r' | sed -n '1p')
+        if [ -n "$windows_local_app_data" ]; then
+            local_app_data=$(wslpath -u "$windows_local_app_data")
+            printf '%s/Programs/Araseo/araseo.exe\n' "$local_app_data"
+            return
+        fi
+    fi
+
+    printf '%s\n' "$repository_root/dist/araseo.exe"
+}
+
+if [ -n "${ARASEO_EXE:-}" ]; then
+    araseo_executable=$ARASEO_EXE
+elif [ -n "${AIDE_EXE:-}" ]; then
+    araseo_executable=$AIDE_EXE
+elif [ -f "$repository_root/dist/araseo.exe" ]; then
+    # Preserve the repository-local behavior used by development symlinks.
+    araseo_executable=$repository_root/dist/araseo.exe
+else
+    araseo_executable=$(find_installed_executable)
+fi
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     printf '%s\n' 'Usage: araseo [PATH]'

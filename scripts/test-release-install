@@ -1,0 +1,70 @@
+#!/bin/sh
+set -eu
+
+repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/araseo-release-test.XXXXXX")
+cleanup() {
+    rm -rf -- "$test_root"
+}
+trap cleanup EXIT HUP INT TERM
+
+release_directory=$test_root/release
+install_directory=$test_root/windows/Araseo
+bin_directory=$test_root/bin
+config_home=$test_root/config
+workspace="$test_root/workspace/with spaces"
+mkdir -p "$release_directory" "$workspace"
+
+cat > "$release_directory/araseo.exe" <<'EOF'
+#!/bin/sh
+printf '<%s>\n' "$@"
+EOF
+chmod +x "$release_directory/araseo.exe"
+cp "$repository_root/scripts/araseo" "$release_directory/araseo"
+chmod +x "$release_directory/araseo"
+(
+    cd "$release_directory"
+    sha256sum araseo.exe araseo > SHA256SUMS
+)
+
+ARASEO_RELEASE_URL=file://$release_directory \
+ARASEO_INSTALL_DIR=$install_directory \
+ARASEO_BIN_DIR=$bin_directory \
+XDG_CONFIG_HOME=$config_home \
+    "$repository_root/scripts/install.sh"
+
+test -x "$install_directory/araseo.exe"
+test -x "$bin_directory/araseo"
+test "$(cat "$config_home/araseo/executable")" = "$install_directory/araseo.exe"
+
+installed_checksum=$(sha256sum "$install_directory/araseo.exe")
+printf '%s\n' 'corrupt download' >> "$release_directory/araseo.exe"
+if ARASEO_RELEASE_URL=file://$release_directory \
+    ARASEO_INSTALL_DIR=$install_directory \
+    ARASEO_BIN_DIR=$bin_directory \
+    XDG_CONFIG_HOME=$config_home \
+    "$repository_root/scripts/install.sh" >/dev/null 2>&1; then
+    echo "Installer accepted an asset with the wrong checksum." >&2
+    exit 1
+fi
+test "$(sha256sum "$install_directory/araseo.exe")" = "$installed_checksum"
+
+actual=$(XDG_CONFIG_HOME=$config_home WSL_DISTRO_NAME=TestDistro \
+    "$bin_directory/araseo" "$workspace")
+expected=$(printf '%s\n' \
+    '<--distro>' '<TestDistro>' '<--root>' "<$workspace>")
+test "$actual" = "$expected"
+
+version_output=$(XDG_CONFIG_HOME=$config_home "$bin_directory/araseo" --version)
+test "$version_output" = '<--version>'
+
+ARASEO_INSTALL_DIR=$install_directory \
+ARASEO_BIN_DIR=$bin_directory \
+XDG_CONFIG_HOME=$config_home \
+    "$repository_root/scripts/install.sh" --uninstall
+
+test ! -e "$install_directory/araseo.exe"
+test ! -e "$bin_directory/araseo"
+test ! -e "$config_home/araseo/executable"
+
+echo "Release installer and WSL launcher tests passed."

@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Linux and Windows targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install system and Rust target dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libfontconfig1 mingw-w64
+          rustup target add x86_64-pc-windows-gnu
+      - name: Run required verification
+        run: ./scripts/verify --windows
+
+  build:
+    name: Build Windows release
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check tag and Cargo versions
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}" -replace '^v', ''
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $cargoVersion = ($metadata.packages | Where-Object name -eq araseo).version
+          if ($tagVersion -ne $cargoVersion) {
+            throw "Tag version '$tagVersion' does not match Cargo version '$cargoVersion'."
+          }
+      - name: Build executable
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Assemble release assets
+        shell: pwsh
+        run: |
+          $stage = Join-Path $PWD "release-stage"
+          $archive = Join-Path $PWD "release-archive"
+          New-Item -ItemType Directory -Force -Path $stage, $archive | Out-Null
+          Copy-Item dist/araseo.exe, scripts/araseo, scripts/install.sh, README.md, INSTALL.md, LICENSE -Destination $archive
+          Copy-Item dist/araseo.exe, scripts/araseo, scripts/install.sh -Destination $stage
+          Compress-Archive -Path "$archive/*" -DestinationPath "$stage/araseo-windows-x86_64.zip"
+          Push-Location $stage
+          Get-ChildItem -File | Where-Object Name -ne SHA256SUMS | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Add-Content -Encoding ascii SHA256SUMS
+          }
+          Pop-Location
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: release-stage/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-assets
+          path: release-assets
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          case "$RELEASE_TAG" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Araseo $RELEASE_TAG" \
+              --generate-notes \
+              --verify-tag \
+              "${prerelease[@]}"
+          fi

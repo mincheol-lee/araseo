@@ -49,6 +49,20 @@ it excludes document edits, rendering, and eventual background highlighting.
 
 The product specification is in [docs/PRD.md](docs/PRD.md).
 
+## Installation
+
+From WSL, install the newest release with:
+
+```bash
+curl -fsSL https://github.com/mincheol-lee/araseo/releases/latest/download/install.sh | sh
+araseo .
+```
+
+The same command updates an existing installation. It installs the native
+executable under Windows LocalAppData and the `araseo` command under
+`~/.local/bin`. See [INSTALL.md](INSTALL.md) for pinned versions, manual
+installation, checksum verification, and removal instructions.
+
 ## Development
 
 Prerequisites:
@@ -65,7 +79,9 @@ Build the native application on Windows:
 
 This produces `dist/araseo.exe`.
 
-Install `target/release/araseo.exe` somewhere on the Windows `PATH`, then place `scripts/araseo` on the WSL `PATH`. If the executable is not named or located as expected, set `ARASEO_EXE` in WSL to its interop path:
+For a development checkout, put `scripts/araseo` on the WSL `PATH`; the launcher
+will use `dist/araseo.exe`. If the executable is elsewhere, set `ARASEO_EXE` in
+WSL to its interop path:
 
 ```bash
 export ARASEO_EXE=/mnt/c/Tools/Araseo/araseo.exe
@@ -80,7 +96,7 @@ Ubuntu development builds require Fontconfig and pkg-config headers:
 sudo apt install pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev
 ```
 
-Run the headless verification harness after a change:
+Run the headless verification harness and release-script tests after a change:
 
 ```bash
 ./scripts/verify
@@ -106,6 +122,9 @@ for the Windows target:
 ```
 
 `scripts/build-windows.ps1` runs the headless harness automatically before it
-creates `dist/araseo.exe`.
+creates `dist/araseo.exe`. Pushing a version tag such as `v0.1.0` runs both
+verification modes, builds the Windows executable, checks that the tag matches
+the Cargo package version, and publishes the GitHub Release assets. Tags with a
+pre-release suffix, such as `v0.2.0-beta.1`, create a GitHub pre-release.
 
 Use **Aa** in the status bar to change terminal, file viewer, and file list font sizes and brightness independently. **Reset** restores the Orca-matched defaults (14, 14, and 12 px at 120% brightness). Settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or `$XDG_CONFIG_HOME/araseo/fonts.conf` (default `~/.config/araseo/fonts.conf`) on Linux.
