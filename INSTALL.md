@@ -28,7 +28,7 @@ To install a particular version, pass its Git tag:
 
 ```sh
 curl -fsSL https://github.com/mincheol-lee/araseo/releases/latest/download/install.sh \
-  | sh -s -- --version v0.1.5
+  | sh -s -- --version v0.1.6
 ```
 
 ## Manual portable installation
