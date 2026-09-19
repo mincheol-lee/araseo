@@ -55,10 +55,11 @@ jobs:
           Copy-Item dist/araseo.exe, scripts/araseo, scripts/install.sh -Destination $stage
           Compress-Archive -Path "$archive/*" -DestinationPath "$stage/araseo-windows-x86_64.zip"
           Push-Location $stage
-          Get-ChildItem -File | Where-Object Name -ne SHA256SUMS | ForEach-Object {
+          $hashLines = Get-ChildItem -File | Where-Object Name -ne SHA256SUMS | ForEach-Object {
             $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
-            "$hash  $($_.Name)" | Add-Content -Encoding ascii SHA256SUMS
+            "$hash  $($_.Name)"
           }
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS'), (($hashLines -join "`n") + "`n"), [System.Text.Encoding]::ASCII)
           Pop-Location
       - uses: actions/upload-artifact@v7
         with:

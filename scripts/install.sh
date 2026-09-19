@@ -13,7 +13,7 @@ Install or update Araseo for the current WSL user. By default, the newest
 stable GitHub release is installed.
 
 Options:
-  --version TAG  Install a specific release, for example v0.1.0
+  --version TAG  Install a specific release, for example v0.1.3
   --uninstall    Remove Araseo from the current Windows and WSL user
   -h, --help     Show this help
 EOF
@@ -117,7 +117,7 @@ done
 
 verify_asset() {
     asset=$1
-    expected=$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1; exit }' \
+    expected=$(awk -v asset="$asset" '{ sub(/\r$/, "", $2); if ($2 == asset || $2 == "*" asset) { print $1; exit } }' \
         "$temporary_directory/SHA256SUMS")
     if ! printf '%s\n' "$expected" | grep -Eq '^[0-9a-fA-F]{64}$'; then
         echo "No valid checksum found for $asset." >&2

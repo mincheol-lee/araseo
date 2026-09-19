@@ -34,7 +34,7 @@ cp "$repository_root/scripts/araseo" "$release_directory/araseo"
 chmod +x "$release_directory/araseo"
 (
     cd "$release_directory"
-    sha256sum araseo.exe araseo > SHA256SUMS
+    sha256sum araseo.exe araseo | sed 's/$/\r/' > SHA256SUMS
 )
 
 ARASEO_RELEASE_URL=file://$release_directory \
