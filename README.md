@@ -20,7 +20,7 @@ full-scale IDE.
 ## Current Features
 
 - Lazy, expandable file tree with context-aware icons
-- File-tree creation, confirmed deletion, path copying, Explorer file drops, terminal paste, and drag-to-terminal paths
+- File-tree creation, rename, confirmed deletion, path copying, Explorer file drops, terminal paste, and drag-to-terminal paths
 - Git status detection across multiple nested repositories
 - VS Code-style Git changes view with confirmed discard actions and side-by-side working-tree diffs
 - Unified file and terminal tabs, organized in Orca-style pane-local tab bars
@@ -122,7 +122,7 @@ for the Windows target:
 ```
 
 `scripts/build-windows.ps1` runs the headless harness automatically before it
-creates `dist/araseo.exe`. Pushing a version tag such as `v0.1.0` runs both
+creates `dist/araseo.exe`. Pushing a version tag such as `v0.1.4` runs both
 verification modes, builds the Windows executable, checks that the tag matches
 the Cargo package version, and publishes the GitHub Release assets. Tags with a
 pre-release suffix, such as `v0.2.0-beta.1`, create a GitHub pre-release.

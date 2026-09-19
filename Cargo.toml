@@ -1,6 +1,6 @@
 [package]
 name = "araseo"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Araseo, a lightweight Windows editor for WSL workspaces"
 license = "MIT"
