@@ -43,6 +43,11 @@ jobs:
       - name: Assemble release assets
         shell: pwsh
         run: |
+          foreach ($script in @('scripts/araseo', 'scripts/install.sh')) {
+            if ([System.IO.File]::ReadAllBytes((Join-Path $PWD $script)) -contains 13) {
+              throw "$script contains CRLF line endings; release shell scripts must use LF."
+            }
+          }
           $stage = Join-Path $PWD "release-stage"
           $archive = Join-Path $PWD "release-archive"
           New-Item -ItemType Directory -Force -Path $stage, $archive | Out-Null
