@@ -214,6 +214,13 @@ mod tests {
                 is_directory,
             ));
         });
+        let tree_renames = Rc::new(RefCell::new(Vec::new()));
+        let observed_tree_renames = tree_renames.clone();
+        ui.on_tree_rename_requested(move |path, name| {
+            observed_tree_renames
+                .borrow_mut()
+                .push((path.to_string(), name.to_string()));
+        });
         let tree_deletes = Rc::new(RefCell::new(Vec::new()));
         let observed_tree_deletes = tree_deletes.clone();
         ui.on_tree_delete_requested(move |path| {
@@ -413,7 +420,7 @@ mod tests {
         });
         assert!(ui.get_tree_context_visible(), "right-click did not open the file-tree menu");
         write_snapshot_if_requested("file-tree-context-menu.png", &render(&window));
-        dispatch_click(&ui, 100.0, 181.0);
+        dispatch_click(&ui, 100.0, 211.0);
         assert_eq!(clipboard.borrow().as_str(), "/workspace/local-project");
         assert_eq!(
             copied_tree_paths.borrow().last().map(String::as_str),
@@ -445,13 +452,69 @@ mod tests {
             position: LogicalPosition::new(60.0, 76.0),
             button: PointerEventButton::Right,
         });
-        dispatch_click(&ui, 100.0, 211.0);
+        dispatch_click(&ui, 100.0, 181.0);
+        assert!(ui.get_tree_rename_visible(), "Rename did not open the dialog");
+        assert!(ui.get_tree_rename_is_directory());
+        assert_eq!(ui.get_tree_rename_name().as_str(), "local-project");
+        ui.set_tree_rename_name("renamed-project".into());
+        render(&window);
+        dispatch_click(&ui, 760.0, 451.0);
+        assert_eq!(
+            tree_renames.borrow().last(),
+            Some(&("/workspace/local-project".to_string(), "renamed-project".to_string())),
+            "folder rename request was not forwarded"
+        );
+
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_click(&ui, 100.0, 241.0);
         assert!(ui.get_tree_delete_visible(), "Delete did not require confirmation");
         dispatch_click(&ui, 748.0, 451.0);
         assert_eq!(
             tree_deletes.borrow().last().map(String::as_str),
             Some("/workspace/local-project"),
             "confirmed file-tree deletion was not forwarded"
+        );
+
+        ui.set_tree_entries(ModelRc::new(VecModel::from(vec![
+            ui.get_tree_entries().row_data(0).unwrap(),
+            TreeEntry {
+                name: "sample.js".into(),
+                path: "/workspace/sample.js".into(),
+                icon: slint::Image::default(),
+                icon_label: "".into(),
+                depth: 0,
+                is_directory: false,
+                is_expanded: false,
+                git_mark: "".into(),
+                project_kind: "".into(),
+            },
+        ])));
+        render(&window);
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 101.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 101.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_click(&ui, 100.0, 206.0);
+        assert!(ui.get_tree_rename_visible() && !ui.get_tree_rename_is_directory());
+        assert_eq!(ui.get_tree_rename_name().as_str(), "sample.js");
+        ui.set_tree_rename_name("renamed.js".into());
+        render(&window);
+        dispatch_click(&ui, 760.0, 451.0);
+        assert_eq!(
+            tree_renames.borrow().last(),
+            Some(&("/workspace/sample.js".to_string(), "renamed.js".to_string())),
+            "file rename request was not forwarded"
         );
 
         let before_close_hover = render(&window);

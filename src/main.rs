@@ -61,6 +61,12 @@ enum TreeActionResult {
         is_directory: bool,
     },
     Deleted(PathBuf),
+    Renamed {
+        from: PathBuf,
+        to: PathBuf,
+        from_host: PathBuf,
+        to_host: PathBuf,
+    },
     Copied {
         path: PathBuf,
         parent: PathBuf,
@@ -265,6 +271,38 @@ fn main() -> Result<()> {
                 } else {
                     state.status = "The selected file tree item is no longer available".into();
                 }
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_tree_rename_requested(move |path, new_name| {
+            let mut state = state.borrow_mut();
+            if state.tree_action_pending {
+                state.status = "A file tree action is already running".into();
+            } else if let Some(node) = tree_node_for_ui_path(&state, path.as_str()) {
+                let workspace = state.workspace.clone();
+                let from = node.linux_path;
+                let name = new_name.to_string();
+                state.tree_action_pending = true;
+                state.status = format!("Renaming {}...", from.display());
+                state.tree_action_loader.request(move || {
+                    let from_host = workspace.host_path(&from)?;
+                    let to = tree::rename_entry(&workspace, &from, &name)?;
+                    let to_host = from_host.with_file_name(&name);
+                    Ok(TreeActionResult::Renamed {
+                        from,
+                        to,
+                        from_host,
+                        to_host,
+                    })
+                });
+            } else {
+                state.status = "The selected file tree item is no longer available".into();
             }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
@@ -768,6 +806,57 @@ fn main() -> Result<()> {
                         }
                         state.status = format!("Deleted {}", path.display());
                     }
+                    Ok(TreeActionResult::Renamed {
+                        from,
+                        to,
+                        from_host,
+                        to_host,
+                    }) => {
+                        state.file_loader.cancel();
+                        state.diff_loader.cancel();
+                        close_diff_tabs_at_or_below(&mut state, &from);
+                        state.expanded = state
+                            .expanded
+                            .iter()
+                            .map(|path| tree::rebased_path(path, &from, &to))
+                            .collect();
+                        state.expanded_git_repositories = state
+                            .expanded_git_repositories
+                            .iter()
+                            .map(|path| tree::rebased_path(path, &from, &to))
+                            .collect();
+                        state.repositories = state
+                            .repositories
+                            .iter()
+                            .map(|path| tree::rebased_path(path, &from, &to))
+                            .collect();
+                        for node in &mut state.tree {
+                            if node.linux_path == from {
+                                node.name = to
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned();
+                            }
+                            node.linux_path = tree::rebased_path(&node.linux_path, &from, &to);
+                        }
+                        for tab in &mut state.tabs {
+                            if let TabContent::File(document) = &mut tab.content {
+                                document.linux_path =
+                                    tree::rebased_path(&document.linux_path, &from, &to);
+                                document.host_path = tree::rebased_path(
+                                    &document.host_path,
+                                    &from_host,
+                                    &to_host,
+                                );
+                            }
+                        }
+                        refresh_tree(&mut state);
+                        if let Some(monitor) = state.git_monitor.as_mut() {
+                            let _ = monitor.force_refresh();
+                        }
+                        state.status = format!("Renamed {} to {}", from.display(), to.display());
+                    }
                     Ok(TreeActionResult::Copied { path, parent }) => {
                         state.expanded.insert(parent);
                         refresh_tree(&mut state);
@@ -1214,6 +1303,23 @@ fn close_diff_tabs(state: &mut AppState, path: &std::path::Path) {
         .iter()
         .filter_map(|tab| match &tab.content {
             TabContent::Diff(diff) if diff.path == path => Some(tab.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for tab_id in tab_ids {
+        state.tab_groups.remove(tab_id);
+        if let Some(index) = state.tabs.iter().position(|tab| tab.id == tab_id) {
+            state.tabs.remove(index);
+        }
+    }
+}
+
+fn close_diff_tabs_at_or_below(state: &mut AppState, path: &std::path::Path) {
+    let tab_ids = state
+        .tabs
+        .iter()
+        .filter_map(|tab| match &tab.content {
+            TabContent::Diff(diff) if diff.path.starts_with(path) => Some(tab.id),
             _ => None,
         })
         .collect::<Vec<_>>();

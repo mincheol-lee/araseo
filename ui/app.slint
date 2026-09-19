@@ -918,6 +918,15 @@ export component AppWindow inherits Window {
         );
     }
 
+    function submit-tree-rename() {
+        if (root.tree-rename-name == "" || root.tree-rename-name == root.tree-rename-original-name
+            || root.tree-action-pending) {
+            return;
+        }
+        root.tree-rename-visible = false;
+        root.tree-rename-requested(root.tree-rename-path, root.tree-rename-name);
+    }
+
     in property <string> workspace-name: "No workspace";
     in property <[TreeEntry]> tree-entries;
     in property <[GitEntry]> git-entries;
@@ -1006,6 +1015,11 @@ export component AppWindow inherits Window {
     in-out property <bool> tree-create-is-directory: false;
     in-out property <string> tree-create-target: "";
     in-out property <string> tree-create-name: "";
+    in-out property <bool> tree-rename-visible: false;
+    in-out property <string> tree-rename-path: "";
+    in-out property <string> tree-rename-original-name: "";
+    in-out property <string> tree-rename-name: "";
+    in-out property <bool> tree-rename-is-directory: false;
     in-out property <bool> tree-delete-visible: false;
     in-out property <string> tree-delete-path: "";
     in-out property <string> tree-delete-name: "";
@@ -1042,6 +1056,7 @@ export component AppWindow inherits Window {
 
     callback tree-activated(int);
     callback tree-create-requested(string, string, bool);
+    callback tree-rename-requested(string, string);
     callback tree-delete-requested(string);
     callback tree-path-copied(string);
     callback git-repository-toggled(string);
@@ -1396,7 +1411,7 @@ export component AppWindow inherits Window {
                                             root.tree-context-is-directory = entry.is-directory;
                                             root.tree-context-x = min(root.width - 198px,
                                                 self.absolute-position.x + self.mouse-x);
-                                            root.tree-context-y = min(root.height - 166px,
+                                            root.tree-context-y = min(root.height - 196px,
                                                 self.absolute-position.y + self.mouse-y);
                                             root.tree-context-visible = true;
                                         } else if (event.kind == PointerEventKind.up && self.drag-armed) {
@@ -1933,7 +1948,7 @@ export component AppWindow inherits Window {
             x: root.tree-context-x;
             y: root.tree-context-y;
             width: 198px;
-            height: 158px;
+            height: 188px;
             background: #252526;
             border-color: #454545;
             border-width: 1px;
@@ -1981,6 +1996,22 @@ export component AppWindow inherits Window {
                             root.tree-create-name = "";
                             root.tree-create-is-directory = true;
                             root.tree-create-visible = true;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 30px;
+                    background: context-rename-touch.has-hover ? #094771 : transparent;
+                    Text { text: "Rename"; color: #f0f0f0; x: 8px; vertical-alignment: center; }
+                    context-rename-touch := TouchArea {
+                        enabled: !root.tree-action-pending;
+                        clicked => {
+                            root.tree-context-visible = false;
+                            root.tree-rename-path = root.tree-context-path;
+                            root.tree-rename-original-name = root.tree-context-name;
+                            root.tree-rename-name = root.tree-context-name;
+                            root.tree-rename-is-directory = root.tree-context-is-directory;
+                            root.tree-rename-visible = true;
                         }
                     }
                 }
@@ -2066,6 +2097,7 @@ export component AppWindow inherits Window {
             opacity: 0.55;
             TouchArea { clicked => { root.tree-delete-visible = false; } }
         }
+
         if root.tree-delete-visible: Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
@@ -2099,6 +2131,52 @@ export component AppWindow inherits Window {
                             root.tree-delete-visible = false;
                             root.tree-delete-requested(root.tree-delete-path);
                         }
+                    }
+                }
+            }
+        }
+
+        if root.tree-rename-visible: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #000000;
+            opacity: 0.55;
+            TouchArea { clicked => { root.tree-rename-visible = false; } }
+        }
+        if root.tree-rename-visible: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 420px;
+            height: 172px;
+            background: #252526;
+            border-color: #454545;
+            border-width: 1px;
+            border-radius: 5px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text {
+                    text: root.tree-rename-is-directory ? "Rename Folder" : "Rename File";
+                    color: #f0f0f0;
+                    font-size: 15px;
+                    font-weight: 600;
+                }
+                LineEdit {
+                    text <=> root.tree-rename-name;
+                    placeholder-text: "New name";
+                    horizontal-stretch: 1;
+                    accepted => { root.submit-tree-rename(); }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.tree-rename-visible = false; } }
+                    Button {
+                        text: "Rename";
+                        enabled: root.tree-rename-name != ""
+                            && root.tree-rename-name != root.tree-rename-original-name
+                            && !root.tree-action-pending;
+                        clicked => { root.submit-tree-rename(); }
                     }
                 }
             }
