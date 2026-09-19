@@ -22,6 +22,24 @@ export struct TabEntry {
     dirty: bool,
 }
 
+export struct DividerEntry {
+    id: int,
+    horizontal: bool,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+}
+
+export struct DockTarget {
+    group: int,
+    zone: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+}
+
 export struct TerminalCell {
     row: int,
     column: int,
@@ -55,6 +73,35 @@ export struct DiffRow {
     new-highlighted-enabled: bool,
     old-kind: string,
     new-kind: string,
+}
+
+export struct PaneEntry {
+    group: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    visible: bool,
+    tabs: [TabEntry],
+    active-tab-id: int,
+    active-kind: string,
+    active-title: string,
+    active-detail: string,
+    editor-text: string,
+    highlighted-text: styled-text,
+    syntax-highlight-enabled: bool,
+    editor-cursor-offset: int,
+    editor-cursor-generation: int,
+    line-numbers: string,
+    diff-rows: [DiffRow],
+    diff-old-title: string,
+    diff-new-title: string,
+    terminal-cells: [TerminalCell],
+    terminal-grid-columns: int,
+    terminal-grid-rows: int,
+    terminal-cursor-row: int,
+    terminal-cursor-column: int,
+    terminal-update-generation: int,
 }
 
 component DiffCell inherits Rectangle {
@@ -140,6 +187,12 @@ component WorkspaceGroup inherits Rectangle {
     callback window-maximize-requested();
     in property <[TabEntry]> tabs;
     in property <bool> focused: false;
+    in property <int> focus-generation: 0;
+    changed focus-generation => {
+        if (root.focused && root.active-kind == "terminal") {
+            root.focus-terminal();
+        }
+    }
     in property <int> active-tab-id: -1;
     in property <string> active-kind: "";
     in property <string> active-title: "";
@@ -1011,6 +1064,10 @@ export component AppWindow inherits Window {
     in-out property <length> tree-drag-y: 0px;
     in-out property <int> tree-drop-terminal-id: -1;
     private property <int> tree-drop-group: -1;
+    private property <float> tree-drop-x: 0;
+    private property <float> tree-drop-y: 0;
+    private property <float> tree-drop-width: 0;
+    private property <float> tree-drop-height: 0;
     in-out property <bool> tree-create-visible: false;
     in-out property <bool> tree-create-is-directory: false;
     in-out property <string> tree-create-target: "";
@@ -1024,12 +1081,22 @@ export component AppWindow inherits Window {
     in-out property <string> tree-delete-path: "";
     in-out property <string> tree-delete-name: "";
     in-out property <bool> find-visible: false;
+    private property <int> extra-selection-length: 0;
+    private property <bool> extra-copy-feedback-active: false;
     out property <int> editor-selection-length: root.focused-group == 1
         ? (root.secondary-active-kind == "file" ? secondary-view.editor-selection-length : 0)
-        : (root.primary-active-kind == "file" ? primary-view.editor-selection-length : 0);
+        : (root.focused-group == 0
+            ? (root.primary-active-kind == "file" ? primary-view.editor-selection-length : 0)
+            : (root.focused-group - 2 < root.extra-panes.length
+                && root.extra-panes[root.focused-group - 2].active-kind == "file"
+                ? root.extra-selection-length : 0));
     out property <bool> copy-feedback-active: root.focused-group == 1
         ? (root.secondary-active-kind == "file" && secondary-view.copy-feedback-active)
-        : (root.primary-active-kind == "file" && primary-view.copy-feedback-active);
+        : (root.focused-group == 0
+            ? (root.primary-active-kind == "file" && primary-view.copy-feedback-active)
+            : (root.focused-group - 2 < root.extra-panes.length
+                && root.extra-panes[root.focused-group - 2].active-kind == "file"
+                && root.extra-copy-feedback-active));
     out property <length> file-tree-x: 0px;
     out property <length> file-tree-y: 66px;
     out property <length> file-tree-width: root.sidebar-width;
@@ -1038,6 +1105,23 @@ export component AppWindow inherits Window {
     out property <length> file-tree-row-height: max(25px, root.tree-font-size * 1.7px);
     in-out property <int> workspace-layout: 0;
     in-out property <float> panel-split-ratio: 0.64;
+    in property <bool> dynamic-panes: false;
+    in property <[PaneEntry]> extra-panes;
+    in property <[DividerEntry]> pane-dividers;
+    in property <float> primary-layout-x: 0;
+    in property <float> primary-layout-y: 0;
+    in property <float> primary-layout-width: 1;
+    in property <float> primary-layout-height: 1;
+    in property <bool> primary-layout-visible: true;
+    in property <float> secondary-layout-x: 0;
+    in property <float> secondary-layout-y: 0;
+    in property <float> secondary-layout-width: 0;
+    in property <float> secondary-layout-height: 0;
+    in property <bool> secondary-layout-visible: false;
+    out property <length> workspace-area-x: workspace-area.absolute-position.x;
+    out property <length> workspace-area-y: workspace-area.absolute-position.y;
+    out property <length> workspace-area-width: workspace-area.width;
+    out property <length> workspace-area-height: workspace-area.height;
     out property <length> primary-group-x: primary-view.x;
     out property <length> primary-group-y: primary-view.y;
     out property <length> primary-group-width: primary-view.width;
@@ -1051,6 +1135,13 @@ export component AppWindow inherits Window {
     in-out property <length> sidebar-width: 250px;
     private property <int> dragging-tab: -1;
     private property <int> dock-preview: -1;
+    private property <int> dock-target-group: -1;
+    private property <float> dock-preview-x: 0;
+    private property <float> dock-preview-y: 0;
+    private property <float> dock-preview-width: 0;
+    private property <float> dock-preview-height: 0;
+    in property <int> maximized-pane: -1;
+    in-out property <int> terminal-focus-generation: 0;
     private property <int> restore-layout: 0;
     private property <bool> has-secondary-group: root.secondary-tabs.length > 0;
 
@@ -1079,10 +1170,20 @@ export component AppWindow inherits Window {
     callback terminal-output-ready(int);
     callback new-terminal-requested(int);
     callback tab-dock-requested(int, int);
+    callback pane-dock-requested(int, int, int);
+    callback dock-target-requested(int, length, length) -> DockTarget;
+    callback pane-divider-dragged(int, length, length);
+    callback pane-terminal-size-changed(int, float, float);
+    callback pane-maximize-requested(int);
+    callback tree-target-requested(length, length) -> int;
     callback focused-group-changed(int);
     callback window-drag-requested();
 
     public function focus-terminal() {
+        if (root.dynamic-panes) {
+            root.terminal-focus-generation += 1;
+            return;
+        }
         if (root.focused-group == 1) {
             secondary-view.focus-terminal();
         } else {
@@ -1091,6 +1192,10 @@ export component AppWindow inherits Window {
     }
 
     public function toggle-panel-maximize(panel: int) {
+        if (root.dynamic-panes) {
+            root.pane-maximize-requested(panel);
+            return;
+        }
         let maximized-layout = panel == 1 ? 5 : 4;
         if (root.workspace-layout == maximized-layout) {
             root.workspace-layout = root.restore-layout;
@@ -1104,6 +1209,16 @@ export component AppWindow inherits Window {
 
     function update-dock-preview(tab-id: int, x: length, y: length) {
         root.dragging-tab = tab-id;
+        if (root.dynamic-panes) {
+            let target = root.dock-target-requested(tab-id, x, y);
+            root.dock-target-group = target.group;
+            root.dock-preview = target.zone;
+            root.dock-preview-x = target.x;
+            root.dock-preview-y = target.y;
+            root.dock-preview-width = target.width;
+            root.dock-preview-height = target.height;
+            return;
+        }
         let local-x = x - workspace-area.absolute-position.x;
         let local-y = y - workspace-area.absolute-position.y;
         if (local-x < workspace-area.width * 0.25) {
@@ -1128,6 +1243,13 @@ export component AppWindow inherits Window {
             return;
         }
         let zone = root.dock-preview;
+        if (root.dynamic-panes) {
+            root.pane-dock-requested(tab-id, root.dock-target-group, zone);
+            root.dragging-tab = -1;
+            root.dock-preview = -1;
+            root.dock-target-group = -1;
+            return;
+        }
         if (zone == 0) { root.workspace-layout = 2; }
         else if (zone == 1) { root.workspace-layout = 3; }
         else if (zone == 2) { root.workspace-layout = 1; }
@@ -1140,6 +1262,7 @@ export component AppWindow inherits Window {
     function cancel-tab-drag() {
         root.dragging-tab = -1;
         root.dock-preview = -1;
+        root.dock-target-group = -1;
     }
 
     function update-tree-drag(path: string, name: string, x: length, y: length) {
@@ -1151,6 +1274,25 @@ export component AppWindow inherits Window {
         root.tree-drag-y = y;
         root.tree-drop-terminal-id = -1;
         root.tree-drop-group = -1;
+
+        if (root.dynamic-panes) {
+            let group = root.tree-target-requested(x, y);
+            if (group >= 0) {
+                root.tree-drop-group = group;
+                root.tree-drop-terminal-id = group == 0 ? root.primary-active-tab-id
+                    : (group == 1 ? root.secondary-active-tab-id
+                    : root.extra-panes[group - 2].active-tab-id);
+                root.tree-drop-x = group == 0 ? root.primary-layout-x
+                    : (group == 1 ? root.secondary-layout-x : root.extra-panes[group - 2].x);
+                root.tree-drop-y = group == 0 ? root.primary-layout-y
+                    : (group == 1 ? root.secondary-layout-y : root.extra-panes[group - 2].y);
+                root.tree-drop-width = group == 0 ? root.primary-layout-width
+                    : (group == 1 ? root.secondary-layout-width : root.extra-panes[group - 2].width);
+                root.tree-drop-height = group == 0 ? root.primary-layout-height
+                    : (group == 1 ? root.secondary-layout-height : root.extra-panes[group - 2].height);
+            }
+            return;
+        }
 
         let local-x = x - workspace-area.absolute-position.x;
         let local-y = y - workspace-area.absolute-position.y;
@@ -1634,8 +1776,10 @@ export component AppWindow inherits Window {
                 clip: true;
                 private property <length> divider-size: 6px;
                 private property <bool> vertical-split: root.has-secondary-group
+                    && !root.dynamic-panes
                     && (root.workspace-layout == 0 || root.workspace-layout == 1);
                 private property <bool> horizontal-split: root.has-secondary-group
+                    && !root.dynamic-panes
                     && (root.workspace-layout == 2 || root.workspace-layout == 3);
                 private property <length> primary-split-width: (self.width - self.divider-size) * root.panel-split-ratio;
                 private property <length> secondary-split-width: self.width - self.divider-size - self.primary-split-width;
@@ -1658,6 +1802,7 @@ export component AppWindow inherits Window {
                     group-id: 0;
                     tabs: root.primary-tabs;
                     focused: root.focused-group == 0;
+                    focus-generation: root.terminal-focus-generation;
                     active-tab-id: root.primary-active-tab-id;
                     active-kind: root.primary-active-kind;
                     active-title: root.primary-active-title;
@@ -1675,13 +1820,18 @@ export component AppWindow inherits Window {
                     terminal-cursor-row: root.terminal-cursor-row;
                     terminal-cursor-column: root.terminal-cursor-column;
                     terminal-update-generation <=> root.terminal-update-generation;
-                    x: root.workspace-layout == 2 && root.has-secondary-group
+                    x: root.dynamic-panes ? workspace-area.width * root.primary-layout-x
+                        : root.workspace-layout == 2 && root.has-secondary-group
                         ? workspace-area.secondary-split-width + workspace-area.divider-size : 0px;
-                    y: root.workspace-layout == 1 && root.has-secondary-group
+                    y: root.dynamic-panes ? workspace-area.height * root.primary-layout-y
+                        : root.workspace-layout == 1 && root.has-secondary-group
                         ? workspace-area.secondary-split-height + workspace-area.divider-size : 0px;
-                    width: workspace-area.horizontal-split ? workspace-area.primary-split-width : workspace-area.width;
-                    height: workspace-area.vertical-split ? workspace-area.primary-split-height : workspace-area.height;
-                    visible: !root.has-secondary-group || root.workspace-layout != 5;
+                    width: root.dynamic-panes ? workspace-area.width * root.primary-layout-width
+                        : (workspace-area.horizontal-split ? workspace-area.primary-split-width : workspace-area.width);
+                    height: root.dynamic-panes ? workspace-area.height * root.primary-layout-height
+                        : (workspace-area.vertical-split ? workspace-area.primary-split-height : workspace-area.height);
+                    visible: root.dynamic-panes ? root.primary-layout-visible
+                        : (!root.has-secondary-group || root.workspace-layout != 5);
 
                     editor-edited(text, tab-id) => { root.editor-edited(text, tab-id); }
                     editor-selection-changed(tab-id, anchor, cursor) => {
@@ -1730,6 +1880,7 @@ export component AppWindow inherits Window {
                     group-id: 1;
                     tabs: root.secondary-tabs;
                     focused: root.focused-group == 1;
+                    focus-generation: root.terminal-focus-generation;
                     active-tab-id: root.secondary-active-tab-id;
                     active-kind: root.secondary-active-kind;
                     active-title: root.secondary-active-title;
@@ -1747,13 +1898,18 @@ export component AppWindow inherits Window {
                     terminal-cursor-row: root.secondary-terminal-cursor-row;
                     terminal-cursor-column: root.secondary-terminal-cursor-column;
                     terminal-update-generation <=> root.secondary-terminal-update-generation;
-                    x: root.workspace-layout == 3
+                    x: root.dynamic-panes ? workspace-area.width * root.secondary-layout-x
+                        : root.workspace-layout == 3
                         ? workspace-area.primary-split-width + workspace-area.divider-size : 0px;
-                    y: root.workspace-layout == 0
+                    y: root.dynamic-panes ? workspace-area.height * root.secondary-layout-y
+                        : root.workspace-layout == 0
                         ? workspace-area.primary-split-height + workspace-area.divider-size : 0px;
-                    width: workspace-area.horizontal-split ? workspace-area.secondary-split-width : workspace-area.width;
-                    height: workspace-area.vertical-split ? workspace-area.secondary-split-height : workspace-area.height;
-                    visible: root.has-secondary-group && root.workspace-layout != 4;
+                    width: root.dynamic-panes ? workspace-area.width * root.secondary-layout-width
+                        : (workspace-area.horizontal-split ? workspace-area.secondary-split-width : workspace-area.width);
+                    height: root.dynamic-panes ? workspace-area.height * root.secondary-layout-height
+                        : (workspace-area.vertical-split ? workspace-area.secondary-split-height : workspace-area.height);
+                    visible: root.dynamic-panes ? root.secondary-layout-visible
+                        : (root.has-secondary-group && root.workspace-layout != 4);
 
                     editor-edited(text, tab-id) => { root.editor-edited(text, tab-id); }
                     editor-selection-changed(tab-id, anchor, cursor) => {
@@ -1778,6 +1934,94 @@ export component AppWindow inherits Window {
                     new-terminal-requested(group) => { root.new-terminal-requested(group); }
                     group-focused(group) => {
                         root.focused-group = group;
+                        root.focused-group-changed(group);
+                    }
+                    toggle-maximize(group) => { root.toggle-panel-maximize(group); }
+                    tab-drag-moved(tab-id, x, y) => { root.update-dock-preview(tab-id, x, y); }
+                    tab-drag-released(tab-id) => { root.finish-tab-drag(tab-id); }
+                    tab-drag-cancelled => { root.cancel-tab-drag(); }
+                }
+
+                for pane in root.extra-panes: WorkspaceGroup {
+                    x: workspace-area.width * pane.x;
+                    y: workspace-area.height * pane.y;
+                    width: workspace-area.width * pane.width;
+                    height: workspace-area.height * pane.height;
+                    visible: root.dynamic-panes && pane.visible;
+                    group-id: pane.group;
+                    terminal-font-size: root.terminal-font-size;
+                    editor-font-size: root.editor-font-size;
+                    terminal-font-brightness: root.terminal-font-brightness;
+                    editor-font-brightness: root.editor-font-brightness;
+                    title-row: self.y == 0px;
+                    caption-reserve: self.y == 0px
+                        ? max(0px, self.x + self.width - (workspace-area.width - 140px)) : 0px;
+                    tabs: pane.tabs;
+                    focused: root.focused-group == pane.group;
+                    focus-generation: root.terminal-focus-generation;
+                    changed editor-selection-length => {
+                        if (root.focused-group == pane.group) {
+                            root.extra-selection-length = self.editor-selection-length;
+                        }
+                    }
+                    changed copy-feedback-active => {
+                        if (root.focused-group == pane.group) {
+                            root.extra-copy-feedback-active = self.copy-feedback-active;
+                        }
+                    }
+                    active-tab-id: pane.active-tab-id;
+                    active-kind: pane.active-kind;
+                    active-title: pane.active-title;
+                    active-detail: pane.active-detail;
+                    editor-text <=> pane.editor-text;
+                    highlighted-text: pane.highlighted-text;
+                    syntax-highlight-enabled: pane.syntax-highlight-enabled;
+                    editor-cursor-offset: pane.editor-cursor-offset;
+                    editor-cursor-generation <=> pane.editor-cursor-generation;
+                    line-numbers: pane.line-numbers;
+                    find-visible: root.find-visible && root.focused-group == pane.group;
+                    diff-rows: pane.diff-rows;
+                    diff-old-title: pane.diff-old-title;
+                    diff-new-title: pane.diff-new-title;
+                    terminal-cells: pane.terminal-cells;
+                    terminal-grid-columns: pane.terminal-grid-columns;
+                    terminal-grid-rows: pane.terminal-grid-rows;
+                    terminal-cursor-row: pane.terminal-cursor-row;
+                    terminal-cursor-column: pane.terminal-cursor-column;
+                    terminal-update-generation <=> pane.terminal-update-generation;
+                    changed terminal-columns => {
+                        root.pane-terminal-size-changed(pane.group, self.terminal-rows, self.terminal-columns);
+                    }
+                    changed terminal-rows => {
+                        root.pane-terminal-size-changed(pane.group, self.terminal-rows, self.terminal-columns);
+                    }
+                    window-drag-requested => { root.window-drag-requested(); }
+                    window-maximize-requested => { root.maximized = !root.maximized; }
+                    editor-edited(text, tab-id) => { root.editor-edited(text, tab-id); }
+                    editor-selection-changed(tab-id, anchor, cursor) => {
+                        if (root.focused-group == pane.group) { root.editor-selection-changed(anchor, cursor); }
+                    }
+                    undo-requested(tab-id) => { root.undo-requested(tab-id); }
+                    redo-requested(tab-id) => { root.redo-requested(tab-id); }
+                    save-requested(tab-id) => { root.save-requested(tab-id); }
+                    find-requested(tab-id, query) => { root.find-requested(tab-id, query); }
+                    find-visibility-requested(group, visible) => {
+                        root.focused-group = group;
+                        root.find-visible = visible;
+                        root.focused-group-changed(group);
+                    }
+                    terminal-key(tab-id, text, control, alt, shift) => {
+                        root.terminal-key(tab-id, text, control, alt, shift);
+                    }
+                    terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
+                    terminal-scrollback(tab-id, rows) => { root.terminal-scrollback(tab-id, rows); }
+                    tab-activated(tab-id) => { root.tab-activated(tab-id); }
+                    tab-close(tab-id) => { root.tab-close(tab-id); }
+                    new-terminal-requested(group) => { root.new-terminal-requested(group); }
+                    group-focused(group) => {
+                        root.focused-group = group;
+                        root.extra-selection-length = self.editor-selection-length;
+                        root.extra-copy-feedback-active = self.copy-feedback-active;
                         root.focused-group-changed(group);
                     }
                     toggle-maximize(group) => { root.toggle-panel-maximize(group); }
@@ -1829,11 +2073,37 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                for divider in root.pane-dividers: Rectangle {
+                    visible: root.dynamic-panes;
+                    x: workspace-area.width * divider.x - (divider.horizontal ? 3px : 0px);
+                    y: workspace-area.height * divider.y - (divider.horizontal ? 0px : 3px);
+                    width: divider.horizontal ? 6px : workspace-area.width * divider.width;
+                    height: divider.horizontal ? workspace-area.height * divider.height : 6px;
+                    background: pane-divider-touch.pressed || pane-divider-touch.has-hover
+                        ? #5686b3 : #313640;
+                    pane-divider-touch := TouchArea {
+                        mouse-cursor: divider.horizontal ? ew-resize : ns-resize;
+                        moved => {
+                            if (self.pressed) {
+                                root.pane-divider-dragged(
+                                    divider.id,
+                                    self.absolute-position.x + self.mouse-x,
+                                    self.absolute-position.y + self.mouse-y
+                                );
+                            }
+                        }
+                    }
+                }
+
                 if root.tree-dragging && root.tree-drop-terminal-id >= 0: Rectangle {
-                    x: root.tree-drop-group == 1 ? secondary-view.x : primary-view.x;
-                    y: (root.tree-drop-group == 1 ? secondary-view.y : primary-view.y) + 36px;
-                    width: root.tree-drop-group == 1 ? secondary-view.width : primary-view.width;
-                    height: (root.tree-drop-group == 1 ? secondary-view.height : primary-view.height) - 36px;
+                    x: root.dynamic-panes ? workspace-area.width * root.tree-drop-x
+                        : (root.tree-drop-group == 1 ? secondary-view.x : primary-view.x);
+                    y: root.dynamic-panes ? workspace-area.height * root.tree-drop-y + 36px
+                        : (root.tree-drop-group == 1 ? secondary-view.y : primary-view.y) + 36px;
+                    width: root.dynamic-panes ? workspace-area.width * root.tree-drop-width
+                        : (root.tree-drop-group == 1 ? secondary-view.width : primary-view.width);
+                    height: root.dynamic-panes ? workspace-area.height * root.tree-drop-height - 36px
+                        : (root.tree-drop-group == 1 ? secondary-view.height : primary-view.height) - 36px;
                     background: #315f8a55;
                     border-width: 2px;
                     border-color: #79b8f3;
@@ -1850,17 +2120,21 @@ export component AppWindow inherits Window {
                 }
 
                 if root.dragging-tab >= 0 && root.dock-preview >= 0: Rectangle {
-                    x: root.dock-preview == 1 ? workspace-area.width / 2
+                    x: root.dynamic-panes ? workspace-area.width * root.dock-preview-x
+                        : root.dock-preview == 1 ? workspace-area.width / 2
                         : (root.dock-preview == 4 ? primary-view.x
                         : (root.dock-preview == 5 ? secondary-view.x : 0px));
-                    y: root.dock-preview == 3 ? workspace-area.height / 2
+                    y: root.dynamic-panes ? workspace-area.height * root.dock-preview-y
+                        : root.dock-preview == 3 ? workspace-area.height / 2
                         : (root.dock-preview == 4 ? primary-view.y
                         : (root.dock-preview == 5 ? secondary-view.y : 0px));
-                    width: root.dock-preview == 0 || root.dock-preview == 1
+                    width: root.dynamic-panes ? workspace-area.width * root.dock-preview-width
+                        : root.dock-preview == 0 || root.dock-preview == 1
                         ? workspace-area.width / 2
                         : (root.dock-preview == 4 ? primary-view.width
                         : (root.dock-preview == 5 ? secondary-view.width : workspace-area.width));
-                    height: root.dock-preview == 2 || root.dock-preview == 3
+                    height: root.dynamic-panes ? workspace-area.height * root.dock-preview-height
+                        : root.dock-preview == 2 || root.dock-preview == 3
                         ? workspace-area.height / 2
                         : (root.dock-preview == 4 ? primary-view.height
                         : (root.dock-preview == 5 ? secondary-view.height : workspace-area.height));
