@@ -25,6 +25,7 @@ full-scale IDE.
 - VS Code-style Git changes view with confirmed discard actions and side-by-side working-tree diffs
 - Unified file and terminal tabs, organized in Orca-style pane-local tab bars
 - Multiple independent WSL terminals with ANSI colors, Korean text, IME input, and visible start paths
+- On-demand, read-only WSL diagnostics from the status bar (workspace and host disk, running distributions, top processes, Docker containers, available memory, and Git)
 - Repeatable horizontal and vertical tab-pane splits with independent tabs and resizable dividers
 - WSL-aware CLI arguments and Linux-to-UNC path mapping
 - Headless behavioral Harness for editor isolation, multiple terminals, docking layouts, Git, and UI regressions
