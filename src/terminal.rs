@@ -125,6 +125,34 @@ fn resize_windows_pty(distro: &str, tty_path_file: &str, rows: u16, columns: u16
 const DEFAULT_FOREGROUND: [u8; 3] = [0xff, 0xff, 0xff];
 const DEFAULT_BACKGROUND: [u8; 3] = [0x28, 0x2c, 0x34];
 
+#[derive(Default)]
+struct TerminalCallbacks {
+    replies: Vec<u8>,
+}
+
+impl vt100::Callbacks for TerminalCallbacks {
+    fn unhandled_osc(&mut self, _screen: &mut vt100::Screen, params: &[&[u8]]) {
+        let (slot, color) = match params {
+            [b"10", b"?"] => (10, DEFAULT_FOREGROUND),
+            [b"11", b"?"] => (11, DEFAULT_BACKGROUND),
+            _ => return,
+        };
+        let [red, green, blue] = color.map(|channel| u16::from(channel) * 0x101);
+        self.replies.extend_from_slice(
+            format!("\x1b]{slot};rgb:{red:04x}/{green:04x}/{blue:04x}\x1b\\").as_bytes(),
+        );
+    }
+}
+
+fn write_terminal_replies(writer: &mut impl Write, callbacks: &mut TerminalCallbacks) {
+    if callbacks.replies.is_empty() {
+        return;
+    }
+    let replies = std::mem::take(&mut callbacks.replies);
+    let _ = writer.write_all(&replies);
+    let _ = writer.flush();
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayCell {
     pub row: i32,
@@ -176,7 +204,7 @@ pub struct TerminalSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     receiver: mpsc::Receiver<Vec<u8>>,
     output_signal: Arc<OutputSignal>,
-    parser: vt100::Parser,
+    parser: vt100::Parser<TerminalCallbacks>,
     _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     _pipe_child: Option<std::process::Child>,
     #[cfg(target_os = "windows")]
@@ -233,7 +261,7 @@ impl TerminalSession {
             // util-linux `script` allocates an 80x24 Unix PTY by default.
             // Keep the VT parser at the same size so full-screen TUIs such as
             // Codex do not wrap every row into a narrow UI-sized buffer.
-            parser: vt100::Parser::new(24, 80, 10_000),
+            parser: vt100::Parser::new_with_callbacks(24, 80, 10_000, TerminalCallbacks::default()),
             _pty_child: None,
             _pipe_child: Some(child),
             windows_resize: WindowsPtyResize::new(distro.to_string(), tty_path_file),
@@ -270,14 +298,21 @@ impl TerminalSession {
             writer,
             receiver,
             output_signal,
-            parser: vt100::Parser::new(24, 100, 10_000),
+            parser: vt100::Parser::new_with_callbacks(24, 100, 10_000, TerminalCallbacks::default()),
             _pty_child: Some(child),
             _pipe_child: None,
         })
     }
 
     pub fn poll(&mut self) -> bool {
-        poll_output(&self.receiver, &self.output_signal, &mut self.parser)
+        let changed = poll_output(&self.receiver, &self.output_signal, &mut self.parser);
+        if !self.parser.callbacks().replies.is_empty()
+            && let Ok(mut writer) = self.writer.lock()
+        {
+            // Protocol replies are not user input: do not reset scrollback.
+            write_terminal_replies(&mut *writer, self.parser.callbacks_mut());
+        }
+        changed
     }
 
     pub fn set_output_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
@@ -354,10 +389,10 @@ impl TerminalSession {
 
 // Bound one UI callback even when a command continuously produces output.
 // Chunk boundaries are not VT boundaries: the parser retains partial escapes.
-fn poll_output(
+fn poll_output<CB: vt100::Callbacks>(
     receiver: &mpsc::Receiver<Vec<u8>>,
     signal: &OutputSignal,
-    parser: &mut vt100::Parser,
+    parser: &mut vt100::Parser<CB>,
 ) -> bool {
     let mut processed = 0;
     let started = std::time::Instant::now();
@@ -591,6 +626,35 @@ pub fn encode_key(text: &str, control: bool, alt: bool, _shift: bool) -> Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answers_split_default_color_queries_without_moving_scrollback() {
+        let (sender, receiver) = mpsc::channel();
+        let signal = OutputSignal::default();
+        let mut parser = vt100::Parser::new_with_callbacks(
+            3,
+            12,
+            20,
+            TerminalCallbacks::default(),
+        );
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour");
+        assert!(scroll_screen(parser.screen_mut(), 1));
+
+        sender.send(b"\x1b]10;?\x1b".to_vec()).unwrap();
+        sender.send(b"\\\x1b]11;?\x07".to_vec()).unwrap();
+        sender.send(b"\x1b]12;?\x07\x1b]11;rgb:0000/0000/0000\x07".to_vec()).unwrap();
+        assert!(poll_output(&receiver, &signal, &mut parser));
+        assert_eq!(parser.screen().scrollback(), 1);
+        assert!(parser.screen().contents().contains("one"));
+
+        let mut writer = Vec::new();
+        write_terminal_replies(&mut writer, parser.callbacks_mut());
+        let expected = b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:2828/2c2c/3434\x1b\\";
+        assert_eq!(writer, expected);
+        assert_eq!(parser.screen().scrollback(), 1);
+        write_terminal_replies(&mut writer, parser.callbacks_mut());
+        assert_eq!(writer, expected);
+    }
 
     #[test]
     fn busy_terminal_yields_and_reschedules_without_losing_output() {
