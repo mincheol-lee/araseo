@@ -309,6 +309,14 @@ impl TerminalSession {
     }
 
     pub fn scroll_scrollback(&mut self, rows: i32) -> bool {
+        if let Some(input) = alternate_screen_scroll_input(self.parser.screen(), rows) {
+            if let Ok(mut writer) = self.writer.lock() {
+                let _ = writer.write_all(&input);
+                let _ = writer.flush();
+            }
+            // Full-screen applications redraw in response to the key events.
+            return false;
+        }
         scroll_screen(self.parser.screen_mut(), rows)
     }
 
@@ -436,6 +444,18 @@ fn scroll_screen(screen: &mut vt100::Screen, rows: i32) -> bool {
     };
     screen.set_scrollback(requested);
     screen.scrollback() != current
+}
+
+fn alternate_screen_scroll_input(screen: &vt100::Screen, rows: i32) -> Option<Vec<u8>> {
+    if !screen.alternate_screen() || rows == 0 {
+        return None;
+    }
+
+    // The alternate grid has no terminal scrollback. Like xterm's alternate
+    // scroll mode, turn wheel steps into cursor keys so TUIs (including Codex)
+    // can scroll their own viewport.
+    let key = if rows > 0 { b"\x1b[A" } else { b"\x1b[B" };
+    Some(key.repeat(rows.unsigned_abs().min(100) as usize))
 }
 
 impl Drop for TerminalSession {
@@ -646,6 +666,44 @@ mod tests {
         assert!(scroll_screen(parser.screen_mut(), -20));
         assert_eq!(parser.screen().scrollback(), 0);
         assert!(parser.screen().contents().contains("four"));
+    }
+
+    #[test]
+    fn wheel_scrolls_full_screen_app_via_cursor_keys_instead_of_empty_scrollback() {
+        let mut parser = vt100::Parser::new(3, 12, 20);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(alternate_screen_scroll_input(parser.screen(), 3), None);
+
+        parser.process(b"\x1b[?1049h");
+        assert!(parser.screen().alternate_screen());
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert_eq!(
+            alternate_screen_scroll_input(parser.screen(), 3),
+            Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
+        );
+        assert_eq!(
+            alternate_screen_scroll_input(parser.screen(), -2),
+            Some(b"\x1b[B\x1b[B".to_vec())
+        );
+        assert_eq!(alternate_screen_scroll_input(parser.screen(), 0), None);
+
+        parser.process(b"\x1b[?1049l");
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(alternate_screen_scroll_input(parser.screen(), 3), None);
+        assert!(scroll_screen(parser.screen_mut(), 3));
+    }
+
+    #[test]
+    fn inline_tui_top_scroll_region_retains_scrolled_answer_rows() {
+        let mut parser = vt100::Parser::new(4, 12, 20);
+        parser.process(b"one\r\ntwo\r\nthree\r\nprompt");
+        // An inline TUI scrolls only the transcript, leaving its prompt at
+        // the bottom. The displaced top row must remain available to wheel.
+        parser.process(b"\x1b[1;3r\x1b[S\x1b[r");
+        assert!(!parser.screen().alternate_screen());
+        assert!(!parser.screen().contents().contains("one"));
+        assert!(scroll_screen(parser.screen_mut(), 1));
+        assert!(parser.screen().contents().contains("one"));
     }
 
     #[test]

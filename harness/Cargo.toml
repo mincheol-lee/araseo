@@ -8,3 +8,6 @@ publish = false
 anyhow = "1"
 portable-pty = "0.9"
 vt100 = "0.16"
+
+[patch.crates-io]
+vt100 = { path = "../vendor/vt100" }
