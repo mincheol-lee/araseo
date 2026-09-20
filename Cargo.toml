@@ -26,6 +26,9 @@ i-slint-backend-testing = { path = "ui-harness/vendor/i-slint-backend-testing" }
 # Slint 1.17 converts off-screen glyph coordinates to i16 before clipping.
 # Keep a narrowly patched copy so large documents cannot overflow the renderer.
 i-slint-renderer-software = { path = "vendor/i-slint-renderer-software" }
+# Inline TUIs scroll a top-anchored DEC region to retain a fixed prompt.
+# Preserve the rows they scroll out in the terminal's history.
+vt100 = { path = "vendor/vt100" }
 
 [profile.release]
 strip = true

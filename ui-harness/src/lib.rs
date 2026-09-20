@@ -1343,6 +1343,16 @@ mod tests {
             Some(&(1, 3)),
             "mouse wheel over the terminal did not request retained output"
         );
+        ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position: LogicalPosition::new(600.0, 300.0),
+            delta_x: 0.0,
+            delta_y: -120.0,
+        });
+        assert_eq!(
+            terminal_scrolls.borrow().last(),
+            Some(&(1, -3)),
+            "downward mouse wheel over the terminal was not delivered"
+        );
         let top_left_cell_pixels = terminal_ui
             .iter()
             .enumerate()
