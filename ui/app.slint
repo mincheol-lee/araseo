@@ -62,6 +62,19 @@ export struct GitEntry {
     expanded: bool,
 }
 
+export struct WslCheckEntry {
+    title: string,
+    level: string,
+    detail: string,
+    kind: string,
+}
+
+export struct WslDockerUsageEntry {
+    name: string,
+    cpu: string,
+    memory: string,
+}
+
 export struct DiffRow {
     old-line: string,
     new-line: string,
@@ -933,6 +946,15 @@ export component AppWindow inherits Window {
     in-out property <int> editor-font-brightness: 120;
     in-out property <int> tree-font-brightness: 120;
     in-out property <bool> font-menu-visible: false;
+    in-out property <bool> wsl-diagnostics-visible: false;
+    in property <bool> wsl-diagnostics-running: false;
+    in property <[WslCheckEntry]> wsl-checks;
+    in property <string> wsl-report-text: "";
+    in property <bool> wsl-docker-usage-available: false;
+    in-out property <bool> wsl-docker-usage-visible: false;
+    in property <bool> wsl-docker-usage-running: false;
+    in property <[WslDockerUsageEntry]> wsl-docker-usage;
+    in property <string> wsl-docker-usage-error: "";
     callback font-settings-changed();
     changed terminal-font-size => { root.font-settings-changed(); }
     changed editor-font-size => { root.font-settings-changed(); }
@@ -1178,6 +1200,8 @@ export component AppWindow inherits Window {
     callback tree-target-requested(length, length) -> int;
     callback focused-group-changed(int);
     callback window-drag-requested();
+    callback wsl-diagnostics-requested();
+    callback wsl-docker-usage-requested();
 
     public function focus-terminal() {
         if (root.dynamic-panes) {
@@ -2176,7 +2200,15 @@ export component AppWindow inherits Window {
                     color: white;
                     vertical-alignment: center;
                 }
-                Button { text: "Aa"; width: 38px; clicked => { root.font-menu-visible = !root.font-menu-visible; } }
+                Button { text: "WSL"; width: 46px; clicked => {
+                    root.wsl-diagnostics-visible = !root.wsl-diagnostics-visible;
+                    root.font-menu-visible = false;
+                    if (root.wsl-diagnostics-visible) { root.wsl-diagnostics-requested(); }
+                } }
+                Button { text: "Aa"; width: 38px; clicked => {
+                    root.wsl-diagnostics-visible = false;
+                    root.font-menu-visible = !root.font-menu-visible;
+                } }
                 Text { text: root.status-text; color: white; vertical-alignment: center; }
                 if root.save-conflict: Button { text: "Reload"; clicked => { root.reload-requested(); } }
                 if root.save-conflict: Button { text: "Overwrite"; clicked => { root.force-save-requested(); } }
@@ -2508,6 +2540,110 @@ export component AppWindow inherits Window {
                         root.tree-font-brightness = 120;
                     } }
                     Button { text: "Close"; clicked => { root.font-menu-visible = false; } }
+                }
+            }
+        }
+
+        if root.wsl-diagnostics-visible: TouchArea {
+            width: parent.width;
+            height: parent.height - 24px;
+            clicked => { root.wsl-diagnostics-visible = false; }
+        }
+        if root.wsl-diagnostics-visible: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height - 24px) / 2;
+            width: min(parent.width - 40px, 540px);
+            height: 552px;
+            background: #25282f;
+            border-color: #454a54;
+            border-width: 1px;
+            border-radius: 6px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                HorizontalLayout {
+                    height: 26px;
+                    Text { text: "WSL environment diagnostics"; color: white; font-size: 16px; font-weight: 600; horizontal-stretch: 1; }
+                    Button { text: "Close"; clicked => { root.wsl-diagnostics-visible = false; } }
+                }
+                Text {
+                    height: 34px;
+                    text: root.wsl-diagnostics-running ? "Checking this workspace..." : "Read-only snapshot; no processes or services are stopped";
+                    color: #b8bec9;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 5px;
+                        for check in root.wsl-checks: Rectangle {
+                            height: check.kind == "process" ? 46px : 65px;
+                            background: #30343c;
+                            border-radius: 4px;
+                            Text {
+                                x: 10px;
+                                y: 8px;
+                                width: parent.width - 20px;
+                                height: 20px;
+                                text: (check.level == "good" ? "✓  " : check.level == "warning" ? "!  " : check.level == "error" ? "×  " : "·  ") + check.title;
+                                color: check.level == "good" ? #90d3a2 : check.level == "warning" ? #f3c472 : check.level == "error" ? #f48771 : #b8bec9;
+                                font-weight: 600;
+                            }
+                            Text {
+                                x: 10px;
+                                y: check.kind == "process" ? 25px : 29px;
+                                width: parent.width - 20px;
+                                height: check.kind == "process" ? 18px : 32px;
+                                text: check.detail;
+                                color: #d4d7dd;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+                        if root.wsl-docker-usage-visible: Rectangle {
+                            height: 28px;
+                            background: #25282f;
+                            Text { text: "Container CPU and memory"; color: #ffffff; font-weight: 600; vertical-alignment: center; }
+                        }
+                        if root.wsl-docker-usage-visible && root.wsl-docker-usage-running: Rectangle {
+                            height: 30px;
+                            Text { text: "Checking running containers..."; color: #b8bec9; vertical-alignment: center; }
+                        }
+                        if root.wsl-docker-usage-visible && root.wsl-docker-usage-error != "": Rectangle {
+                            height: 48px;
+                            Text { text: root.wsl-docker-usage-error; color: #f3c472; width: parent.width; wrap: word-wrap; vertical-alignment: center; }
+                        }
+                        if root.wsl-docker-usage-visible: VerticalLayout {
+                            spacing: 5px;
+                            for container in root.wsl-docker-usage: Rectangle {
+                                height: 46px;
+                                background: #30343c;
+                                border-radius: 4px;
+                                Text { x: 10px; y: 5px; text: container.name; color: #d4d7dd; font-weight: 600; }
+                                Text { x: 10px; y: 25px; text: "CPU " + container.cpu + " · memory " + container.memory; color: #b8bec9; font-size: 11px; }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    height: 30px;
+                    spacing: 8px;
+                    Button { text: "Run again"; enabled: !root.wsl-diagnostics-running; clicked => { root.wsl-diagnostics-requested(); } }
+                    if root.wsl-docker-usage-available: Button {
+                        text: root.wsl-docker-usage-visible ? "Hide containers" : "Container usage";
+                        clicked => {
+                            root.wsl-docker-usage-visible = !root.wsl-docker-usage-visible;
+                            if (root.wsl-docker-usage-visible) { root.wsl-docker-usage-requested(); }
+                        }
+                    }
+                    Button { text: "Copy report"; enabled: root.wsl-report-text != ""; clicked => {
+                        clipboard-staging.text = root.wsl-report-text;
+                        clipboard-staging.select-all();
+                        clipboard-staging.copy();
+                    } }
+                    Rectangle { horizontal-stretch: 1; }
                 }
             }
         }

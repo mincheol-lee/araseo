@@ -18,6 +18,8 @@ pub mod terminal;
 pub mod tabs;
 #[path = "../../src/background.rs"]
 pub mod background;
+#[path = "../../src/wsl_diagnostics.rs"]
+pub mod wsl_diagnostics;
 
 #[path = "../../src/appearance.rs"]
 pub mod appearance;

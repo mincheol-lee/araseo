@@ -11,6 +11,7 @@ mod tabs;
 mod terminal;
 mod tree;
 mod workspace;
+mod wsl_diagnostics;
 
 use anyhow::{Context, Result, bail};
 use background::Background;
@@ -51,6 +52,8 @@ struct AppState {
     git_action_loader: Background<Result<PathBuf>>,
     tree_action_loader: Background<Result<TreeActionResult>>,
     tree_action_pending: bool,
+    wsl_diagnostics_loader: Background<wsl_diagnostics::Report>,
+    wsl_docker_usage_loader: Background<std::io::Result<Vec<wsl_diagnostics::DockerUsage>>>,
     editor_views: RefCell<[editor_view::EditorView; 2]>,
     extra_editor_views: RefCell<HashMap<usize, editor_view::EditorView>>,
     extra_terminal_sizes: HashMap<usize, (u16, u16)>,
@@ -135,6 +138,8 @@ fn main() -> Result<()> {
         git_action_loader: Background::default(),
         tree_action_loader: Background::default(),
         tree_action_pending: false,
+        wsl_diagnostics_loader: Background::default(),
+        wsl_docker_usage_loader: Background::default(),
         editor_views: RefCell::new(Default::default()),
         extra_editor_views: RefCell::new(HashMap::new()),
         extra_terminal_sizes: HashMap::new(),
@@ -148,6 +153,49 @@ fn main() -> Result<()> {
     let ui = AppWindow::new()?;
     ui.set_dynamic_panes(true);
     ui.set_extra_panes(ModelRc::new(VecModel::from(Vec::<PaneEntry>::new())));
+    ui.set_wsl_checks(ModelRc::new(VecModel::from(Vec::<WslCheckEntry>::new())));
+    ui.set_wsl_docker_usage(ModelRc::new(VecModel::from(
+        Vec::<WslDockerUsageEntry>::new(),
+    )));
+    {
+        let state = state.clone();
+        let weak = ui.as_weak();
+        ui.on_wsl_diagnostics_requested(move || {
+            let mut state = state.borrow_mut();
+            state.wsl_docker_usage_loader.cancel();
+            let workspace = state.workspace.clone();
+            state
+                .wsl_diagnostics_loader
+                .request(move || wsl_diagnostics::collect(&workspace));
+            if let Some(ui) = weak.upgrade() {
+                ui.set_wsl_diagnostics_running(true);
+                ui.set_wsl_docker_usage_visible(false);
+                ui.set_wsl_docker_usage_available(false);
+                ui.set_wsl_docker_usage_running(false);
+                ui.set_wsl_docker_usage_error("".into());
+                ui.set_wsl_docker_usage(ModelRc::new(VecModel::from(
+                    Vec::<WslDockerUsageEntry>::new(),
+                )));
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = ui.as_weak();
+        ui.on_wsl_docker_usage_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if !ui.get_wsl_docker_usage_available() {
+                return;
+            }
+            let mut state = state.borrow_mut();
+            let workspace = state.workspace.clone();
+            state
+                .wsl_docker_usage_loader
+                .request(move || wsl_diagnostics::collect_docker_usage(&workspace));
+            ui.set_wsl_docker_usage_running(true);
+            ui.set_wsl_docker_usage_error("".into());
+        });
+    }
     install_windows_file_drop(&ui, state.clone());
     if let Some(path) = appearance::settings_path() {
         let sizes = appearance::FontSizes::load(&path);
@@ -854,6 +902,50 @@ fn main() -> Result<()> {
         loading_timer.start(TimerMode::Repeated, Duration::from_millis(16), move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
+            if let Some(report) = state.wsl_diagnostics_loader.poll() {
+                let entries = report
+                    .checks
+                    .iter()
+                    .map(|check| WslCheckEntry {
+                        title: check.title.clone().into(),
+                        level: check.level.as_str().into(),
+                        detail: check.detail.clone().into(),
+                        kind: check.kind.into(),
+                    })
+                    .collect::<Vec<_>>();
+                ui.set_wsl_checks(ModelRc::new(VecModel::from(entries)));
+                ui.set_wsl_report_text(report.copy_text().into());
+                ui.set_wsl_docker_usage_available(report.docker_usage_available);
+                ui.set_wsl_diagnostics_running(false);
+            }
+            if let Some(result) = state.wsl_docker_usage_loader.poll() {
+                ui.set_wsl_docker_usage_running(false);
+                match result {
+                    Ok(containers) => {
+                        let entries = containers
+                            .iter()
+                            .map(|container| WslDockerUsageEntry {
+                                name: container.name.clone().into(),
+                                cpu: container.cpu.clone().into(),
+                                memory: container.memory.clone().into(),
+                            })
+                            .collect::<Vec<_>>();
+                        ui.set_wsl_docker_usage(ModelRc::new(VecModel::from(entries)));
+                        let mut copied = ui.get_wsl_report_text().to_string();
+                        copied.push_str("Docker container usage\n");
+                        for container in containers {
+                            copied.push_str(&format!(
+                                "{}: CPU {}, memory {}\n",
+                                container.name, container.cpu, container.memory
+                            ));
+                        }
+                        ui.set_wsl_report_text(copied.into());
+                    }
+                    Err(error) => ui.set_wsl_docker_usage_error(
+                        format!("Could not read container usage: {error}").into(),
+                    ),
+                }
+            }
             if let Some(result) = startup_loader.poll() {
                 let mut focus_startup_terminal = false;
                 match result {
