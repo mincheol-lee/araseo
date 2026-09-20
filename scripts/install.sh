@@ -13,7 +13,7 @@ Install or update Araseo for the current WSL user. By default, the newest
 stable GitHub release is installed.
 
 Options:
-  --version TAG  Install a specific release, for example v0.1.6
+  --version TAG  Install a specific release, for example v0.1.7
   --uninstall    Remove Araseo from the current Windows and WSL user
   -h, --help     Show this help
 EOF
