@@ -128,7 +128,7 @@ for the Windows target:
 ```
 
 `scripts/build-windows.ps1` runs the headless harness automatically before it
-creates `dist/araseo.exe`. Pushing a version tag such as `v0.1.7` runs both
+creates `dist/araseo.exe`. Pushing a version tag such as `v0.1.8` runs both
 verification modes, builds the Windows executable, checks that the tag matches
 the Cargo package version, and publishes the GitHub Release assets. Tags with a
 pre-release suffix, such as `v0.2.0-beta.1`, create a GitHub pre-release.
