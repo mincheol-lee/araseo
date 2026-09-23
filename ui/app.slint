@@ -207,6 +207,10 @@ component WorkspaceGroup inherits Rectangle {
         }
     }
     in property <int> active-tab-id: -1;
+    changed active-tab-id => {
+        root.terminal-selection-dragged = false;
+        root.terminal-context-visible = false;
+    }
     in property <string> active-kind: "";
     in property <string> active-title: "";
     in property <string> active-detail: "";
@@ -228,6 +232,9 @@ component WorkspaceGroup inherits Rectangle {
     out property <length> terminal-scroll-offset: terminal-scroll.viewport-y;
     out property <bool> terminal-ime-active: terminal-ime-input.has-focus;
     out property <string> terminal-ime-buffer: terminal-ime-input.text;
+    out property <string> terminal-ime-preedit: self.terminal-composition-text;
+    out property <length> terminal-ime-width: terminal-ime-layer.width;
+    out property <length> terminal-ime-height: terminal-ime-layer.height;
     out property <length> tab-scroll-offset: group-tabs-flickable.viewport-x;
     out property <length> editor-surface-width: file-layer.width;
     out property <length> editor-surface-height: file-layer.height;
@@ -244,6 +251,13 @@ component WorkspaceGroup inherits Rectangle {
     private property <bool> terminal-context-visible: false;
     private property <length> terminal-context-x: 0px;
     private property <length> terminal-context-y: 0px;
+    private property <int> terminal-selection-anchor-row: 0;
+    private property <int> terminal-selection-anchor-column: 0;
+    private property <int> terminal-selection-cursor-row: 0;
+    private property <int> terminal-selection-cursor-column: 0;
+    private property <bool> terminal-selection-dragged: false;
+    private property <string> terminal-composition-text: "";
+    out property <bool> terminal-selection-active: self.terminal-selection-dragged;
 
     callback editor-edited(string, int);
     callback editor-selection-changed(int, int, int);
@@ -255,6 +269,7 @@ component WorkspaceGroup inherits Rectangle {
     callback terminal-key(int, string, bool, bool, bool);
     callback terminal-text(int, string);
     callback terminal-scrollback(int, int);
+    callback terminal-copy-requested(int, int, int, int, int) -> string;
     callback tab-activated(int);
     callback tab-close(int);
     callback new-terminal-requested(int);
@@ -296,6 +311,48 @@ component WorkspaceGroup inherits Rectangle {
     function show-copy-feedback() {
         self.copy-feedback-active = true;
         copy-feedback-timer.restart();
+    }
+
+    function copy-terminal-selection() {
+        if (!self.terminal-selection-active) {
+            return;
+        }
+        let selected = root.terminal-copy-requested(
+            root.active-tab-id,
+            self.terminal-selection-anchor-row,
+            self.terminal-selection-anchor-column,
+            self.terminal-selection-cursor-row,
+            self.terminal-selection-cursor-column
+        );
+        if (selected != "") {
+            terminal-ime-input.text = selected;
+            terminal-ime-input.select-all();
+            terminal-ime-input.copy();
+            terminal-ime-input.text = "";
+            terminal-ime-input.set-selection-offsets(0, 0);
+        }
+    }
+
+    function terminal-row-at(y: length) -> int {
+        return max(0, min(root.terminal-grid-rows - 1,
+            floor((y - terminal-scroll.viewport-y) / root.terminal-cell-height)));
+    }
+
+    function terminal-column-at(x: length) -> int {
+        return max(0, min(root.terminal-grid-columns - 1,
+            floor((x - terminal-scroll.viewport-x) / root.terminal-cell-width)));
+    }
+
+    function terminal-cell-selected(row: int, column: int, span: int) -> bool {
+        if (!self.terminal-selection-active) { return false; }
+        let anchor = self.terminal-selection-anchor-row * root.terminal-grid-columns
+            + self.terminal-selection-anchor-column;
+        let cursor = self.terminal-selection-cursor-row * root.terminal-grid-columns
+            + self.terminal-selection-cursor-column;
+        let first = min(anchor, cursor);
+        let last = max(anchor, cursor);
+        let cell-first = row * root.terminal-grid-columns + column;
+        return cell-first <= last && cell-first + max(1, span) - 1 >= first;
     }
 
     copy-feedback-timer := Timer {
@@ -786,17 +843,34 @@ component WorkspaceGroup inherits Rectangle {
                     width: terminal-scroll.viewport-width;
                     height: terminal-scroll.viewport-height;
                     background: #282c34;
+                    for row in root.terminal-grid-rows: Rectangle {
+                        private property <int> anchor-index: root.terminal-selection-anchor-row
+                            * root.terminal-grid-columns + root.terminal-selection-anchor-column;
+                        private property <int> cursor-index: root.terminal-selection-cursor-row
+                            * root.terminal-grid-columns + root.terminal-selection-cursor-column;
+                        private property <int> first-index: min(self.anchor-index, self.cursor-index);
+                        private property <int> last-index: max(self.anchor-index, self.cursor-index);
+                        private property <int> row-first: max(self.first-index, row * root.terminal-grid-columns);
+                        private property <int> row-last: min(self.last-index, (row + 1) * root.terminal-grid-columns - 1);
+                        visible: root.terminal-selection-active && self.row-first <= self.row-last;
+                        x: (self.row-first - row * root.terminal-grid-columns) * root.terminal-cell-width;
+                        y: row * root.terminal-cell-height;
+                        width: (self.row-last - self.row-first + 1) * root.terminal-cell-width;
+                        height: root.terminal-cell-height;
+                        background: #264f78;
+                    }
                     for cell in root.terminal-cells: Rectangle {
                         x: cell.column * root.terminal-cell-width;
                         y: cell.row * root.terminal-cell-height;
                         width: cell.column-span * root.terminal-cell-width;
                         height: root.terminal-cell-height;
                         visible: cell.column-span > 0;
-                        background: cell.cursor ? cell.foreground : cell.background;
+                        background: root.terminal-cell-selected(cell.row, cell.column, cell.column-span)
+                            ? #264f78 : (cell.cursor ? cell.foreground : cell.background);
                         Text {
                             text: cell.glyph;
-                            color: cell.cursor
-                                ? cell.background
+                            color: root.terminal-cell-selected(cell.row, cell.column, cell.column-span)
+                                ? #ffffff : cell.cursor ? cell.background
                                 : root.adjusted-font-color(cell.foreground, root.terminal-font-brightness);
                             font-family: "Cascadia Mono";
                             font-size: root.terminal-font-size * 1px;
@@ -809,10 +883,19 @@ component WorkspaceGroup inherits Rectangle {
                     }
                 }
             }
-            terminal-ime-input := TextInput {
-                x: max(0px, root.terminal-cursor-column * root.terminal-cell-width + terminal-scroll.viewport-x);
+            terminal-ime-layer := Rectangle {
+                x: max(0px, min(terminal-focus.width - root.terminal-cell-width,
+                    root.terminal-cursor-column * root.terminal-cell-width + terminal-scroll.viewport-x));
                 y: max(0px, root.terminal-cursor-row * root.terminal-cell-height + terminal-scroll.viewport-y);
-                width: max(root.terminal-cell-height, terminal-focus.width - self.x);
+                // Keep Windows' native IME preedit visible at the PTY cursor,
+                // but constrain the proxy so its decoration cannot stretch
+                // across the rest of the Codex input surface.
+                width: max(root.terminal-cell-width,
+                    min(root.terminal-cell-width * 4, terminal-focus.width - self.x));
+                height: root.terminal-cell-height;
+                clip: true;
+            terminal-ime-input := TextInput {
+                width: terminal-ime-layer.width;
                 height: root.terminal-cell-height;
                 text: "";
                 single-line: true;
@@ -820,10 +903,16 @@ component WorkspaceGroup inherits Rectangle {
                 font-family: "Cascadia Mono";
                 font-size: root.terminal-font-size * 1px;
                 font-weight: 500;
-                color: root.adjusted-font-color(#ffffff, root.terminal-font-brightness);
+                // Slint underlines native IME preedit text. Keep the native
+                // editor transparent and paint the same text below without
+                // decoration so terminal composition has no black line.
+                color: transparent;
                 selection-background-color: #264f78;
-                selection-foreground-color: #ffffff;
+                selection-foreground-color: transparent;
                 text-cursor-width: 0px;
+                changed preedit-text => {
+                    root.terminal-composition-text = self.preedit-text;
+                }
                 edited => {
                     root.group-focused(root.group-id);
                     if (self.text != "") {
@@ -857,6 +946,11 @@ component WorkspaceGroup inherits Rectangle {
                         self.paste();
                         return accept;
                     }
+                    if (event.modifiers.control && (event.text == "c" || event.text == "C")
+                        && root.terminal-selection-active) {
+                        root.copy-terminal-selection();
+                        return accept;
+                    }
                     if (event.modifiers.control || event.modifiers.alt) {
                         root.terminal-key(root.active-tab-id, event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift);
                         return accept;
@@ -864,7 +958,21 @@ component WorkspaceGroup inherits Rectangle {
                     return reject;
                 }
             }
+            Text {
+                text: root.terminal-composition-text;
+                color: root.adjusted-font-color(#ffffff, root.terminal-font-brightness);
+                font-family: "Cascadia Mono";
+                font-size: root.terminal-font-size * 1px;
+                font-weight: 500;
+                width: parent.width;
+                height: parent.height;
+                vertical-alignment: center;
+                wrap: no-wrap;
+            }
+            }
             terminal-click := TouchArea {
+                private property <int> pointer-row: root.terminal-row-at(self.mouse-y);
+                private property <int> pointer-column: root.terminal-column-at(self.mouse-x);
                 scroll-event(event) => {
                     let delta = event.delta-y != 0px ? event.delta-y : event.delta-x;
                     if (delta != 0px) {
@@ -878,13 +986,32 @@ component WorkspaceGroup inherits Rectangle {
                     root.group-focused(root.group-id);
                     root.focus-terminal();
                 }
+                moved => {
+                    if (self.pressed) {
+                        root.terminal-selection-cursor-row = self.pointer-row;
+                        root.terminal-selection-cursor-column = self.pointer-column;
+                        root.terminal-selection-dragged = self.pointer-row != root.terminal-selection-anchor-row
+                            || self.pointer-column != root.terminal-selection-anchor-column;
+                    }
+                }
                 pointer-event(event) => {
-                    if (event.button == PointerEventButton.right
+                    if (event.button == PointerEventButton.left
+                        && event.kind == PointerEventKind.down) {
+                        root.terminal-context-visible = false;
+                        root.group-focused(root.group-id);
+                        root.focus-terminal();
+                        root.terminal-selection-anchor-row = self.pointer-row;
+                        root.terminal-selection-anchor-column = self.pointer-column;
+                        root.terminal-selection-cursor-row = self.pointer-row;
+                        root.terminal-selection-cursor-column = self.pointer-column;
+                        root.terminal-selection-dragged = false;
+                    } else if (event.button == PointerEventButton.right
                         && event.kind == PointerEventKind.down) {
                         root.group-focused(root.group-id);
                         root.terminal-context-x = min(content-stack.width - 132px,
                             self.absolute-position.x + self.mouse-x - content-stack.absolute-position.x);
-                        root.terminal-context-y = min(content-stack.height - 40px,
+                        root.terminal-context-y = min(content-stack.height
+                                - (root.terminal-selection-active ? 74px : 40px),
                             self.absolute-position.y + self.mouse-y - content-stack.absolute-position.y);
                         root.terminal-context-visible = true;
                     }
@@ -912,11 +1039,36 @@ component WorkspaceGroup inherits Rectangle {
             x: root.terminal-context-x;
             y: root.terminal-context-y;
             width: 132px;
-            height: 34px;
+            height: root.terminal-selection-active ? 68px : 34px;
             background: #252526;
             border-width: 1px;
             border-color: #454545;
             border-radius: 3px;
+            if root.terminal-selection-active: Rectangle {
+                width: parent.width;
+                height: 34px;
+                background: terminal-copy-touch.has-hover ? #094771 : transparent;
+                Text {
+                    text: "Copy   Ctrl+C";
+                    color: #f0f0f0;
+                    font-size: 11px;
+                    x: 10px;
+                    width: parent.width - 20px;
+                    vertical-alignment: center;
+                }
+                terminal-copy-touch := TouchArea {
+                    clicked => {
+                        root.terminal-context-visible = false;
+                        root.copy-terminal-selection();
+                        root.focus-terminal();
+                    }
+                }
+            }
+            Rectangle {
+                y: root.terminal-selection-active ? 34px : 0px;
+                width: parent.width;
+                height: 34px;
+                background: terminal-paste-touch.has-hover ? #094771 : transparent;
             Text {
                 text: "Paste   Ctrl+V";
                 color: #f0f0f0;
@@ -931,6 +1083,7 @@ component WorkspaceGroup inherits Rectangle {
                     terminal-ime-input.focus();
                     terminal-ime-input.paste();
                 }
+            }
             }
         }
         }
@@ -1035,6 +1188,10 @@ export component AppWindow inherits Window {
     out property <length> terminal-scroll-offset: primary-view.terminal-scroll-offset;
     out property <bool> terminal-ime-active: primary-view.terminal-ime-active;
     out property <string> terminal-ime-buffer: primary-view.terminal-ime-buffer;
+    out property <string> terminal-ime-preedit: primary-view.terminal-ime-preedit;
+    out property <length> terminal-ime-width: primary-view.terminal-ime-width;
+    out property <length> terminal-ime-height: primary-view.terminal-ime-height;
+    out property <bool> terminal-selection-active: primary-view.terminal-selection-active;
     in-out property <string> secondary-editor-text;
     in property <styled-text> secondary-highlighted-text;
     in property <bool> secondary-syntax-highlight-enabled: false;
@@ -1052,6 +1209,7 @@ export component AppWindow inherits Window {
     out property <length> secondary-terminal-scroll-offset: secondary-view.terminal-scroll-offset;
     out property <bool> secondary-terminal-ime-active: secondary-view.terminal-ime-active;
     out property <string> secondary-terminal-ime-buffer: secondary-view.terminal-ime-buffer;
+    out property <string> secondary-terminal-ime-preedit: secondary-view.terminal-ime-preedit;
     out property <length> primary-tab-scroll-offset: primary-view.tab-scroll-offset;
     out property <length> secondary-tab-scroll-offset: secondary-view.tab-scroll-offset;
     out property <length> primary-editor-surface-width: primary-view.editor-surface-width;
@@ -1189,6 +1347,7 @@ export component AppWindow inherits Window {
     callback terminal-key(int, string, bool, bool, bool);
     callback terminal-text(int, string);
     callback terminal-scrollback(int, int);
+    callback terminal-copy-requested(int, int, int, int, int) -> string;
     callback terminal-output-ready(int);
     callback new-terminal-requested(int);
     callback tab-dock-requested(int, int);
@@ -1875,6 +2034,9 @@ export component AppWindow inherits Window {
                     }
                     terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
                     terminal-scrollback(tab-id, rows) => { root.terminal-scrollback(tab-id, rows); }
+                    terminal-copy-requested(tab-id, anchor-row, anchor-column, cursor-row, cursor-column) => {
+                        root.terminal-copy-requested(tab-id, anchor-row, anchor-column, cursor-row, cursor-column)
+                    }
                     tab-activated(tab-id) => { root.tab-activated(tab-id); }
                     tab-close(tab-id) => { root.tab-close(tab-id); }
                     new-terminal-requested(group) => { root.new-terminal-requested(group); }
@@ -1953,6 +2115,9 @@ export component AppWindow inherits Window {
                     }
                     terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
                     terminal-scrollback(tab-id, rows) => { root.terminal-scrollback(tab-id, rows); }
+                    terminal-copy-requested(tab-id, anchor-row, anchor-column, cursor-row, cursor-column) => {
+                        root.terminal-copy-requested(tab-id, anchor-row, anchor-column, cursor-row, cursor-column)
+                    }
                     tab-activated(tab-id) => { root.tab-activated(tab-id); }
                     tab-close(tab-id) => { root.tab-close(tab-id); }
                     new-terminal-requested(group) => { root.new-terminal-requested(group); }
@@ -2039,6 +2204,9 @@ export component AppWindow inherits Window {
                     }
                     terminal-text(tab-id, text) => { root.terminal-text(tab-id, text); }
                     terminal-scrollback(tab-id, rows) => { root.terminal-scrollback(tab-id, rows); }
+                    terminal-copy-requested(tab-id, anchor-row, anchor-column, cursor-row, cursor-column) => {
+                        root.terminal-copy-requested(tab-id, anchor-row, anchor-column, cursor-row, cursor-column)
+                    }
                     tab-activated(tab-id) => { root.tab-activated(tab-id); }
                     tab-close(tab-id) => { root.tab-close(tab-id); }
                     new-terminal-requested(group) => { root.new-terminal-requested(group); }

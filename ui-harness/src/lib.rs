@@ -24,6 +24,8 @@ mod editor_view;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use i_slint_core::input::{InternalKeyEvent, KeyEvent as InternalKeyEventData, KeyEventType};
+    use i_slint_core::window::WindowInner;
     use slint::platform::software_renderer::{
         MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType, TargetPixel,
     };
@@ -205,6 +207,20 @@ mod tests {
         ui.on_terminal_scrollback(move |tab_id, rows| {
             observed_terminal_scrolls.borrow_mut().push((tab_id, rows));
         });
+        let terminal_copy_requests = Rc::new(RefCell::new(Vec::new()));
+        let observed_terminal_copy_requests = terminal_copy_requests.clone();
+        ui.on_terminal_copy_requested(
+            move |tab_id, anchor_row, anchor_column, cursor_row, cursor_column| {
+                observed_terminal_copy_requests.borrow_mut().push((
+                    tab_id,
+                    anchor_row,
+                    anchor_column,
+                    cursor_row,
+                    cursor_column,
+                ));
+                "Codex response".into()
+            },
+        );
         let tree_creates = Rc::new(RefCell::new(Vec::new()));
         let observed_tree_creates = tree_creates.clone();
         ui.on_tree_create_requested(move |target, name, is_directory| {
@@ -1382,6 +1398,51 @@ mod tests {
             "sparse terminal cells were not rendered at their explicit grid positions"
         );
 
+        // Terminal output is made from VT cells rather than a TextInput. A
+        // mouse drag must create a visible selection, and Control+C should
+        // ask the production terminal callback for its text instead of
+        // sending SIGINT to Codex.
+        let terminal_before_selection = render(&window);
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerPressed {
+                position: LogicalPosition::new(workspace_left as f32 + 2.0, 44.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(workspace_left as f32 + 26.0, 44.0),
+            },
+        );
+        dispatch_pointer(
+            &ui,
+            WindowEvent::PointerReleased {
+                position: LogicalPosition::new(workspace_left as f32 + 26.0, 44.0),
+                button: PointerEventButton::Left,
+            },
+        );
+        assert!(ui.get_terminal_selection_active(), "terminal drag did not create a selection");
+        let terminal_after_selection = render(&window);
+        assert_ne!(
+            terminal_before_selection, terminal_after_selection,
+            "terminal selection was not visibly highlighted"
+        );
+        let terminal_key_count = terminal_keys.borrow().len();
+        clipboard.borrow_mut().clear();
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: "c".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: "c".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        assert_eq!(clipboard.borrow().as_str(), "Codex response");
+        assert_eq!(terminal_keys.borrow().len(), terminal_key_count, "copy sent Control+C to Codex");
+        assert_eq!(
+            terminal_copy_requests.borrow().last(),
+            Some(&(1, 0, 0, 0, 3)),
+            "terminal copy used the wrong selected cell range"
+        );
+
         // A stale, wider grid can remain until the asynchronous PTY resize
         // completes. It must not flash a horizontal scrollbar either.
         ui.set_terminal_grid_columns(160);
@@ -1406,14 +1467,87 @@ mod tests {
             "long terminal output did not automatically reveal the prompt row"
         );
 
+        // Return to a compact prompt for deterministic IME pixel assertions.
+        // Scroll-following itself is covered immediately above.
+        ui.set_terminal_grid_rows(ui.get_terminal_rows().round() as i32);
+        ui.set_terminal_cursor_row(0);
+        ui.set_terminal_cursor_column(0);
+        ui.set_terminal_cells(ModelRc::new(VecModel::from(vec![TerminalCell {
+            row: 0,
+            column: 0,
+            glyph: " ".into(),
+            foreground: slint::Color::from_rgb_u8(255, 255, 255),
+            background: slint::Color::from_rgb_u8(0x28, 0x2c, 0x34),
+            bold: false,
+            cursor: true,
+            column_span: 1,
+        }])));
+        ui.set_terminal_update_generation(ui.get_terminal_update_generation() + 1);
+        render(&window);
+        assert!(ui.get_terminal_cells().row_data(0).unwrap().cursor);
+        assert_eq!(ui.get_terminal_scroll_offset(), 0.0);
+
         // The terminal must focus an editable TextInput so the Windows backend
         // enables IME. A committed Hangul string is then forwarded once and
         // removed from the proxy buffer instead of being rendered twice.
+        let terminal_before_focus = render(&window);
         ui.invoke_focus_terminal();
         assert!(
             ui.get_terminal_ime_active(),
             "terminal focus did not activate its IME-capable TextInput"
         );
+        let focused_terminal = render(&window);
+        assert_eq!(
+            terminal_before_focus, focused_terminal,
+            "focusing the invisible IME proxy painted over the Codex input surface"
+        );
+        // The minimal Linux renderer does not have a Hangul fallback font,
+        // so use Latin preedit text to verify the undecorated preview pixels.
+        dispatch_preedit(&ui, "h");
+        assert_eq!(ui.get_terminal_ime_preedit().as_str(), "h");
+        let initial_preedit = render(&window);
+        let changed_preedit_pixels = focused_terminal
+            .iter()
+            .zip(&initial_preedit)
+            .enumerate()
+            .filter_map(|(index, (before, after))| (before != after).then_some(index))
+            .collect::<Vec<_>>();
+        assert!(
+            changed_preedit_pixels.len() > 5,
+            "the first composition character was not painted"
+        );
+        assert!(
+            ui.get_terminal_ime_width() >= 8.0 && ui.get_terminal_ime_height() >= 16.0,
+            "the IME proxy was clipped too tightly to show Hangul composition"
+        );
+        assert!(
+            ui.get_terminal_ime_width() <= 32.0,
+            "the IME proxy can paint a line beyond the composed glyphs"
+        );
+        assert!(
+            changed_preedit_pixels
+                .iter()
+                .all(|index| index % 1200 < workspace_left + 32),
+            "the IME preview painted outside its bounded composition area"
+        );
+        dispatch_preedit(&ui, "ha");
+        assert_ne!(
+            initial_preedit,
+            render(&window),
+            "the composition preview did not update"
+        );
+        dispatch_preedit(&ui, "ㅎ");
+        assert_eq!(ui.get_terminal_ime_preedit().as_str(), "ㅎ");
+        dispatch_preedit(&ui, "하");
+        assert_eq!(ui.get_terminal_ime_preedit().as_str(), "하");
+        dispatch_commit(&ui, "한글");
+        assert_eq!(
+            terminal_text.borrow().last(),
+            Some(&(1, "한글".to_string())),
+            "primary terminal text was routed to the wrong tab"
+        );
+        assert_eq!(ui.get_terminal_ime_buffer().as_str(), "");
+        assert_eq!(ui.get_terminal_ime_preedit().as_str(), "");
         *clipboard.borrow_mut() = "/workspace/local-project".into();
         ui.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
         ui.window().dispatch_event(WindowEvent::KeyPressed { text: "v".into() });
@@ -1424,14 +1558,11 @@ mod tests {
             Some(&(1, "/workspace/local-project".to_string())),
             "Control+V did not paste a copied file-tree path into the terminal"
         );
-        ui.window().dispatch_event(WindowEvent::KeyPressed { text: "한글".into() });
-        ui.window().dispatch_event(WindowEvent::KeyReleased { text: "한글".into() });
         assert_eq!(
-            terminal_text.borrow().last(),
-            Some(&(1, "한글".to_string())),
-            "primary terminal text was routed to the wrong tab"
+            focused_terminal,
+            render(&window),
+            "committed terminal input left an extra line over the Codex input surface"
         );
-        assert_eq!(ui.get_terminal_ime_buffer().as_str(), "");
         ui.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Return.into() });
         assert_eq!(
             terminal_keys.borrow().last().map(|event| (event.0, event.1.as_str())),
@@ -1846,6 +1977,25 @@ mod tests {
 
     fn dispatch_pointer(ui: &AppWindow, event: WindowEvent) {
         ui.window().dispatch_event(event);
+    }
+
+    fn dispatch_preedit(ui: &AppWindow, text: &str) {
+        WindowInner::from_pub(ui.window()).process_key_input(InternalKeyEvent {
+            event_type: KeyEventType::UpdateComposition,
+            preedit_text: text.into(),
+            preedit_selection: Some(text.len() as i32..text.len() as i32),
+            ..Default::default()
+        });
+    }
+
+    fn dispatch_commit(ui: &AppWindow, text: &str) {
+        let mut key_event = InternalKeyEventData::default();
+        key_event.text = text.into();
+        WindowInner::from_pub(ui.window()).process_key_input(InternalKeyEvent {
+            event_type: KeyEventType::CommitComposition,
+            key_event,
+            ..Default::default()
+        });
     }
 
     fn write_snapshot_if_requested(name: &str, pixels: &[TestPixel]) {

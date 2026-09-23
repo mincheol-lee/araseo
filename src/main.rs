@@ -650,6 +650,27 @@ fn main() -> Result<()> {
         });
     }
     {
+        let state = state.clone();
+        ui.on_terminal_copy_requested(
+            move |tab_id, anchor_row, anchor_column, cursor_row, cursor_column| {
+                let Ok(tab_id) = TabId::try_from(tab_id) else {
+                    return String::new().into();
+                };
+                terminal_ref(&state.borrow(), tab_id)
+                    .map(|terminal| {
+                        terminal.selection_text(
+                            anchor_row,
+                            anchor_column,
+                            cursor_row,
+                            cursor_column,
+                        )
+                    })
+                    .unwrap_or_default()
+                    .into()
+            },
+        );
+    }
+    {
         let weak = ui.as_weak();
         let state = state.clone();
         ui.on_find_requested(move |tab_id, query| {

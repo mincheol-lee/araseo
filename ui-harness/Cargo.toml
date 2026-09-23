@@ -6,6 +6,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+i-slint-core = "1.17"
 slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "renderer-software"] }
 swash = "0.2"
 
