@@ -343,6 +343,22 @@ impl TerminalSession {
         }
     }
 
+    pub fn selection_text(
+        &self,
+        anchor_row: i32,
+        anchor_column: i32,
+        cursor_row: i32,
+        cursor_column: i32,
+    ) -> String {
+        selection_text(
+            self.parser.screen(),
+            anchor_row,
+            anchor_column,
+            cursor_row,
+            cursor_column,
+        )
+    }
+
     pub fn scroll_scrollback(&mut self, rows: i32) -> bool {
         if let Some(input) = alternate_screen_scroll_input(self.parser.screen(), rows) {
             if let Ok(mut writer) = self.writer.lock() {
@@ -479,6 +495,33 @@ fn scroll_screen(screen: &mut vt100::Screen, rows: i32) -> bool {
     };
     screen.set_scrollback(requested);
     screen.scrollback() != current
+}
+
+fn selection_text(
+    screen: &vt100::Screen,
+    anchor_row: i32,
+    anchor_column: i32,
+    cursor_row: i32,
+    cursor_column: i32,
+) -> String {
+    let (rows, columns) = screen.size();
+    if rows == 0 || columns == 0 {
+        return String::new();
+    }
+
+    let clamp_row = |row: i32| row.clamp(0, i32::from(rows) - 1) as u16;
+    let clamp_column = |column: i32| column.clamp(0, i32::from(columns) - 1) as u16;
+    let anchor = (clamp_row(anchor_row), clamp_column(anchor_column));
+    let cursor = (clamp_row(cursor_row), clamp_column(cursor_column));
+    let (start, end) = if anchor <= cursor {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    };
+
+    // The UI identifies the cells under the two pointer positions. vt100's
+    // end coordinate is exclusive, so include the final selected cell.
+    screen.contents_between(start.0, start.1, end.0, end.1.saturating_add(1))
 }
 
 fn alternate_screen_scroll_input(screen: &vt100::Screen, rows: i32) -> Option<Vec<u8>> {
@@ -768,6 +811,16 @@ mod tests {
         assert!(!parser.screen().contents().contains("one"));
         assert!(scroll_screen(parser.screen_mut(), 1));
         assert!(parser.screen().contents().contains("one"));
+    }
+
+    #[test]
+    fn copies_forward_and_reverse_terminal_cell_selections() {
+        let mut parser = vt100::Parser::new(3, 12, 0);
+        parser.process(b"alpha\r\nbeta\r\ngamma");
+
+        assert_eq!(selection_text(parser.screen(), 0, 1, 0, 3), "lph");
+        assert_eq!(selection_text(parser.screen(), 1, 1, 2, 2), "eta\ngam");
+        assert_eq!(selection_text(parser.screen(), 2, 2, 1, 1), "eta\ngam");
     }
 
     #[test]
