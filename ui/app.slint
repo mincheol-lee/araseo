@@ -1,4 +1,51 @@
-import { Button, LineEdit, ScrollView, SpinBox } from "std-widgets.slint";
+import { Button, LineEdit, Palette, ScrollView, SpinBox } from "std-widgets.slint";
+
+global Chrome {
+    out property <color> canvas: #10151d;
+    out property <color> sidebar: #171e28;
+    out property <color> surface: #1d2632;
+    out property <color> elevated: #222e3d;
+    out property <color> hover: #2a394a;
+    out property <color> border: #344456;
+    out property <color> text: #e8edf4;
+    out property <color> muted: #a2b0bf;
+    out property <color> accent: #72b8f0;
+    out property <color> accent-fill: #284968;
+    out property <color> danger: #f39893;
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <string> intent: "neutral";
+    in property <bool> available: true;
+    callback clicked();
+    width: max(74px, caption.preferred-width + 26px);
+    height: 30px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: self.intent == "primary" ? #537da2
+        : (self.intent == "danger" ? #8d4e57 : Chrome.border);
+    background: !self.available ? Chrome.sidebar
+        : (button-touch.has-hover ? (self.intent == "danger" ? #6b343f
+            : (self.intent == "primary" ? #38658a : Chrome.hover))
+        : (self.intent == "danger" ? #58313b
+            : (self.intent == "primary" ? Chrome.accent-fill : Chrome.surface)));
+    caption := Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        color: root.available ? (root.intent == "danger" ? #ffe0df : Chrome.text) : Chrome.muted;
+        font-size: 11px;
+        font-weight: root.intent == "primary" ? 600 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    button-touch := TouchArea {
+        enabled: root.available;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
 
 export struct TreeEntry {
     name: string,
@@ -125,20 +172,20 @@ component DiffCell inherits Rectangle {
     in property <string> change-kind;
     in property <int> font-size: 14;
     height: max(21px, root.font-size * 1.5px);
-    background: root.change-kind == "removed" ? #4b1818
-        : (root.change-kind == "added" ? #173d24
-        : (root.change-kind == "empty" ? #252526 : #1e1e1e));
+    background: root.change-kind == "removed" ? #4a2b36
+        : (root.change-kind == "added" ? #19362f
+        : (root.change-kind == "empty" ? Chrome.sidebar : Chrome.canvas));
     clip: true;
 
     HorizontalLayout {
         spacing: 0px;
         Rectangle {
             width: 46px;
-            background: root.change-kind == "removed" ? #3d1717
-                : (root.change-kind == "added" ? #14331f : #1e1e1e);
+            background: root.change-kind == "removed" ? #3d2530
+                : (root.change-kind == "added" ? #163027 : Chrome.sidebar);
             Text {
                 text: root.line-number;
-                color: #858585;
+                color: Chrome.muted;
                 font-family: "Cascadia Mono";
                 font-size: root.font-size * 1px;
                 horizontal-alignment: right;
@@ -149,8 +196,8 @@ component DiffCell inherits Rectangle {
         }
         Rectangle {
             width: 3px;
-            background: root.change-kind == "removed" ? #b54a4a
-                : (root.change-kind == "added" ? #3f9b57 : transparent);
+                background: root.change-kind == "removed" ? #e07d83
+                : (root.change-kind == "added" ? #60c5a4 : transparent);
         }
         Rectangle {
             horizontal-stretch: 1;
@@ -158,8 +205,8 @@ component DiffCell inherits Rectangle {
                 x: 8px;
                 width: parent.width - 10px;
                 text: root.code;
-                color: root.change-kind == "removed" ? #f1cccc
-                    : (root.change-kind == "added" ? #d2f0d8 : #d4d4d4);
+                color: root.change-kind == "removed" ? #f3d5dc
+                    : (root.change-kind == "added" ? #d5eee3 : Chrome.text);
                 font-family: "Cascadia Mono";
                 font-size: root.font-size * 1px;
                 vertical-alignment: center;
@@ -173,7 +220,7 @@ component DiffCell inherits Rectangle {
                 width: max(parent.width - 10px, self.preferred-width);
                 height: parent.height;
                 text: root.highlighted-code;
-                default-color: #d4d4d4;
+                default-color: Chrome.text;
                 default-font-family: "Cascadia Mono";
                 default-font-size: root.font-size * 1px;
                 horizontal-alignment: left;
@@ -364,7 +411,7 @@ component WorkspaceGroup inherits Rectangle {
         }
     }
 
-    background: #181a1f;
+    background: Chrome.canvas;
     clip: true;
 
     VerticalLayout {
@@ -372,16 +419,16 @@ component WorkspaceGroup inherits Rectangle {
 
         pane-tab-bar := Rectangle {
             height: 36px;
-            background: #202329;
+            background: Chrome.sidebar;
             border-width: 1px;
-            border-color: root.focused ? #3d5268 : #2b2f36;
+            border-color: Chrome.border;
 
             Rectangle {
                 x: 0px;
                 y: 0px;
                 width: parent.width;
                 height: 2px;
-                background: root.focused ? #5ca8e6 : transparent;
+                background: root.focused ? Chrome.accent : transparent;
             }
 
             HorizontalLayout {
@@ -409,10 +456,18 @@ component WorkspaceGroup inherits Rectangle {
                             for tab in root.tabs: Rectangle {
                                 private property <bool> active: tab.id == root.active-tab-id;
                                 width: min(210px, max(108px, local-tab-title.preferred-width + 48px));
-                                background: self.active ? #1e1e1e
-                                    : (local-tab-touch.has-hover || local-tab-close-touch.has-hover ? #30343c : #25282f);
+                                background: self.active ? Chrome.canvas
+                                    : (local-tab-touch.has-hover || local-tab-close-touch.has-hover ? Chrome.hover : Chrome.sidebar);
                                 border-width: self.active ? 1px : 0px;
-                                border-color: root.focused ? #3a4655 : #30343b;
+                                border-color: Chrome.border;
+
+                                Rectangle {
+                                    x: 1px;
+                                    y: 0px;
+                                    width: parent.width - 2px;
+                                    height: 2px;
+                                    background: parent.active ? Chrome.accent : transparent;
+                                }
 
                                 changed active => {
                                     if (self.active) { root.reveal-tab(self.x, self.width); }
@@ -424,12 +479,12 @@ component WorkspaceGroup inherits Rectangle {
                                 local-tab-title := Text {
                                     x: 9px;
                                     width: parent.width - 43px;
-                                    text: (tab.kind == "terminal" ? ">_ " : (tab.kind == "diff" ? "↔ " : "")) + tab.title
+                                    text: (tab.kind == "terminal" ? "›_  " : (tab.kind == "diff" ? "⇄  " : "▤  ")) + tab.title
                                         + (tab.dirty ? " ●" : "");
-                                    color: tab.kind == "terminal" ? #82c7ff
-                                        : (tab.kind == "diff" ? #e2c08d : (parent.active ? #f1f1f1 : #aeb4bf));
-                                    font-family: tab.kind == "terminal" ? "Cascadia Mono" : "Geist";
+                                    color: parent.active ? Chrome.text : Chrome.muted;
+                                    font-family: "Segoe UI";
                                     font-size: 12px;
+                                    font-weight: parent.active ? 600 : 400;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
@@ -474,10 +529,10 @@ component WorkspaceGroup inherits Rectangle {
                                     width: 27px;
                                     height: 27px;
                                     border-radius: 4px;
-                                    background: local-tab-close-touch.has-hover ? #454a54 : transparent;
+                                    background: local-tab-close-touch.has-hover ? Chrome.hover : transparent;
                                     Text {
                                         text: "×";
-                                        color: local-tab-close-touch.has-hover ? #ffffff : #abb0ba;
+                                        color: local-tab-close-touch.has-hover ? Chrome.text : Chrome.muted;
                                         font-family: "Segoe UI Symbol";
                                         font-size: 18px;
                                         horizontal-alignment: center;
@@ -491,7 +546,7 @@ component WorkspaceGroup inherits Rectangle {
 
                             Rectangle {
                                 horizontal-stretch: 1;
-                                background: #202329;
+                                background: Chrome.sidebar;
                                 blank-tab-bar-touch := TouchArea {
                                     moved => {
                                         if (root.title-row && self.pressed) { root.window-drag-requested(); }
@@ -512,12 +567,12 @@ component WorkspaceGroup inherits Rectangle {
 
                 Rectangle {
                     width: 38px;
-                    background: group-new-terminal-touch.has-hover ? #343943 : transparent;
+                    background: group-new-terminal-touch.has-hover ? Chrome.hover : transparent;
                     Text {
-                        text: ">_+";
-                        color: #82c7ff;
+                        text: "+";
+                        color: Chrome.accent;
                         font-family: "Cascadia Mono";
-                        font-size: 12px;
+                        font-size: 19px;
                         font-weight: 600;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -536,20 +591,20 @@ component WorkspaceGroup inherits Rectangle {
         content-stack := Rectangle {
             horizontal-stretch: 1;
             vertical-stretch: 1;
-            background: #181a1f;
+            background: Chrome.canvas;
             clip: true;
 
         file-layer := Rectangle {
             visible: root.active-kind == "file";
             width: parent.width;
             height: parent.height;
-            background: #1e1e1e;
+            background: Chrome.canvas;
 
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
                     height: root.find-visible ? 36px : 0px;
-                    background: #24272e;
+                    background: Chrome.surface;
                     clip: true;
                     HorizontalLayout {
                         padding-left: 8px;
@@ -560,8 +615,8 @@ component WorkspaceGroup inherits Rectangle {
                             edited(text) => { root.find-requested(root.active-tab-id, text); }
                             horizontal-stretch: 1;
                         }
-                        Button {
-                            text: "Close";
+                        ActionButton {
+                            label: "Close";
                             clicked => { root.find-visibility-requested(root.group-id, false); }
                         }
                     }
@@ -570,11 +625,12 @@ component WorkspaceGroup inherits Rectangle {
                     spacing: 0px;
                     Rectangle {
                         width: 48px;
-                        background: #1e1e1e;
+                        background: Chrome.sidebar;
                         clip: true;
+                        Rectangle { x: parent.width - 1px; width: 1px; height: parent.height; background: Chrome.border; }
                         Text {
                             text: root.line-numbers;
-                            color: root.adjusted-font-color(#858585, root.editor-font-brightness);
+                            color: root.adjusted-font-color(#8090a2, root.editor-font-brightness);
                             font-family: "Cascadia Mono";
                             font-size: root.editor-font-size * 1px;
                             horizontal-alignment: right;
@@ -589,13 +645,13 @@ component WorkspaceGroup inherits Rectangle {
                         private property <length> cursor-y: 0px;
                         horizontal-stretch: 1;
                         vertical-stretch: 1;
-                        background: #1e1e1e;
+                        background: Chrome.canvas;
                         clip: true;
 
                         editor-scroll := ScrollView {
-                            x: 10px;
+                            x: 14px;
                             y: 6px;
-                            width: parent.width - 10px;
+                            width: parent.width - 14px;
                             height: parent.height - 6px;
                             viewport-width: max(self.visible-width, code-input.preferred-width + 2px);
                             viewport-height: max(self.visible-height, code-input.preferred-height + 4px);
@@ -604,7 +660,7 @@ component WorkspaceGroup inherits Rectangle {
                                 width: editor-scroll.viewport-width;
                                 height: editor-scroll.viewport-height;
                                 text: root.highlighted-text;
-                                default-color: root.adjusted-font-color(#d4d4d4, root.editor-font-brightness);
+                                default-color: root.adjusted-font-color(Chrome.text, root.editor-font-brightness);
                                 default-font-family: "Cascadia Mono";
                                 default-font-size: root.editor-font-size * 1px;
                                 vertical-alignment: top;
@@ -621,9 +677,9 @@ component WorkspaceGroup inherits Rectangle {
                                 font-size: root.editor-font-size * 1px;
                                 color: root.syntax-highlight-enabled && self.preedit-text == ""
                                     ? transparent
-                                    : root.adjusted-font-color(#d4d4d4, root.editor-font-brightness);
-                                selection-background-color: #264f78;
-                                selection-foreground-color: #ffffff;
+                                    : root.adjusted-font-color(Chrome.text, root.editor-font-brightness);
+                                selection-background-color: Chrome.accent-fill;
+                                selection-foreground-color: Chrome.text;
                                 page-height: editor-scroll.visible-height;
                                 text-cursor-width: 0px;
                                 changed requested-cursor-generation => {
@@ -704,14 +760,14 @@ component WorkspaceGroup inherits Rectangle {
                             width: 78px;
                             height: 28px;
                             border-radius: 4px;
-                            background: root.copy-feedback-active ? #2e7d4f
-                                : (copy-selection-touch.has-hover ? #3a3d43 : #292c32);
+                            background: root.copy-feedback-active ? #275d4f
+                                : (copy-selection-touch.has-hover ? Chrome.hover : Chrome.surface);
                             border-width: 1px;
-                            border-color: root.copy-feedback-active ? #55b979 : #555960;
+                            border-color: root.copy-feedback-active ? #55b979 : Chrome.border;
                             Text {
                                 text: root.copy-feedback-active ? "Copied!" : "Copy";
-                                color: #f0f0f0;
-                                font-family: "Geist";
+                                color: Chrome.text;
+                                font-family: "Segoe UI";
                                 font-size: 12px;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
@@ -729,24 +785,24 @@ component WorkspaceGroup inherits Rectangle {
             visible: root.active-kind == "diff";
             width: parent.width;
             height: parent.height;
-            background: #1e1e1e;
+            background: Chrome.canvas;
 
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
                     height: 34px;
-                    background: #181818;
+                    background: Chrome.surface;
                     border-width: 1px;
-                    border-color: #2b2b2b;
+                    border-color: Chrome.border;
                     HorizontalLayout {
                         spacing: 1px;
                         Rectangle {
                             horizontal-stretch: 1;
-                            background: #181818;
+                            background: Chrome.surface;
                             Text {
                                 text: root.diff-old-title;
-                                color: #cccccc;
-                                font-family: "Geist";
+                                color: Chrome.muted;
+                                font-family: "Segoe UI";
                                 font-size: 12px;
                                 x: 12px;
                                 width: parent.width - 18px;
@@ -754,14 +810,14 @@ component WorkspaceGroup inherits Rectangle {
                                 overflow: elide;
                             }
                         }
-                        Rectangle { width: 1px; background: #3c3c3c; }
+                        Rectangle { width: 1px; background: Chrome.border; }
                         Rectangle {
                             horizontal-stretch: 1;
-                            background: #181818;
+                            background: Chrome.surface;
                             Text {
                                 text: root.diff-new-title;
-                                color: #cccccc;
-                                font-family: "Geist";
+                                color: Chrome.muted;
+                                font-family: "Segoe UI";
                                 font-size: 12px;
                                 x: 12px;
                                 width: parent.width - 18px;
@@ -1022,10 +1078,10 @@ component WorkspaceGroup inherits Rectangle {
         if root.active-kind == "": Rectangle {
             width: parent.width;
             height: parent.height;
-            background: #181a1f;
+            background: Chrome.canvas;
             Text {
                 text: "Drop a file or terminal tab here";
-                color: #737985;
+                color: Chrome.muted;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
@@ -1040,17 +1096,17 @@ component WorkspaceGroup inherits Rectangle {
             y: root.terminal-context-y;
             width: 132px;
             height: root.terminal-selection-active ? 68px : 34px;
-            background: #252526;
+            background: Chrome.elevated;
             border-width: 1px;
-            border-color: #454545;
-            border-radius: 3px;
+            border-color: Chrome.border;
+            border-radius: 5px;
             if root.terminal-selection-active: Rectangle {
                 width: parent.width;
                 height: 34px;
-                background: terminal-copy-touch.has-hover ? #094771 : transparent;
+                background: terminal-copy-touch.has-hover ? Chrome.hover : transparent;
                 Text {
                     text: "Copy   Ctrl+C";
-                    color: #f0f0f0;
+                    color: Chrome.text;
                     font-size: 11px;
                     x: 10px;
                     width: parent.width - 20px;
@@ -1068,22 +1124,22 @@ component WorkspaceGroup inherits Rectangle {
                 y: root.terminal-selection-active ? 34px : 0px;
                 width: parent.width;
                 height: 34px;
-                background: terminal-paste-touch.has-hover ? #094771 : transparent;
-            Text {
-                text: "Paste   Ctrl+V";
-                color: #f0f0f0;
-                font-size: 11px;
-                x: 10px;
-                width: parent.width - 20px;
-                vertical-alignment: center;
-            }
-            terminal-paste-touch := TouchArea {
-                clicked => {
-                    root.terminal-context-visible = false;
-                    terminal-ime-input.focus();
-                    terminal-ime-input.paste();
+                background: terminal-paste-touch.has-hover ? Chrome.hover : transparent;
+                Text {
+                    text: "Paste   Ctrl+V";
+                    color: Chrome.text;
+                    font-size: 11px;
+                    x: 10px;
+                    width: parent.width - 20px;
+                    vertical-alignment: center;
                 }
-            }
+                terminal-paste-touch := TouchArea {
+                    clicked => {
+                        root.terminal-context-visible = false;
+                        terminal-ime-input.focus();
+                        terminal-ime-input.paste();
+                    }
+                }
             }
         }
         }
@@ -1092,6 +1148,7 @@ component WorkspaceGroup inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Araseo";
+    init => { Palette.color-scheme = ColorScheme.dark; }
     in-out property <int> terminal-font-size: 14;
     in-out property <int> editor-font-size: 14;
     in-out property <int> tree-font-size: 12;
@@ -1118,14 +1175,14 @@ export component AppWindow inherits Window {
     icon: @image-url("../assets/araseo-app-icon.png");
     no-frame: true;
     resize-border-width: root.maximized ? 0px : 5px;
-    default-font-family: "Geist";
+    default-font-family: "Segoe UI";
     default-font-size: 12px;
     default-font-weight: 400;
     preferred-width: 1200px;
     preferred-height: 800px;
     min-width: 800px;
     min-height: 600px;
-    background: #181a1f;
+    background: Chrome.canvas;
 
     function adjusted-font-color(source: color, brightness: int) -> color {
         if brightness >= 100 {
@@ -1544,12 +1601,12 @@ export component AppWindow inherits Window {
             Rectangle {
                 horizontal-stretch: 0;
                 width: root.sidebar-width;
-                background: #20232a;
+                background: Chrome.sidebar;
                 VerticalLayout {
                     spacing: 0px;
                     Rectangle {
                         height: 34px;
-                        background: title-left-touch.has-hover ? #24272e : #181a1f;
+                        background: title-left-touch.has-hover ? Chrome.surface : Chrome.sidebar;
                         HorizontalLayout {
                             padding-left: 10px;
                             padding-right: 10px;
@@ -1557,13 +1614,13 @@ export component AppWindow inherits Window {
                             alignment: center;
                             Image {
                                 source: @image-url("../assets/araseo-app-icon.png");
-                                width: 23px;
-                                height: 23px;
+                                width: 20px;
+                                height: 20px;
                                 image-fit: contain;
                             }
                             Text {
-                                text: "Araseo";
-                            color: root.adjusted-font-color(#e6e8ec, root.tree-font-brightness);
+                                text: "ARASEO";
+                                color: Chrome.text;
                                 font-size: 13px;
                                 font-weight: 700;
                                 vertical-alignment: center;
@@ -1578,18 +1635,18 @@ export component AppWindow inherits Window {
 
                     Rectangle {
                         height: 32px;
-                        background: #181a1f;
+                        background: Chrome.sidebar;
                         HorizontalLayout {
                             spacing: 0px;
                             Rectangle {
                                 horizontal-stretch: 1;
-                                background: root.sidebar-view == 0 ? #2a2d34
-                                    : (files-view-touch.has-hover ? #24272e : #20232a);
+                                background: root.sidebar-view == 0 ? Chrome.surface
+                                    : (files-view-touch.has-hover ? Chrome.hover : Chrome.sidebar);
                                 Text {
                                     text: "FILES";
                                     x: root.sidebar-view == 0 ? 8px : 0px;
                                     width: root.sidebar-view == 0 ? parent.width - 54px : parent.width;
-                                    color: root.sidebar-view == 0 ? #ffffff : #aeb4bf;
+                                    color: root.sidebar-view == 0 ? Chrome.text : Chrome.muted;
                                     font-size: 11px;
                                     font-weight: root.sidebar-view == 0 ? 600 : 400;
                                     horizontal-alignment: root.sidebar-view == 0 ? left : center;
@@ -1599,7 +1656,7 @@ export component AppWindow inherits Window {
                                     y: parent.height - 2px;
                                     height: 2px;
                                     width: parent.width;
-                                    background: root.sidebar-view == 0 ? #3794ff : transparent;
+                                    background: root.sidebar-view == 0 ? Chrome.accent : transparent;
                                 }
                                 files-view-touch := TouchArea {
                                     width: root.sidebar-view == 0 ? parent.width - 50px : parent.width;
@@ -1608,8 +1665,8 @@ export component AppWindow inherits Window {
                                 if root.sidebar-view == 0: Rectangle {
                                     x: parent.width - 48px;
                                     width: 24px;
-                                    background: new-file-touch.has-hover ? #41454d : transparent;
-                                    Text { text: "F+"; color: #d7dae0; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                    background: new-file-touch.has-hover ? Chrome.hover : transparent;
+                                    Text { text: "▤+"; color: Chrome.accent; font-family: "Segoe UI Symbol"; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
                                     new-file-touch := TouchArea {
                                         enabled: !root.tree-action-pending;
                                         clicked => {
@@ -1623,8 +1680,8 @@ export component AppWindow inherits Window {
                                 if root.sidebar-view == 0: Rectangle {
                                     x: parent.width - 24px;
                                     width: 24px;
-                                    background: new-folder-touch.has-hover ? #41454d : transparent;
-                                    Text { text: "D+"; color: #d7dae0; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                                    background: new-folder-touch.has-hover ? Chrome.hover : transparent;
+                                    Text { text: "▰+"; color: Chrome.accent; font-family: "Segoe UI Symbol"; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
                                     new-folder-touch := TouchArea {
                                         enabled: !root.tree-action-pending;
                                         clicked => {
@@ -1638,11 +1695,11 @@ export component AppWindow inherits Window {
                             }
                             Rectangle {
                                 horizontal-stretch: 1;
-                                background: root.sidebar-view == 1 ? #2a2d34
-                                    : (git-view-touch.has-hover ? #24272e : #20232a);
+                                background: root.sidebar-view == 1 ? Chrome.surface
+                                    : (git-view-touch.has-hover ? Chrome.hover : Chrome.sidebar);
                                 Text {
                                     text: root.git-change-count > 0 ? "GIT  " + root.git-change-count : "GIT";
-                                    color: root.sidebar-view == 1 ? #ffffff : #aeb4bf;
+                                    color: root.sidebar-view == 1 ? Chrome.text : Chrome.muted;
                                     font-size: 11px;
                                     font-weight: root.sidebar-view == 1 ? 600 : 400;
                                     horizontal-alignment: center;
@@ -1652,7 +1709,7 @@ export component AppWindow inherits Window {
                                     y: parent.height - 2px;
                                     height: 2px;
                                     width: parent.width;
-                                    background: root.sidebar-view == 1 ? #3794ff : transparent;
+                                    background: root.sidebar-view == 1 ? Chrome.accent : transparent;
                                 }
                                 git-view-touch := TouchArea { clicked => { root.sidebar-view = 1; } }
                             }
@@ -1665,24 +1722,33 @@ export component AppWindow inherits Window {
                             spacing: 0px;
                             for entry[index] in root.tree-entries: Rectangle {
                                 height: root.file-tree-row-height;
-                                background: tree-touch.has-hover ? #343943 : transparent;
+                                background: tree-touch.has-hover ? Chrome.hover : transparent;
                                 HorizontalLayout {
-                                    padding-left: entry.depth * 14px + 8px;
-                                    padding-right: 6px;
-                                    spacing: 5px;
-                                    Image {
-                                        source: entry.icon;
-                                        width: 22px;
-                                        height: 22px;
-                                        image-fit: contain;
+                                    padding-left: entry.depth * 14px + 12px;
+                                    padding-right: 10px;
+                                    spacing: 7px;
+                                    Rectangle {
+                                        width: 19px;
+                                        height: 19px;
+                                        border-radius: 4px;
+                                        background: entry.is-directory ? #2b4b64 : #303b49;
+                                        Image {
+                                            source: entry.icon;
+                                            colorize: entry.is-directory ? Chrome.accent : Chrome.muted;
+                                            x: 2px;
+                                            y: 2px;
+                                            width: 15px;
+                                            height: 15px;
+                                            image-fit: contain;
+                                        }
                                     }
                                     Text {
                                         text: entry.name;
                                         color: root.adjusted-font-color(
-                                            entry.git-mark == "U" ? #65c466 : (entry.git-mark == "M" ? #e2b86b : #d5d8de),
+                                            entry.git-mark == "U" ? #80d8a3 : (entry.git-mark == "M" ? #f0c57e : Chrome.text),
                                             root.tree-font-brightness,
                                         );
-                                        font-family: "Geist";
+                                        font-family: "Segoe UI";
                                         font-size: root.tree-font-size * 1px;
                                         vertical-alignment: center;
                                         overflow: elide;
@@ -1691,10 +1757,10 @@ export component AppWindow inherits Window {
                                     Text {
                                         text: entry.git-mark;
                                         color: root.adjusted-font-color(
-                                            entry.git-mark == "U" ? #65c466 : #e2b86b,
+                                            entry.git-mark == "U" ? #80d8a3 : #f0c57e,
                                             root.tree-font-brightness,
                                         );
-                                        font-family: "Geist";
+                                        font-family: "Segoe UI";
                                         font-size: root.tree-font-size * 1px;
                                         font-weight: 500;
                                         vertical-alignment: center;
@@ -1759,18 +1825,18 @@ export component AppWindow inherits Window {
 
                     if root.sidebar-view == 1: Rectangle {
                         vertical-stretch: 1;
-                        background: #181a1f;
+                        background: Chrome.sidebar;
                         VerticalLayout {
                             spacing: 0px;
                             Rectangle {
                                 height: 34px;
-                                background: #181818;
+                                background: Chrome.surface;
                                 HorizontalLayout {
                                     padding-left: 10px;
                                     padding-right: 10px;
                                     Text {
                                         text: "SOURCE CONTROL";
-                                        color: #f0f0f0;
+                                        color: Chrome.text;
                                         font-size: 12px;
                                         font-weight: 600;
                                         vertical-alignment: center;
@@ -1780,10 +1846,10 @@ export component AppWindow inherits Window {
                                         width: 28px;
                                         height: 18px;
                                         border-radius: 9px;
-                                        background: #3a3d41;
+                                        background: Chrome.accent-fill;
                                         Text {
                                             text: root.git-change-count;
-                                            color: #f0f0f0;
+                                            color: Chrome.text;
                                             font-size: 10px;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
@@ -1799,7 +1865,7 @@ export component AppWindow inherits Window {
                                         height: 64px;
                                         Text {
                                             text: "No changes";
-                                            color: #8c8c8c;
+                                            color: Chrome.muted;
                                             font-size: 12px;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
@@ -1808,19 +1874,19 @@ export component AppWindow inherits Window {
                                     for entry in root.git-entries: Rectangle {
                                         height: entry.kind == "repository" ? 48px : 30px;
                                         background: entry.kind == "repository"
-                                            ? (git-entry-touch.has-hover ? #303033 : #252526)
-                                            : (git-entry-touch.has-hover ? #2a2d2e : transparent);
+                                            ? (git-entry-touch.has-hover ? Chrome.hover : Chrome.surface)
+                                            : (git-entry-touch.has-hover ? Chrome.hover : transparent);
                                         if entry.kind == "repository": Rectangle {
                                             x: 0px;
                                             width: 3px;
                                             height: parent.height;
-                                            background: entry.expanded ? #3794ff : #55575b;
+                                            background: entry.expanded ? Chrome.accent : Chrome.border;
                                         }
                                         if entry.kind == "change": Rectangle {
                                             x: 14px;
                                             width: 1px;
                                             height: parent.height;
-                                            background: #3c3c3c;
+                                            background: Chrome.border;
                                         }
                                         git-entry-touch := TouchArea {
                                             clicked => {
@@ -1837,7 +1903,7 @@ export component AppWindow inherits Window {
                                             spacing: 8px;
                                             Text {
                                                 text: entry.expanded ? "⌄" : "›";
-                                                color: #f0f0f0;
+                                                color: Chrome.text;
                                                 font-size: 16px;
                                                 vertical-alignment: center;
                                             }
@@ -1847,7 +1913,7 @@ export component AppWindow inherits Window {
                                                     spacing: 0px;
                                                     Text {
                                                         text: entry.name;
-                                                        color: #f0f0f0;
+                                                        color: Chrome.text;
                                                         font-size: 12px;
                                                         font-weight: 600;
                                                         vertical-alignment: bottom;
@@ -1855,7 +1921,7 @@ export component AppWindow inherits Window {
                                                     }
                                                     Text {
                                                         text: "PROJECT  ·  " + entry.detail;
-                                                        color: #8c8c8c;
+                                                        color: Chrome.muted;
                                                         font-size: 9px;
                                                         vertical-alignment: top;
                                                         overflow: elide;
@@ -1866,10 +1932,10 @@ export component AppWindow inherits Window {
                                                 width: 28px;
                                                 height: 18px;
                                                 border-radius: 9px;
-                                                background: #3a3d41;
+                                                background: Chrome.accent-fill;
                                                 Text {
                                                     text: entry.count;
-                                                    color: #cccccc;
+                                                    color: Chrome.text;
                                                     font-size: 10px;
                                                     horizontal-alignment: center;
                                                     vertical-alignment: center;
@@ -1880,16 +1946,16 @@ export component AppWindow inherits Window {
                                             padding-left: 25px;
                                             padding-right: 5px;
                                             spacing: 5px;
-                                            Image { source: entry.icon; width: 18px; height: 18px; image-fit: contain; }
+                                            Image { source: entry.icon; colorize: Chrome.muted; width: 18px; height: 18px; image-fit: contain; }
                                             Text {
                                                 text: entry.name;
-                                                color: #cccccc;
+                                                color: Chrome.text;
                                                 font-size: 12px;
                                                 vertical-alignment: center;
                                             }
                                             Text {
                                                 text: entry.detail;
-                                                color: #8c8c8c;
+                                                color: Chrome.muted;
                                                 font-size: 10px;
                                                 vertical-alignment: center;
                                                 overflow: elide;
@@ -1899,7 +1965,7 @@ export component AppWindow inherits Window {
                                                 width: 24px;
                                                 height: 22px;
                                                 border-radius: 3px;
-                                                background: discard-touch.has-hover ? #3a3d41 : transparent;
+                                                background: discard-touch.has-hover ? Chrome.hover : transparent;
                                                 Text {
                                                     text: "↶";
                                                     color: #cccccc;
@@ -1953,7 +2019,7 @@ export component AppWindow inherits Window {
             }
 
             workspace-area := Rectangle {
-                background: #181a1f;
+                background: Chrome.canvas;
                 horizontal-stretch: 1;
                 max-width: 100000px;
                 clip: true;
@@ -2303,7 +2369,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: "Drop to paste path";
                         color: #ffffff;
-                        font-family: "Geist";
+                        font-family: "Segoe UI";
                         font-size: 14px;
                         font-weight: 600;
                         horizontal-alignment: center;
@@ -2343,7 +2409,7 @@ export component AppWindow inherits Window {
                             : (root.dock-preview == 5 ? "Move tab to this group"
                             : "Move tab to this group"))));
                         color: white;
-                        font-family: "Geist";
+                        font-family: "Segoe UI";
                         font-size: 14px;
                         font-weight: 600;
                         horizontal-alignment: center;
@@ -2356,16 +2422,18 @@ export component AppWindow inherits Window {
 
         Rectangle {
             height: 24px;
-            background: #2f6f9f;
+            background: Chrome.surface;
+            Rectangle { height: 1px; width: parent.width; background: Chrome.border; }
             HorizontalLayout {
-                padding-left: 9px;
-                padding-right: 9px;
-                spacing: 6px;
-                Text { text: root.workspace-name; color: white; vertical-alignment: center; }
-                Text { text: root.active-path; color: white; horizontal-alignment: center; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 10px;
+                Text { text: "●"; color: #73c7ac; font-size: 9px; vertical-alignment: center; }
+                Text { text: root.workspace-name; color: Chrome.text; font-size: 11px; font-weight: 600; vertical-alignment: center; }
+                Text { text: root.active-path; color: Chrome.muted; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                 if root.editor-selection-length > 0: Text {
                     text: root.editor-selection-length + " bytes selected";
-                    color: white;
+                    color: Chrome.muted;
                     vertical-alignment: center;
                 }
                 Button { text: "WSL"; width: 46px; clicked => {
@@ -2377,7 +2445,7 @@ export component AppWindow inherits Window {
                     root.wsl-diagnostics-visible = false;
                     root.font-menu-visible = !root.font-menu-visible;
                 } }
-                Text { text: root.status-text; color: white; vertical-alignment: center; }
+                Text { text: root.status-text; color: Chrome.muted; font-size: 11px; vertical-alignment: center; }
                 if root.save-conflict: Button { text: "Reload"; clicked => { root.reload-requested(); } }
                 if root.save-conflict: Button { text: "Overwrite"; clicked => { root.force-save-requested(); } }
             }
@@ -2399,7 +2467,7 @@ export component AppWindow inherits Window {
                 width: parent.width - 18px;
                 text: (root.tree-drop-terminal-id >= 0 ? "Paste  " : "Drag  ") + root.tree-drag-name;
                 color: #f0f0f0;
-                font-family: "Geist";
+                font-family: "Segoe UI";
                 font-size: 11px;
                 vertical-alignment: center;
                 overflow: elide;
@@ -2423,8 +2491,8 @@ export component AppWindow inherits Window {
             y: root.tree-context-y;
             width: 198px;
             height: 188px;
-            background: #252526;
-            border-color: #454545;
+            background: Chrome.elevated;
+            border-color: Chrome.border;
             border-width: 1px;
             border-radius: 4px;
             TouchArea { }
@@ -2435,7 +2503,7 @@ export component AppWindow inherits Window {
                     height: 26px;
                     Text {
                         text: root.tree-context-name;
-                        color: #8c8c8c;
+                        color: Chrome.muted;
                         font-size: 10px;
                         x: 8px;
                         width: parent.width - 16px;
@@ -2445,8 +2513,9 @@ export component AppWindow inherits Window {
                 }
                 Rectangle {
                     height: 30px;
-                    background: context-new-file-touch.has-hover ? #094771 : transparent;
-                    Text { text: "New File"; color: #f0f0f0; x: 8px; vertical-alignment: center; }
+                    background: context-new-file-touch.has-hover ? Chrome.hover : transparent;
+                    Text { text: "▤"; color: Chrome.accent; x: 9px; width: 19px; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "New File"; color: Chrome.text; x: 36px; vertical-alignment: center; }
                     context-new-file-touch := TouchArea {
                         enabled: !root.tree-action-pending;
                         clicked => {
@@ -2460,8 +2529,9 @@ export component AppWindow inherits Window {
                 }
                 Rectangle {
                     height: 30px;
-                    background: context-new-folder-touch.has-hover ? #094771 : transparent;
-                    Text { text: "New Folder"; color: #f0f0f0; x: 8px; vertical-alignment: center; }
+                    background: context-new-folder-touch.has-hover ? Chrome.hover : transparent;
+                    Text { text: "▰"; color: Chrome.accent; x: 9px; width: 19px; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "New Folder"; color: Chrome.text; x: 36px; vertical-alignment: center; }
                     context-new-folder-touch := TouchArea {
                         enabled: !root.tree-action-pending;
                         clicked => {
@@ -2475,8 +2545,9 @@ export component AppWindow inherits Window {
                 }
                 Rectangle {
                     height: 30px;
-                    background: context-rename-touch.has-hover ? #094771 : transparent;
-                    Text { text: "Rename"; color: #f0f0f0; x: 8px; vertical-alignment: center; }
+                    background: context-rename-touch.has-hover ? Chrome.hover : transparent;
+                    Text { text: "✎"; color: Chrome.muted; x: 9px; width: 19px; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Rename"; color: Chrome.text; x: 36px; vertical-alignment: center; }
                     context-rename-touch := TouchArea {
                         enabled: !root.tree-action-pending;
                         clicked => {
@@ -2491,8 +2562,9 @@ export component AppWindow inherits Window {
                 }
                 Rectangle {
                     height: 30px;
-                    background: context-copy-touch.has-hover ? #094771 : transparent;
-                    Text { text: "Copy Path"; color: #f0f0f0; x: 8px; vertical-alignment: center; }
+                    background: context-copy-touch.has-hover ? Chrome.hover : transparent;
+                    Text { text: "⧉"; color: Chrome.muted; x: 9px; width: 19px; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Copy Path"; color: Chrome.text; x: 36px; vertical-alignment: center; }
                     context-copy-touch := TouchArea {
                         clicked => {
                             root.tree-context-visible = false;
@@ -2505,8 +2577,9 @@ export component AppWindow inherits Window {
                 }
                 Rectangle {
                     height: 30px;
-                    background: context-delete-touch.has-hover ? #5a1d1d : transparent;
-                    Text { text: "Delete"; color: #f48771; x: 8px; vertical-alignment: center; }
+                    background: context-delete-touch.has-hover ? #593440 : transparent;
+                    Text { text: "×"; color: Chrome.danger; x: 9px; width: 19px; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Delete"; color: Chrome.danger; x: 36px; vertical-alignment: center; }
                     context-delete-touch := TouchArea {
                         enabled: !root.tree-action-pending;
                         clicked => {
@@ -2532,18 +2605,18 @@ export component AppWindow inherits Window {
             y: (parent.height - self.height) / 2;
             width: 420px;
             height: 172px;
-            background: #252526;
-            border-color: #454545;
+            background: Chrome.elevated;
+            border-color: Chrome.border;
             border-width: 1px;
-            border-radius: 5px;
+            border-radius: 8px;
             TouchArea { }
             VerticalLayout {
                 padding: 18px;
                 spacing: 12px;
                 Text {
                     text: root.tree-create-is-directory ? "New Folder" : "New File";
-                    color: #f0f0f0;
-                    font-size: 15px;
+                    color: Chrome.text;
+                    font-size: 16px;
                     font-weight: 600;
                 }
                 create-entry-name := LineEdit {
@@ -2554,10 +2627,12 @@ export component AppWindow inherits Window {
                 }
                 HorizontalLayout {
                     alignment: end;
-                    Button { text: "Cancel"; clicked => { root.tree-create-visible = false; } }
-                    Button {
-                        text: "Create";
-                        enabled: root.tree-create-name != "" && !root.tree-action-pending;
+                    spacing: 8px;
+                    ActionButton { label: "Cancel"; clicked => { root.tree-create-visible = false; } }
+                    ActionButton {
+                        label: "Create";
+                        intent: "primary";
+                        available: root.tree-create-name != "" && !root.tree-action-pending;
                         clicked => { root.submit-tree-create(); }
                     }
                 }
@@ -2577,30 +2652,32 @@ export component AppWindow inherits Window {
             y: (parent.height - self.height) / 2;
             width: 420px;
             height: 170px;
-            background: #252526;
-            border-color: #454545;
+            background: Chrome.elevated;
+            border-color: Chrome.border;
             border-width: 1px;
-            border-radius: 5px;
+            border-radius: 8px;
             TouchArea { }
             VerticalLayout {
                 padding: 18px;
                 spacing: 12px;
-                Text { text: "Delete " + root.tree-delete-name + "?"; color: #f0f0f0; font-size: 15px; font-weight: 600; }
+                Text { text: "Delete " + root.tree-delete-name + "?"; color: Chrome.text; font-size: 16px; font-weight: 600; }
                 Text {
                     text: root.tree-context-is-directory
                         ? "This permanently deletes the folder and everything inside it."
                         : "This permanently deletes the file.";
-                    color: #cccccc;
+                    color: Chrome.muted;
                     font-size: 12px;
                     wrap: word-wrap;
                     vertical-stretch: 1;
                 }
                 HorizontalLayout {
                     alignment: end;
-                    Button { text: "Cancel"; clicked => { root.tree-delete-visible = false; } }
-                    Button {
-                        text: "Delete";
-                        enabled: !root.tree-action-pending;
+                    spacing: 8px;
+                    ActionButton { label: "Cancel"; clicked => { root.tree-delete-visible = false; } }
+                    ActionButton {
+                        label: "Delete";
+                        intent: "danger";
+                        available: !root.tree-action-pending;
                         clicked => {
                             root.tree-delete-visible = false;
                             root.tree-delete-requested(root.tree-delete-path);
@@ -2622,18 +2699,18 @@ export component AppWindow inherits Window {
             y: (parent.height - self.height) / 2;
             width: 420px;
             height: 172px;
-            background: #252526;
-            border-color: #454545;
+            background: Chrome.elevated;
+            border-color: Chrome.border;
             border-width: 1px;
-            border-radius: 5px;
+            border-radius: 8px;
             TouchArea { }
             VerticalLayout {
                 padding: 18px;
                 spacing: 12px;
                 Text {
                     text: root.tree-rename-is-directory ? "Rename Folder" : "Rename File";
-                    color: #f0f0f0;
-                    font-size: 15px;
+                    color: Chrome.text;
+                    font-size: 16px;
                     font-weight: 600;
                 }
                 LineEdit {
@@ -2644,10 +2721,12 @@ export component AppWindow inherits Window {
                 }
                 HorizontalLayout {
                     alignment: end;
-                    Button { text: "Cancel"; clicked => { root.tree-rename-visible = false; } }
-                    Button {
-                        text: "Rename";
-                        enabled: root.tree-rename-name != ""
+                    spacing: 8px;
+                    ActionButton { label: "Cancel"; clicked => { root.tree-rename-visible = false; } }
+                    ActionButton {
+                        label: "Rename";
+                        intent: "primary";
+                        available: root.tree-rename-name != ""
                             && root.tree-rename-name != root.tree-rename-original-name
                             && !root.tree-action-pending;
                         clicked => { root.submit-tree-rename(); }
@@ -2666,40 +2745,41 @@ export component AppWindow inherits Window {
             y: parent.height - self.height - 30px;
             width: 410px;
             height: 280px;
-            background: #25282f;
-            border-color: #454a54;
+            background: Chrome.elevated;
+            border-color: Chrome.border;
             border-width: 1px;
-            border-radius: 6px;
+            border-radius: 8px;
             TouchArea { }
             VerticalLayout {
                 padding: 14px;
                 spacing: 10px;
-                Text { text: "Font appearance"; color: #ffffff; font-size: 14px; font-weight: 600; }
+                Text { text: "Appearance"; color: Chrome.text; font-size: 16px; font-weight: 600; }
                 HorizontalLayout {
                     Rectangle { horizontal-stretch: 1; }
-                    Text { text: "Size (px)"; color: #aeb4bf; width: 110px; horizontal-alignment: center; }
-                    Text { text: "Brightness (%)"; color: #aeb4bf; width: 110px; horizontal-alignment: center; }
+                    Text { text: "SIZE"; color: Chrome.muted; font-size: 10px; font-weight: 600; width: 110px; horizontal-alignment: center; }
+                    Text { text: "BRIGHTNESS"; color: Chrome.muted; font-size: 10px; font-weight: 600; width: 110px; horizontal-alignment: center; }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "Terminal"; color: #d4d4d4; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: "Terminal"; color: Chrome.text; vertical-alignment: center; horizontal-stretch: 1; }
                     SpinBox { width: 110px; minimum: 10; maximum: 28; value <=> root.terminal-font-size; }
                     SpinBox { width: 110px; minimum: 50; maximum: 150; value <=> root.terminal-font-brightness; }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "File viewer"; color: #d4d4d4; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: "Editor"; color: Chrome.text; vertical-alignment: center; horizontal-stretch: 1; }
                     SpinBox { width: 110px; minimum: 10; maximum: 28; value <=> root.editor-font-size; }
                     SpinBox { width: 110px; minimum: 50; maximum: 150; value <=> root.editor-font-brightness; }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "File list"; color: #d4d4d4; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: "Explorer"; color: Chrome.text; vertical-alignment: center; horizontal-stretch: 1; }
                     SpinBox { width: 110px; minimum: 10; maximum: 24; value <=> root.tree-font-size; }
                     SpinBox { width: 110px; minimum: 50; maximum: 150; value <=> root.tree-font-brightness; }
                 }
                 HorizontalLayout {
-                    Button { text: "Reset"; clicked => {
+                    spacing: 8px;
+                    ActionButton { label: "Reset defaults"; clicked => {
                         root.terminal-font-size = 14;
                         root.editor-font-size = 14;
                         root.tree-font-size = 12;
@@ -2707,38 +2787,41 @@ export component AppWindow inherits Window {
                         root.editor-font-brightness = 120;
                         root.tree-font-brightness = 120;
                     } }
-                    Button { text: "Close"; clicked => { root.font-menu-visible = false; } }
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton { label: "Done"; intent: "primary"; clicked => { root.font-menu-visible = false; } }
                 }
             }
         }
 
-        if root.wsl-diagnostics-visible: TouchArea {
+        if root.wsl-diagnostics-visible: Rectangle {
             width: parent.width;
             height: parent.height - 24px;
-            clicked => { root.wsl-diagnostics-visible = false; }
+            background: #070c13;
+            opacity: 0.6;
+            TouchArea { clicked => { root.wsl-diagnostics-visible = false; } }
         }
         if root.wsl-diagnostics-visible: Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height - 24px) / 2;
             width: min(parent.width - 40px, 540px);
             height: 552px;
-            background: #25282f;
-            border-color: #454a54;
+            background: Chrome.elevated;
+            border-color: Chrome.border;
             border-width: 1px;
-            border-radius: 6px;
+            border-radius: 8px;
             TouchArea { }
             VerticalLayout {
                 padding: 16px;
                 spacing: 8px;
                 HorizontalLayout {
                     height: 26px;
-                    Text { text: "WSL environment diagnostics"; color: white; font-size: 16px; font-weight: 600; horizontal-stretch: 1; }
-                    Button { text: "Close"; clicked => { root.wsl-diagnostics-visible = false; } }
+                    Text { text: "WSL environment"; color: Chrome.text; font-size: 16px; font-weight: 600; horizontal-stretch: 1; }
+                    ActionButton { label: "Close"; clicked => { root.wsl-diagnostics-visible = false; } }
                 }
                 Text {
                     height: 34px;
                     text: root.wsl-diagnostics-running ? "Checking this workspace..." : "Read-only snapshot; no processes or services are stopped";
-                    color: #b8bec9;
+                    color: Chrome.muted;
                     font-size: 12px;
                     vertical-alignment: center;
                 }
@@ -2748,15 +2831,15 @@ export component AppWindow inherits Window {
                         spacing: 5px;
                         for check in root.wsl-checks: Rectangle {
                             height: check.kind == "process" ? 46px : 65px;
-                            background: #30343c;
-                            border-radius: 4px;
+                            background: Chrome.surface;
+                            border-radius: 6px;
                             Text {
                                 x: 10px;
                                 y: 8px;
                                 width: parent.width - 20px;
                                 height: 20px;
                                 text: (check.level == "good" ? "✓  " : check.level == "warning" ? "!  " : check.level == "error" ? "×  " : "·  ") + check.title;
-                                color: check.level == "good" ? #90d3a2 : check.level == "warning" ? #f3c472 : check.level == "error" ? #f48771 : #b8bec9;
+                                color: check.level == "good" ? #80d8a3 : check.level == "warning" ? #f0c57e : check.level == "error" ? Chrome.danger : Chrome.muted;
                                 font-weight: 600;
                             }
                             Text {
@@ -2765,32 +2848,32 @@ export component AppWindow inherits Window {
                                 width: parent.width - 20px;
                                 height: check.kind == "process" ? 18px : 32px;
                                 text: check.detail;
-                                color: #d4d7dd;
+                                color: Chrome.text;
                                 font-size: 11px;
                                 wrap: word-wrap;
                             }
                         }
                         if root.wsl-docker-usage-visible: Rectangle {
                             height: 28px;
-                            background: #25282f;
-                            Text { text: "Container CPU and memory"; color: #ffffff; font-weight: 600; vertical-alignment: center; }
+                            background: Chrome.elevated;
+                            Text { text: "Container CPU and memory"; color: Chrome.text; font-weight: 600; vertical-alignment: center; }
                         }
                         if root.wsl-docker-usage-visible && root.wsl-docker-usage-running: Rectangle {
                             height: 30px;
-                            Text { text: "Checking running containers..."; color: #b8bec9; vertical-alignment: center; }
+                            Text { text: "Checking running containers..."; color: Chrome.muted; vertical-alignment: center; }
                         }
                         if root.wsl-docker-usage-visible && root.wsl-docker-usage-error != "": Rectangle {
                             height: 48px;
-                            Text { text: root.wsl-docker-usage-error; color: #f3c472; width: parent.width; wrap: word-wrap; vertical-alignment: center; }
+                            Text { text: root.wsl-docker-usage-error; color: #f0c57e; width: parent.width; wrap: word-wrap; vertical-alignment: center; }
                         }
                         if root.wsl-docker-usage-visible: VerticalLayout {
                             spacing: 5px;
                             for container in root.wsl-docker-usage: Rectangle {
                                 height: 46px;
-                                background: #30343c;
-                                border-radius: 4px;
-                                Text { x: 10px; y: 5px; text: container.name; color: #d4d7dd; font-weight: 600; }
-                                Text { x: 10px; y: 25px; text: "CPU " + container.cpu + " · memory " + container.memory; color: #b8bec9; font-size: 11px; }
+                                background: Chrome.surface;
+                                border-radius: 6px;
+                                Text { x: 10px; y: 5px; text: container.name; color: Chrome.text; font-weight: 600; }
+                                Text { x: 10px; y: 25px; text: "CPU " + container.cpu + " · memory " + container.memory; color: Chrome.muted; font-size: 11px; }
                             }
                         }
                     }
@@ -2798,15 +2881,15 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     height: 30px;
                     spacing: 8px;
-                    Button { text: "Run again"; enabled: !root.wsl-diagnostics-running; clicked => { root.wsl-diagnostics-requested(); } }
-                    if root.wsl-docker-usage-available: Button {
-                        text: root.wsl-docker-usage-visible ? "Hide containers" : "Container usage";
+                    ActionButton { label: "Run again"; available: !root.wsl-diagnostics-running; clicked => { root.wsl-diagnostics-requested(); } }
+                    if root.wsl-docker-usage-available: ActionButton {
+                        label: root.wsl-docker-usage-visible ? "Hide containers" : "Container usage";
                         clicked => {
                             root.wsl-docker-usage-visible = !root.wsl-docker-usage-visible;
                             if (root.wsl-docker-usage-visible) { root.wsl-docker-usage-requested(); }
                         }
                     }
-                    Button { text: "Copy report"; enabled: root.wsl-report-text != ""; clicked => {
+                    ActionButton { label: "Copy report"; available: root.wsl-report-text != ""; clicked => {
                         clipboard-staging.text = root.wsl-report-text;
                         clipboard-staging.select-all();
                         clipboard-staging.copy();
@@ -2828,27 +2911,29 @@ export component AppWindow inherits Window {
             y: (parent.height - self.height) / 2;
             width: 420px;
             height: 170px;
-            background: #252526;
-            border-color: #454545;
+            background: Chrome.elevated;
+            border-color: Chrome.border;
             border-width: 1px;
-            border-radius: 5px;
+            border-radius: 8px;
             TouchArea { }
             VerticalLayout {
                 padding: 18px;
                 spacing: 12px;
-                Text { text: "Discard changes?"; color: #f0f0f0; font-size: 15px; font-weight: 600; }
+                Text { text: "Discard changes?"; color: Chrome.text; font-size: 16px; font-weight: 600; }
                 Text {
                     text: "This will permanently discard changes in " + root.discard-confirm-name + ".";
-                    color: #cccccc;
+                    color: Chrome.muted;
                     font-size: 12px;
                     wrap: word-wrap;
                     vertical-stretch: 1;
                 }
                 HorizontalLayout {
                     alignment: end;
-                    Button { text: "Cancel"; clicked => { root.discard-confirm-visible = false; } }
-                    Button {
-                        text: "Discard";
+                    spacing: 8px;
+                    ActionButton { label: "Cancel"; clicked => { root.discard-confirm-visible = false; } }
+                    ActionButton {
+                        label: "Discard";
+                        intent: "danger";
                         clicked => {
                             root.discard-confirm-visible = false;
                             root.git-discard-requested(root.discard-confirm-path);

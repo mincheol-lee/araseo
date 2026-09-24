@@ -96,8 +96,8 @@ mod tests {
             .filter(|(index, pixel)| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (80..106).contains(&x)
-                    && (4..31).contains(&y)
+                x < 250
+                    && y < 34
                     && pixel.red > 180
                     && pixel.green > 180
                     && pixel.blue > 180
@@ -109,8 +109,8 @@ mod tests {
             .filter(|(index, pixel)| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (80..106).contains(&x)
-                    && (4..31).contains(&y)
+                x < 250
+                    && y < 34
                     && pixel.blue > pixel.red.saturating_add(25)
                     && pixel.blue > pixel.green.saturating_add(15)
                     && pixel.blue > 100
@@ -274,6 +274,16 @@ mod tests {
         });
         ui.show().unwrap();
         let populated_ui = render(&window);
+        assert_eq!(
+            populated_ui[300 * 1200 + 200],
+            TestPixel::from_rgb(0x17, 0x1e, 0x28),
+            "the explorer lost its distinct dark surface"
+        );
+        assert_eq!(
+            populated_ui[300 * 1200 + 600],
+            TestPixel::from_rgb(0x10, 0x15, 0x1d),
+            "the editor lost its low-glare canvas"
+        );
         write_snapshot_if_requested("single-editor.png", &populated_ui);
 
         assert!(
@@ -394,7 +404,7 @@ mod tests {
             "🧩",
             "context-aware project emoji was not delivered to the tree UI"
         );
-        let colored_emoji_pixels = populated_ui
+        let colored_icon_pixels = populated_ui
             .iter()
             .enumerate()
             .filter(|(index, pixel)| {
@@ -407,8 +417,8 @@ mod tests {
             })
             .count();
         assert!(
-            colored_emoji_pixels > 5,
-            "tree emoji reached the UI but was not rendered in color"
+            colored_icon_pixels > 5,
+            "the explorer's icon badge was not rendered with its accent color"
         );
 
         dispatch_click(&ui, 72.0, 51.0);
@@ -416,7 +426,33 @@ mod tests {
             ui.get_tree_create_visible() && !ui.get_tree_create_is_directory(),
             "the FILES toolbar did not open the new-file dialog"
         );
-        write_snapshot_if_requested("new-file-dialog.png", &render(&window));
+        let create_dialog = render(&window);
+        let input_surface = create_dialog[399 * 1200 + 600];
+        assert!(
+            input_surface.red < 90 && input_surface.green < 90 && input_surface.blue < 110,
+            "the create dialog input returned to the bright system style"
+        );
+        for (label, left, right) in [("Cancel", 636, 710), ("Create", 718, 792)] {
+            let caption_pixels = (445..462)
+                .flat_map(|y| (left + 12..right - 12).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let pixel = create_dialog[y * 1200 + x];
+                    pixel.red > 150 && pixel.green > 150 && pixel.blue > 150
+                })
+                .count();
+            let clipped_leading_pixels = (445..462)
+                .flat_map(|y| (left + 1..left + 10).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let pixel = create_dialog[y * 1200 + x];
+                    pixel.red > 150 && pixel.green > 150 && pixel.blue > 150
+                })
+                .count();
+            assert!(
+                caption_pixels > 10 && clipped_leading_pixels == 0,
+                "the {label} caption is missing or clipped against its button's leading edge"
+            );
+        }
+        write_snapshot_if_requested("new-file-dialog.png", &create_dialog);
         ui.set_tree_create_name("new.rs".into());
         render(&window);
         dispatch_click(&ui, 760.0, 451.0);
@@ -537,7 +573,7 @@ mod tests {
         dispatch_pointer(
             &ui,
             WindowEvent::PointerMoved {
-                position: LogicalPosition::new(340.0, 17.0),
+                position: LogicalPosition::new(370.0, 17.0),
             },
         );
         let after_close_hover = render(&window);
@@ -548,7 +584,7 @@ mod tests {
             .filter(|(index, (before, after))| {
                 let x = index % 1200;
                 let y = index / 1200;
-                (320..360).contains(&x) && (0..36).contains(&y) && before != after
+                (350..390).contains(&x) && (0..36).contains(&y) && before != after
             })
             .count();
         assert!(
