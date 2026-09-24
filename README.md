@@ -15,6 +15,11 @@ sessions stay in the selected WSL distribution.
 
 Two terminal sessions alongside source files in a split workspace.
 
+![Araseo showing a side-by-side README diff above a terminal and code editor](assets/araseo-git-diff.png)
+
+A Git change compared between `HEAD` and the working tree, with a terminal and
+source file open in the panes below.
+
 ## What it does
 
 - Browse a lazy-loading file tree. Create or rename entries, delete them after
