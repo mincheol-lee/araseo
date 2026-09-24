@@ -134,3 +134,8 @@ the Cargo package version, and publishes the GitHub Release assets. Tags with a
 pre-release suffix, such as `v0.2.0-beta.1`, create a GitHub pre-release.
 
 Use **Aa** in the status bar to change terminal, file viewer, and file list font sizes and brightness independently. **Reset** restores the Orca-matched defaults (14, 14, and 12 px at 120% brightness). Settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or `$XDG_CONFIG_HOME/araseo/fonts.conf` (default `~/.config/araseo/fonts.conf`) on Linux.
+
+## Support
+
+If Araseo is useful to you and you'd like to support its development, you can
+[buy me a coffee](https://buymeacoffee.com/mclee). Araseo remains free to use.
