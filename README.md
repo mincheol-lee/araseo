@@ -10,6 +10,12 @@ Araseo is built from the ground up in **Rust**. It favors a small native
 application and a focused feature set over the memory and complexity of a
 full-scale IDE.
 
+## Preview
+
+![Araseo workspace with file explorer, two terminal panes, and two editor panes](assets/araseo-workspace.png)
+
+Two terminal sessions alongside source files in a split workspace.
+
 ## Built with Rust
 
 - **Rust application core** for workspace, document, Git, and terminal logic
