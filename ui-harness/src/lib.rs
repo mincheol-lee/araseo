@@ -139,6 +139,7 @@ mod tests {
             is_expanded: false,
             git_mark: "".into(),
             project_kind: "local".into(),
+            is_added_root: false,
         }])));
         ui.set_git_change_count(1);
         ui.set_git_entries(ModelRc::new(VecModel::from(vec![GitEntry {
@@ -229,6 +230,21 @@ mod tests {
                 name.to_string(),
                 is_directory,
             ));
+        });
+        let added_folder = Rc::new(RefCell::new(String::new()));
+        let observed_added_folder = added_folder.clone();
+        ui.on_add_folder_requested(move |path| {
+            *observed_added_folder.borrow_mut() = path.to_string();
+        });
+        let browse_requests = Rc::new(RefCell::new(0usize));
+        let observed_browse_requests = browse_requests.clone();
+        ui.on_browse_folder_requested(move || {
+            *observed_browse_requests.borrow_mut() += 1;
+        });
+        let terminal_folder = Rc::new(RefCell::new(String::new()));
+        let observed_terminal_folder = terminal_folder.clone();
+        ui.on_tree_terminal_requested(move |path| {
+            *observed_terminal_folder.borrow_mut() = path.to_string();
         });
         let tree_renames = Rc::new(RefCell::new(Vec::new()));
         let observed_tree_renames = tree_renames.clone();
@@ -421,7 +437,7 @@ mod tests {
             "the explorer's icon badge was not rendered with its accent color"
         );
 
-        dispatch_click(&ui, 72.0, 51.0);
+        dispatch_click(&ui, 60.0, 51.0);
         assert!(
             ui.get_tree_create_visible() && !ui.get_tree_create_is_directory(),
             "the FILES toolbar did not open the new-file dialog"
@@ -461,6 +477,18 @@ mod tests {
             Some(&("".to_string(), "new.rs".to_string(), false)),
             "the root file creation request was not forwarded"
         );
+
+        ui.set_folder_browser_available(true);
+        render(&window);
+        dispatch_click(&ui, 108.0, 51.0);
+        assert!(ui.get_add_folder_visible(), "the FILES toolbar did not open Add Folder");
+        write_snapshot_if_requested("add-folder-dialog.png", &render(&window));
+        dispatch_click(&ui, 778.0, 416.0);
+        assert_eq!(*browse_requests.borrow(), 1, "Browse did not request the native picker");
+        ui.set_add_folder_path("/home/user/other-project".into());
+        render(&window);
+        dispatch_click(&ui, 794.0, 454.0);
+        assert_eq!(added_folder.borrow().as_str(), "/home/user/other-project");
 
         dispatch_pointer(&ui, WindowEvent::PointerPressed {
             position: LogicalPosition::new(60.0, 76.0),
@@ -534,6 +562,17 @@ mod tests {
             "confirmed file-tree deletion was not forwarded"
         );
 
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Right,
+        });
+        dispatch_click(&ui, 100.0, 271.0);
+        assert_eq!(terminal_folder.borrow().as_str(), "/workspace/local-project");
+
         ui.set_tree_entries(ModelRc::new(VecModel::from(vec![
             ui.get_tree_entries().row_data(0).unwrap(),
             TreeEntry {
@@ -546,6 +585,7 @@ mod tests {
                 is_expanded: false,
                 git_mark: "".into(),
                 project_kind: "".into(),
+                is_added_root: false,
             },
         ])));
         render(&window);

@@ -23,3 +23,5 @@ pub mod wsl_diagnostics;
 
 #[path = "../../src/appearance.rs"]
 pub mod appearance;
+#[path = "../../src/workspace_history.rs"]
+pub mod workspace_history;

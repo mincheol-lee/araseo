@@ -88,7 +88,11 @@ pub fn rename_entry(workspace: &Workspace, path: &Path, new_name: &str) -> Resul
         Err(error) => return Err(error).context("cannot check the new name"),
     }
     fs::rename(&source_host, &destination_host).with_context(|| {
-        format!("cannot rename {} to {}", path.display(), destination.display())
+        format!(
+            "cannot rename {} to {}",
+            path.display(),
+            destination.display()
+        )
     })?;
     Ok(destination)
 }
@@ -114,7 +118,10 @@ pub fn copy_external_file(
         .context("the dropped file has no name")?;
     let target_host = workspace.host_path(target_directory)?;
     if !target_host.is_dir() {
-        bail!("drop target is not a folder: {}", target_directory.display());
+        bail!(
+            "drop target is not a folder: {}",
+            target_directory.display()
+        );
     }
 
     let destination = target_host.join(file_name);
@@ -171,7 +178,9 @@ fn validate_entry_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
         || name == ".."
-        || name.chars().any(|character| matches!(character, '/' | '\\' | '\0'))
+        || name
+            .chars()
+            .any(|character| matches!(character, '/' | '\\' | '\0'))
         || name.trim() != name
     {
         bail!("enter a valid file or folder name");
@@ -292,6 +301,42 @@ pub fn build_tree(
     Ok(output)
 }
 
+pub fn build_tree_with_folders(
+    primary: &Workspace,
+    added: &[Workspace],
+    expanded: &HashSet<PathBuf>,
+    statuses: &HashMap<PathBuf, GitStatus>,
+) -> Result<Vec<FlatNode>> {
+    let mut output = build_tree(primary, expanded, statuses)?;
+    for workspace in added {
+        let root = &workspace.linux_root;
+        let is_expanded = expanded.contains(root);
+        output.push(FlatNode {
+            name: root
+                .file_name()
+                .unwrap_or(root.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            linux_path: root.clone(),
+            depth: 0,
+            is_directory: true,
+            is_expanded,
+            git_status: statuses.get(root).copied().unwrap_or_default(),
+        });
+        if is_expanded {
+            append_directory(
+                workspace,
+                &workspace.host_root,
+                1,
+                expanded,
+                statuses,
+                &mut output,
+            )?;
+        }
+    }
+    Ok(output)
+}
+
 fn append_directory(
     workspace: &Workspace,
     directory: &Path,
@@ -363,7 +408,10 @@ mod tests {
         let workspace = Workspace::new("Ubuntu", root.clone()).unwrap();
         let collapsed = build_tree(&workspace, &HashSet::new(), &HashMap::new()).unwrap();
         assert_eq!(
-            collapsed.iter().map(|node| node.name.as_str()).collect::<Vec<_>>(),
+            collapsed
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
             ["Alpha", "beta", "aardvark.txt", "zeta.txt"]
         );
         assert!(collapsed.iter().all(|node| node.depth == 0));
@@ -375,6 +423,29 @@ mod tests {
         assert!(!tree.iter().any(|node| node.name == ".git"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn added_folder_appears_as_a_separate_expandable_root() {
+        let base = temporary_directory("added-folder");
+        let primary_root = base.join("primary");
+        let added_root = base.join("elsewhere");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(added_root.join("src")).unwrap();
+        fs::write(added_root.join("src/main.rs"), "fn main() {}").unwrap();
+        let primary = Workspace::new("Ubuntu", primary_root).unwrap();
+        let added = Workspace::new("Ubuntu", added_root.clone()).unwrap();
+        let expanded = HashSet::from([added_root.clone(), added_root.join("src")]);
+        let nodes =
+            build_tree_with_folders(&primary, &[added], &expanded, &HashMap::new()).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| (node.name.as_str(), node.depth))
+                .collect::<Vec<_>>(),
+            [("elsewhere", 0), ("src", 1), ("main.rs", 2)]
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -420,7 +491,10 @@ mod tests {
         delete_entry(&workspace, &folder).unwrap();
         assert!(!folder.exists());
         assert!(delete_entry(&workspace, &root).is_err());
-        assert_eq!(linux_path_text(Path::new(r"/work\nested\file.rs")), "/work/nested/file.rs");
+        assert_eq!(
+            linux_path_text(Path::new(r"/work\nested\file.rs")),
+            "/work/nested/file.rs"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -449,7 +523,10 @@ mod tests {
             renamed_file
         );
         assert!(rename_entry(&workspace, &root.join("occupied.txt"), "folder").is_err());
-        assert_eq!(fs::read_to_string(root.join("occupied.txt")).unwrap(), "keep");
+        assert_eq!(
+            fs::read_to_string(root.join("occupied.txt")).unwrap(),
+            "keep"
+        );
 
         let old_folder = root.join("folder");
         let mut document =
@@ -525,9 +602,18 @@ mod tests {
             },
         ];
 
-        assert_eq!(external_drop_target(&tree, &root, 4.0, 25.0), Some(root.join("src")));
-        assert_eq!(external_drop_target(&tree, &root, 30.0, 25.0), Some(root.join("src")));
-        assert_eq!(external_drop_target(&tree, &root, 80.0, 25.0), Some(root.clone()));
+        assert_eq!(
+            external_drop_target(&tree, &root, 4.0, 25.0),
+            Some(root.join("src"))
+        );
+        assert_eq!(
+            external_drop_target(&tree, &root, 30.0, 25.0),
+            Some(root.join("src"))
+        );
+        assert_eq!(
+            external_drop_target(&tree, &root, 80.0, 25.0),
+            Some(root.clone())
+        );
         assert_eq!(external_drop_target(&tree, &root, -1.0, 25.0), None);
     }
 
@@ -566,9 +652,11 @@ mod tests {
             ["config.yml", "docker-compose.yml", "pnpm-lock.yml"],
         ] {
             let expected = icon_for(names[0], false, false, "");
-            assert!(names[1..]
-                .iter()
-                .all(|name| icon_for(name, false, false, "") == expected));
+            assert!(
+                names[1..]
+                    .iter()
+                    .all(|name| icon_for(name, false, false, "") == expected)
+            );
         }
     }
 }
