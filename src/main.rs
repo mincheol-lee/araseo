@@ -5,12 +5,15 @@ mod background;
 mod document;
 mod editor_view;
 mod emoji;
+#[cfg(windows)]
+mod folder_picker;
 mod git;
 mod highlight;
 mod tabs;
 mod terminal;
 mod tree;
 mod workspace;
+mod workspace_history;
 mod wsl_diagnostics;
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +35,9 @@ slint::include_modules!();
 
 struct AppState {
     workspace: Workspace,
+    added_workspaces: Vec<Workspace>,
+    remembered_folders: Vec<PathBuf>,
+    workspace_history_path: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
     expanded_git_repositories: HashSet<PathBuf>,
     statuses: HashMap<PathBuf, GitStatus>,
@@ -42,6 +48,10 @@ struct AppState {
     next_tab_id: TabId,
     next_terminal_number: u32,
     git_monitor: Option<git::StatusMonitor>,
+    added_git_monitors: Vec<(PathBuf, git::StatusMonitor)>,
+    add_folder_loader: Background<Result<(Workspace, std::io::Result<git::StatusMonitor>)>>,
+    restore_folder_loader:
+        Background<Vec<Result<(Workspace, std::io::Result<git::StatusMonitor>)>>>,
     status: String,
     save_conflict: Option<TabId>,
     syncing_editor: Cell<bool>,
@@ -105,6 +115,12 @@ fn main() -> Result<()> {
         .select()
         .context("failed to initialize the Windows software renderer")?;
     let workspace = Workspace::prepare(distro, root)?;
+    let workspace_history_path =
+        workspace_history::settings_path(&workspace.distro, &workspace.linux_root);
+    let remembered_folders = workspace_history_path
+        .as_deref()
+        .map(|path| workspace_history::load(path, &workspace.distro, &workspace.linux_root))
+        .unwrap_or_default();
     let statuses = HashMap::new();
     let tree = Vec::new();
     let mut startup_loader = Background::default();
@@ -118,6 +134,9 @@ fn main() -> Result<()> {
     });
     let state = Rc::new(RefCell::new(AppState {
         workspace,
+        added_workspaces: Vec::new(),
+        remembered_folders: remembered_folders.clone(),
+        workspace_history_path,
         expanded: HashSet::new(),
         expanded_git_repositories: HashSet::new(),
         statuses,
@@ -128,6 +147,9 @@ fn main() -> Result<()> {
         next_tab_id: 0,
         next_terminal_number: 1,
         git_monitor: None,
+        added_git_monitors: Vec::new(),
+        add_folder_loader: Background::default(),
+        restore_folder_loader: Background::default(),
         status: "Starting workspace...".into(),
         save_conflict: None,
         syncing_editor: Cell::new(false),
@@ -146,11 +168,22 @@ fn main() -> Result<()> {
         maximized_group: None,
     }));
 
+    if !remembered_folders.is_empty() {
+        let distro = state.borrow().workspace.distro.clone();
+        state.borrow_mut().restore_folder_loader.request(move || {
+            remembered_folders
+                .into_iter()
+                .map(|path| load_added_folder(distro.clone(), path))
+                .collect()
+        });
+    }
+
     refresh_tree(&mut state.borrow_mut());
     let mut icon_loader = Background::default();
     icon_loader.request(emoji::EmojiIcons::load_pixels);
 
     let ui = AppWindow::new()?;
+    ui.set_folder_browser_available(cfg!(windows));
     ui.set_dynamic_panes(true);
     ui.set_extra_panes(ModelRc::new(VecModel::from(Vec::<PaneEntry>::new())));
     ui.set_wsl_checks(ModelRc::new(VecModel::from(Vec::<WslCheckEntry>::new())));
@@ -197,6 +230,37 @@ fn main() -> Result<()> {
         });
     }
     install_windows_file_drop(&ui, state.clone());
+    #[cfg(windows)]
+    install_windows_folder_browser(&ui, &state.borrow().workspace);
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_add_folder_requested(move |path| {
+            let mut state = state.borrow_mut();
+            let path = PathBuf::from(path.trim());
+            let all = std::iter::once(&state.workspace).chain(&state.added_workspaces);
+            if !path.to_string_lossy().starts_with('/')
+                || path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+            {
+                state.status = "Enter an absolute WSL folder path without '..'".into();
+            } else if all.into_iter().any(|workspace| {
+                path.starts_with(&workspace.linux_root) || workspace.linux_root.starts_with(&path)
+            }) {
+                state.status = "That folder is already covered by this workspace".into();
+            } else {
+                let distro = state.workspace.distro.clone();
+                state.status = format!("Adding folder {}...", path.display());
+                state
+                    .add_folder_loader
+                    .request(move || load_added_folder(distro, path));
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+            }
+        });
+    }
     if let Some(path) = appearance::settings_path() {
         let sizes = appearance::FontSizes::load(&path);
         ui.set_terminal_font_size(sizes.terminal);
@@ -302,7 +366,8 @@ fn main() -> Result<()> {
                     })
                 };
                 if let Some(parent) = parent {
-                    let workspace = state.workspace.clone();
+                    let workspace = workspace_for_path(&state, &parent)
+                        .unwrap_or_else(|_| state.workspace.clone());
                     let result_parent = parent.clone();
                     let result_name = name.to_string();
                     state.tree_action_pending = true;
@@ -337,8 +402,9 @@ fn main() -> Result<()> {
             if state.tree_action_pending {
                 state.status = "A file tree action is already running".into();
             } else if let Some(node) = tree_node_for_ui_path(&state, path.as_str()) {
-                let workspace = state.workspace.clone();
                 let from = node.linux_path;
+                let workspace =
+                    workspace_for_path(&state, &from).unwrap_or_else(|_| state.workspace.clone());
                 let name = new_name.to_string();
                 state.tree_action_pending = true;
                 state.status = format!("Renaming {}...", from.display());
@@ -372,8 +438,39 @@ fn main() -> Result<()> {
                 if has_dirty_document_at_or_below(&state, &node.linux_path) {
                     state.status = "Save or close modified files before deleting".into();
                 } else {
-                    let workspace = state.workspace.clone();
                     let path = node.linux_path;
+                    if state
+                        .added_workspaces
+                        .iter()
+                        .any(|workspace| workspace.linux_root == path)
+                    {
+                        state
+                            .added_workspaces
+                            .retain(|workspace| workspace.linux_root != path);
+                        state.added_git_monitors.retain(|(root, _)| root != &path);
+                        state
+                            .expanded
+                            .retain(|expanded| !expanded.starts_with(&path));
+                        state.statuses.retain(|file, _| !file.starts_with(&path));
+                        state
+                            .repositories
+                            .retain(|repository| !repository.starts_with(&path));
+                        close_file_tabs_at_or_below(&mut state, &path);
+                        close_diff_tabs_at_or_below(&mut state, &path);
+                        refresh_tree(&mut state);
+                        state.status = format!("Removed folder {} from workspace", path.display());
+                        state.remembered_folders.retain(|folder| folder != &path);
+                        if let Err(error) = persist_added_folders(&state) {
+                            state.status =
+                                format!("Folder removed, but history could not be saved: {error}");
+                        }
+                        if let Some(ui) = weak.upgrade() {
+                            sync_ui(&ui, &state);
+                        }
+                        return;
+                    }
+                    let workspace = workspace_for_path(&state, &path)
+                        .unwrap_or_else(|_| state.workspace.clone());
                     let result_path = path.clone();
                     state.tree_action_pending = true;
                     state.status = format!("Deleting {}...", path.display());
@@ -448,7 +545,8 @@ fn main() -> Result<()> {
                 }
                 return;
             };
-            let workspace = state.workspace.clone();
+            let workspace =
+                workspace_for_path(&state, &path).unwrap_or_else(|_| state.workspace.clone());
             let result_path = path.clone();
             state.status = format!("Discarding {}...", path.display());
             state.git_action_loader.request(move || {
@@ -704,6 +802,35 @@ fn main() -> Result<()> {
                     }
                 }
                 Err(error) => state.status = format!("Terminal unavailable: {error}"),
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+                ui.invoke_focus_terminal();
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_tree_terminal_requested(move |path| {
+            let mut state = state.borrow_mut();
+            let target = tree_node_for_ui_path(&state, path.as_str())
+                .filter(|node| node.is_directory)
+                .map(|node| node.linux_path);
+            if let Some(path) = target {
+                let group = state.tab_groups.focused_group();
+                match open_terminal_at(&mut state, group, path) {
+                    Ok(tab_id) => {
+                        if let Some(ui) = weak.upgrade()
+                            && let Some(session) = terminal_ref(&state, tab_id)
+                        {
+                            connect_terminal_output(&ui, tab_id, session);
+                        }
+                    }
+                    Err(error) => state.status = format!("Terminal unavailable: {error}"),
+                }
+            } else {
+                state.status = "The selected folder is no longer available".into();
             }
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
@@ -1007,6 +1134,47 @@ fn main() -> Result<()> {
                     ui.invoke_focus_terminal();
                 }
             }
+            if let Some(results) = state.restore_folder_loader.poll() {
+                let mut restored = 0usize;
+                let mut unavailable = 0usize;
+                for result in results {
+                    match result {
+                        Ok((workspace, monitor)) => {
+                            if attach_added_folder(&mut state, workspace, monitor) {
+                                restored += 1;
+                            }
+                        }
+                        Err(_) => unavailable += 1,
+                    }
+                }
+                if unavailable > 0 {
+                    state.status =
+                        format!("Restored {restored} folders; {unavailable} unavailable");
+                } else if restored > 0 {
+                    state.status = format!("Restored {restored} workspace folders");
+                }
+                sync_ui(&ui, &state);
+            }
+            if let Some(result) = state.add_folder_loader.poll() {
+                match result {
+                    Ok((workspace, monitor)) => {
+                        let root = workspace.linux_root.clone();
+                        if attach_added_folder(&mut state, workspace, monitor) {
+                            if !state.remembered_folders.contains(&root) {
+                                state.remembered_folders.push(root.clone());
+                            }
+                            state.status = format!("Added folder {}", root.display());
+                            if let Err(error) = persist_added_folders(&state) {
+                                state.status = format!(
+                                    "Folder added, but history could not be saved: {error}"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => state.status = error.to_string(),
+                }
+                sync_ui(&ui, &state);
+            }
             if let Some(result) = state.tree_loader.poll() {
                 match result {
                     Ok(tree) => {
@@ -1065,12 +1233,7 @@ fn main() -> Result<()> {
                     Ok(path) => {
                         close_diff_tabs(&mut state, &path);
                         state.status = format!("Discarded changes in {}", path.display());
-                        if let Some(monitor) = state.git_monitor.as_mut() {
-                            let _ = monitor.force_refresh();
-                        } else {
-                            state.statuses = git::read_status(&state.workspace);
-                            refresh_tree(&mut state);
-                        }
+                        refresh_git_for_path(&mut state, &path);
                     }
                     Err(error) => state.status = error.to_string(),
                 }
@@ -1086,9 +1249,7 @@ fn main() -> Result<()> {
                     }) => {
                         state.expanded.insert(parent);
                         refresh_tree(&mut state);
-                        if let Some(monitor) = state.git_monitor.as_mut() {
-                            let _ = monitor.force_refresh();
-                        }
+                        refresh_git_for_path(&mut state, &path);
                         if is_directory {
                             state.status = format!("Created folder {}", path.display());
                         } else if let Err(error) = open_document(&mut state, path) {
@@ -1101,9 +1262,7 @@ fn main() -> Result<()> {
                             .expanded
                             .retain(|expanded| !expanded.starts_with(&path));
                         refresh_tree(&mut state);
-                        if let Some(monitor) = state.git_monitor.as_mut() {
-                            let _ = monitor.force_refresh();
-                        }
+                        refresh_git_for_path(&mut state, &path);
                         state.status = format!("Deleted {}", path.display());
                     }
                     Ok(TreeActionResult::Renamed {
@@ -1149,17 +1308,13 @@ fn main() -> Result<()> {
                             }
                         }
                         refresh_tree(&mut state);
-                        if let Some(monitor) = state.git_monitor.as_mut() {
-                            let _ = monitor.force_refresh();
-                        }
+                        refresh_git_for_path(&mut state, &to);
                         state.status = format!("Renamed {} to {}", from.display(), to.display());
                     }
                     Ok(TreeActionResult::Copied { path, parent }) => {
                         state.expanded.insert(parent);
                         refresh_tree(&mut state);
-                        if let Some(monitor) = state.git_monitor.as_mut() {
-                            let _ = monitor.force_refresh();
-                        }
+                        refresh_git_for_path(&mut state, &path);
                         state.status = format!("Copied {}", path.display());
                     }
                     Err(error) => state.status = error.to_string(),
@@ -1252,28 +1407,41 @@ fn main() -> Result<()> {
         workspace_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
-            let update = state
+            let mut updates = Vec::new();
+            if let Some(update) = state
                 .git_monitor
                 .as_mut()
-                .and_then(git::StatusMonitor::poll_latest);
-            let Some(update) = update else {
-                return;
-            };
-            let snapshot = match update {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    state.status = format!("Git auto-refresh failed: {error}");
-                    ui.set_status_text(state.status.clone().into());
-                    return;
+                .and_then(git::StatusMonitor::poll_latest)
+            {
+                updates.push((state.workspace.linux_root.clone(), update));
+            }
+            for (root, monitor) in &mut state.added_git_monitors {
+                if let Some(update) = monitor.poll_latest() {
+                    updates.push((root.clone(), update));
                 }
-            };
+            }
+            if updates.is_empty() {
+                return;
+            }
             let previous_tree = state.tree.clone();
             let previous_statuses = state.statuses.clone();
             let previous_repositories = state.repositories.clone();
             let previous_status = state.status.clone();
             let previous_save_conflict = state.save_conflict;
-            state.statuses = snapshot.statuses;
-            state.repositories = snapshot.repositories;
+            for (root, update) in updates {
+                match update {
+                    Ok(snapshot) => {
+                        state.statuses.retain(|path, _| !path.starts_with(&root));
+                        state.repositories.retain(|path| !path.starts_with(&root));
+                        state.statuses.extend(snapshot.statuses);
+                        state.repositories.extend(snapshot.repositories);
+                    }
+                    Err(error) => {
+                        state.status =
+                            format!("Git auto-refresh failed for {}: {error}", root.display())
+                    }
+                }
+            }
             if state.status == "Refreshing..." {
                 state.status = "Refreshed".into();
             }
@@ -1302,6 +1470,46 @@ fn main() -> Result<()> {
     drop(timer);
     drop(workspace_timer);
     Ok(())
+}
+
+#[cfg(windows)]
+fn install_windows_folder_browser(ui: &AppWindow, workspace: &Workspace) {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let workspace = workspace.clone();
+    let weak = ui.as_weak();
+    ui.on_browse_folder_requested(move || {
+        let owner = weak.upgrade().and_then(|ui| {
+            ui.window()
+                .with_winit_window(|window| {
+                    let handle = window.window_handle().ok()?;
+                    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                        return None;
+                    };
+                    Some(handle.hwnd.get() as usize)
+                })
+                .flatten()
+        });
+        let Some(owner) = owner else { return };
+        let workspace = workspace.clone();
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            let result = folder_picker::pick_folder(owner, &workspace);
+            let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                Ok(Some(path)) => {
+                    let path = path.to_string_lossy().to_string();
+                    ui.set_add_folder_path(path.clone().into());
+                    ui.set_add_folder_visible(false);
+                    ui.invoke_add_folder_requested(path.into());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    ui.set_add_folder_visible(false);
+                    ui.set_status_text(format!("Could not select folder: {error}").into());
+                }
+            });
+        });
+    });
 }
 
 #[cfg(target_os = "windows")]
@@ -1364,7 +1572,8 @@ fn begin_external_file_copy(
     if state.tree_action_pending {
         state.status = "A file tree action is already running".into();
     } else {
-        let workspace = state.workspace.clone();
+        let workspace =
+            workspace_for_path(&state, &parent).unwrap_or_else(|_| state.workspace.clone());
         let result_parent = parent.clone();
         let name = source
             .file_name()
@@ -1528,7 +1737,7 @@ fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let workspace = state.workspace.clone();
+    let workspace = workspace_for_path(state, &linux_path)?;
     let group = state.tab_groups.focused_group();
     state.status = format!("Opening {}...", linux_path.display());
     state.file_loader.request(move || {
@@ -1555,7 +1764,7 @@ fn open_git_diff(state: &mut AppState, path: PathBuf) -> Result<()> {
         .with_context(|| format!("Git change is no longer available: {}", path.display()))?;
     let repository = repository_for(&state.repositories, &path)
         .with_context(|| format!("Cannot find repository for {}", path.display()))?;
-    let workspace = state.workspace.clone();
+    let workspace = workspace_for_path(state, &path)?;
     let group = state.tab_groups.focused_group();
     state.status = format!("Loading diff for {}...", path.display());
     state.diff_loader.request(move || {
@@ -1568,8 +1777,17 @@ fn open_git_diff(state: &mut AppState, path: PathBuf) -> Result<()> {
 }
 
 fn open_terminal(state: &mut AppState, group: usize) -> Result<TabId> {
+    let path = state.workspace.linux_root.clone();
+    open_terminal_at(state, group, path)
+}
+
+fn open_terminal_at(state: &mut AppState, group: usize, path: PathBuf) -> Result<TabId> {
     cancel_file_open(state);
-    let session = TerminalSession::spawn(&state.workspace.distro, &state.workspace.linux_root)?;
+    let workspace = workspace_for_path(state, &path)?;
+    if !workspace.host_path(&path)?.is_dir() {
+        bail!("folder is not accessible: {}", path.display());
+    }
+    let session = TerminalSession::spawn(&workspace.distro, &path)?;
     let tab_id = take_next_tab_id(state);
     let number = state.next_terminal_number;
     state.next_terminal_number = state.next_terminal_number.saturating_add(1);
@@ -1577,7 +1795,7 @@ fn open_terminal(state: &mut AppState, group: usize) -> Result<TabId> {
         id: tab_id,
         content: TabContent::Terminal {
             session,
-            start_path: state.workspace.linux_root.clone(),
+            start_path: path,
             number,
         },
     });
@@ -1646,6 +1864,87 @@ fn tree_node_for_ui_path(state: &AppState, path: &str) -> Option<FlatNode> {
         .cloned()
 }
 
+fn workspace_for_path(state: &AppState, path: &std::path::Path) -> Result<Workspace> {
+    workspace::for_path(
+        state
+            .added_workspaces
+            .iter()
+            .chain(std::iter::once(&state.workspace)),
+        path,
+    )
+    .cloned()
+    .with_context(|| format!("path is outside workspace: {}", path.display()))
+}
+
+fn load_added_folder(
+    distro: String,
+    path: PathBuf,
+) -> Result<(Workspace, std::io::Result<git::StatusMonitor>)> {
+    let workspace = Workspace::new(distro, path)?;
+    let monitor = git::StatusMonitor::spawn(&workspace);
+    Ok((workspace, monitor))
+}
+
+fn attach_added_folder(
+    state: &mut AppState,
+    workspace: Workspace,
+    monitor: std::io::Result<git::StatusMonitor>,
+) -> bool {
+    let root = &workspace.linux_root;
+    if std::iter::once(&state.workspace)
+        .chain(&state.added_workspaces)
+        .any(|existing| {
+            root.starts_with(&existing.linux_root) || existing.linux_root.starts_with(root)
+        })
+    {
+        return false;
+    }
+    state.expanded.insert(root.clone());
+    match monitor {
+        Ok(monitor) => state.added_git_monitors.push((root.clone(), monitor)),
+        Err(error) => {
+            state.status = format!(
+                "Git auto-refresh unavailable for {}: {error}",
+                root.display()
+            )
+        }
+    }
+    state.added_workspaces.push(workspace);
+    refresh_tree(state);
+    true
+}
+
+fn persist_added_folders(state: &AppState) -> std::io::Result<()> {
+    let Some(path) = &state.workspace_history_path else {
+        return Err(std::io::Error::other(
+            "user settings location is unavailable",
+        ));
+    };
+    workspace_history::save(
+        path,
+        &state.workspace.distro,
+        &state.workspace.linux_root,
+        &state.remembered_folders,
+    )
+}
+
+fn refresh_git_for_path(state: &mut AppState, path: &std::path::Path) {
+    if let Some((_, monitor)) = state
+        .added_git_monitors
+        .iter_mut()
+        .find(|(root, _)| path.starts_with(root))
+    {
+        let _ = monitor.force_refresh();
+    } else if path.starts_with(&state.workspace.linux_root) {
+        if let Some(monitor) = state.git_monitor.as_mut() {
+            let _ = monitor.force_refresh();
+        } else {
+            state.statuses = git::read_status(&state.workspace);
+            refresh_tree(state);
+        }
+    }
+}
+
 fn has_dirty_document_at_or_below(state: &AppState, path: &std::path::Path) -> bool {
     state.tabs.iter().any(|tab| {
         matches!(
@@ -1688,10 +1987,9 @@ fn save_tab(state: &mut AppState, tab_id: TabId, overwrite_external: bool) {
         Ok(()) => {
             state.status = "Saved".into();
             state.save_conflict = None;
-            if let Some(monitor) = state.git_monitor.as_mut() {
-                let _ = monitor.force_refresh();
-            } else {
-                state.statuses = git::read_status(&state.workspace);
+            let path = document_ref(state, tab_id).map(|document| document.linux_path.clone());
+            if let Some(path) = path {
+                refresh_git_for_path(state, &path);
             }
             refresh_tree(state);
         }
@@ -1860,11 +2158,12 @@ fn connect_terminal_output(ui: &AppWindow, tab_id: TabId, terminal: &TerminalSes
 
 fn refresh_tree(state: &mut AppState) {
     let workspace = state.workspace.clone();
+    let added = state.added_workspaces.clone();
     let expanded = state.expanded.clone();
     let statuses = state.statuses.clone();
     state
         .tree_loader
-        .request(move || tree::build_tree(&workspace, &expanded, &statuses));
+        .request(move || tree::build_tree_with_folders(&workspace, &added, &expanded, &statuses));
 }
 
 fn workspace_pointer(ui: &AppWindow, x: f32, y: f32) -> (f32, f32, f32, f32) {
@@ -2592,6 +2891,10 @@ fn sync_tree(ui: &AppWindow, state: &AppState) {
                 }
                 .into(),
                 project_kind: project_kind.into(),
+                is_added_root: state
+                    .added_workspaces
+                    .iter()
+                    .any(|workspace| workspace.linux_root == node.linux_path),
             }
         })
         .collect::<Vec<_>>();

@@ -64,6 +64,15 @@ versions, manual installation, and removal.
 - Click a file in the tree to open it. Use the **FILES** toolbar or an item's
   context menu for file operations. Drag a file from the tree into a terminal
   to paste its Linux path.
+- Click **⊞** in the **FILES** toolbar to add another folder in the same WSL
+  distribution. On Windows, choose **Browse...** to select a folder in File
+  Explorer, or enter its absolute Linux path (for example,
+  `/home/user/other-project`). Added folders appear as separate roots in the
+  tree, with their own Git changes. Right-click an added root and select
+  **Remove Folder** to remove it from the window without deleting its files.
+  Use **Open Terminal Here** in a folder's context menu to start in that folder.
+  Araseo remembers added folders for each starting workspace and WSL
+  distribution, then restores accessible folders the next time it opens.
 - Press `Ctrl+S` to save, `Ctrl+F` to find in the active file, and `Ctrl+Z`
   or `Ctrl+Y` to undo or redo. `Ctrl+Tab` and `Ctrl+Shift+Tab` cycle tabs.
 - Select **GIT** in the sidebar to browse changed and untracked files. Click

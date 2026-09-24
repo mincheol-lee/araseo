@@ -72,6 +72,18 @@ impl Workspace {
     }
 }
 
+/// Select the most specific workspace containing a Linux path. This also
+/// handles a folder explicitly added below an existing workspace root.
+pub fn for_path<'a>(
+    workspaces: impl IntoIterator<Item = &'a Workspace>,
+    path: &Path,
+) -> Option<&'a Workspace> {
+    workspaces
+        .into_iter()
+        .filter(|workspace| path.starts_with(&workspace.linux_root))
+        .max_by_key(|workspace| workspace.linux_root.components().count())
+}
+
 pub fn linux_to_host_path(distro: &str, linux_path: &Path) -> PathBuf {
     if cfg!(windows) {
         let linux_path = normalize_linux_path(linux_path);
@@ -80,6 +92,29 @@ pub fn linux_to_host_path(distro: &str, linux_path: &Path) -> PathBuf {
     } else {
         linux_path.to_path_buf()
     }
+}
+
+/// Translate a folder selected under the Explorer WSL network share. Other
+/// Windows paths are handled by `wslpath` in the native picker.
+pub fn wsl_unc_to_linux_path(distro: &str, selected: &str) -> Result<Option<PathBuf>> {
+    let normalized = selected.replace('/', "\\");
+    let Some(rest) = normalized.strip_prefix("\\\\") else {
+        return Ok(None);
+    };
+    let mut parts = rest.split('\\');
+    let server = parts.next().unwrap_or_default();
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return Ok(None);
+    }
+    let selected_distro = parts.next().unwrap_or_default();
+    if !selected_distro.eq_ignore_ascii_case(distro) {
+        bail!("select a folder in the current WSL distribution ({distro})");
+    }
+    let components = parts.filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    if components.iter().any(|part| *part == "." || *part == "..") {
+        bail!("selected WSL folder contains an invalid path segment");
+    }
+    Ok(Some(PathBuf::from(format!("/{}", components.join("/")))))
 }
 
 fn normalize_linux_path(path: &Path) -> String {
@@ -125,6 +160,46 @@ mod tests {
                 .split('/')
                 .any(|part| part == "..")
         );
+    }
+
+    #[test]
+    fn selects_the_most_specific_added_folder() {
+        let parent = Workspace::prepare("Ubuntu", PathBuf::from("/projects")).unwrap();
+        let other = Workspace::prepare("Ubuntu", PathBuf::from("/elsewhere/app")).unwrap();
+        let nested = Workspace::prepare("Ubuntu", PathBuf::from("/projects/app")).unwrap();
+        let workspaces = [parent, other, nested];
+        assert_eq!(
+            for_path(&workspaces, Path::new("/projects/app/src/main.rs"))
+                .unwrap()
+                .linux_root,
+            Path::new("/projects/app")
+        );
+        assert_eq!(
+            for_path(&workspaces, Path::new("/elsewhere/app/src/main.rs"))
+                .unwrap()
+                .linux_root,
+            Path::new("/elsewhere/app")
+        );
+        assert!(for_path(&workspaces, Path::new("/missing/file")).is_none());
+    }
+
+    #[test]
+    fn converts_explorer_wsl_folder_paths_and_rejects_other_distributions() {
+        assert_eq!(
+            wsl_unc_to_linux_path("Ubuntu", r"\\wsl.localhost\Ubuntu\home\user\한글 project")
+                .unwrap(),
+            Some(PathBuf::from("/home/user/한글 project"))
+        );
+        assert_eq!(
+            wsl_unc_to_linux_path("Ubuntu", r"\\wsl$\ubuntu\home\user").unwrap(),
+            Some(PathBuf::from("/home/user"))
+        );
+        assert_eq!(
+            wsl_unc_to_linux_path("Ubuntu", r"C:\Projects\app").unwrap(),
+            None
+        );
+        assert!(wsl_unc_to_linux_path("Ubuntu", r"\\wsl.localhost\Debian\home\user").is_err());
+        assert!(wsl_unc_to_linux_path("Ubuntu", r"\\wsl.localhost\Ubuntu\..\user").is_err());
     }
 
     #[cfg(unix)]

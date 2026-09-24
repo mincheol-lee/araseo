@@ -57,6 +57,7 @@ export struct TreeEntry {
     is-expanded: bool,
     git-mark: string,
     project-kind: string,
+    is-added-root: bool,
 }
 
 export struct TabEntry {
@@ -1292,6 +1293,7 @@ export component AppWindow inherits Window {
     in-out property <string> tree-context-path: "";
     in-out property <string> tree-context-name: "";
     in-out property <bool> tree-context-is-directory: false;
+    in-out property <bool> tree-context-is-added-root: false;
     in-out property <length> tree-context-x: 0px;
     in-out property <length> tree-context-y: 0px;
     in-out property <bool> tree-dragging: false;
@@ -1306,6 +1308,9 @@ export component AppWindow inherits Window {
     private property <float> tree-drop-width: 0;
     private property <float> tree-drop-height: 0;
     in-out property <bool> tree-create-visible: false;
+    in-out property <bool> add-folder-visible: false;
+    in-out property <string> add-folder-path: "";
+    in property <bool> folder-browser-available: false;
     in-out property <bool> tree-create-is-directory: false;
     in-out property <string> tree-create-target: "";
     in-out property <string> tree-create-name: "";
@@ -1384,9 +1389,12 @@ export component AppWindow inherits Window {
 
     callback tree-activated(int);
     callback tree-create-requested(string, string, bool);
+    callback add-folder-requested(string);
+    callback browse-folder-requested();
     callback tree-rename-requested(string, string);
     callback tree-delete-requested(string);
     callback tree-path-copied(string);
+    callback tree-terminal-requested(string);
     callback git-repository-toggled(string);
     callback git-change-activated(string);
     callback git-discard-requested(string);
@@ -1645,7 +1653,7 @@ export component AppWindow inherits Window {
                                 Text {
                                     text: "FILES";
                                     x: root.sidebar-view == 0 ? 8px : 0px;
-                                    width: root.sidebar-view == 0 ? parent.width - 54px : parent.width;
+                                    width: root.sidebar-view == 0 ? parent.width - 78px : parent.width;
                                     color: root.sidebar-view == 0 ? Chrome.text : Chrome.muted;
                                     font-size: 11px;
                                     font-weight: root.sidebar-view == 0 ? 600 : 400;
@@ -1659,11 +1667,11 @@ export component AppWindow inherits Window {
                                     background: root.sidebar-view == 0 ? Chrome.accent : transparent;
                                 }
                                 files-view-touch := TouchArea {
-                                    width: root.sidebar-view == 0 ? parent.width - 50px : parent.width;
+                                    width: root.sidebar-view == 0 ? parent.width - 74px : parent.width;
                                     clicked => { root.sidebar-view = 0; }
                                 }
                                 if root.sidebar-view == 0: Rectangle {
-                                    x: parent.width - 48px;
+                                    x: parent.width - 72px;
                                     width: 24px;
                                     background: new-file-touch.has-hover ? Chrome.hover : transparent;
                                     Text { text: "▤+"; color: Chrome.accent; font-family: "Segoe UI Symbol"; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
@@ -1678,7 +1686,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 if root.sidebar-view == 0: Rectangle {
-                                    x: parent.width - 24px;
+                                    x: parent.width - 48px;
                                     width: 24px;
                                     background: new-folder-touch.has-hover ? Chrome.hover : transparent;
                                     Text { text: "▰+"; color: Chrome.accent; font-family: "Segoe UI Symbol"; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
@@ -1689,6 +1697,18 @@ export component AppWindow inherits Window {
                                             root.tree-create-name = "";
                                             root.tree-create-is-directory = true;
                                             root.tree-create-visible = true;
+                                        }
+                                    }
+                                }
+                                if root.sidebar-view == 0: Rectangle {
+                                    x: parent.width - 24px;
+                                    width: 24px;
+                                    background: add-folder-touch.has-hover ? Chrome.hover : transparent;
+                                    Text { text: "⊞"; color: Chrome.accent; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; }
+                                    add-folder-touch := TouchArea {
+                                        clicked => {
+                                            root.add-folder-path = "";
+                                            root.add-folder-visible = true;
                                         }
                                     }
                                 }
@@ -1800,9 +1820,10 @@ export component AppWindow inherits Window {
                                             root.tree-context-path = entry.path;
                                             root.tree-context-name = entry.name;
                                             root.tree-context-is-directory = entry.is-directory;
+                                            root.tree-context-is-added-root = entry.is-added-root;
                                             root.tree-context-x = min(root.width - 198px,
                                                 self.absolute-position.x + self.mouse-x);
-                                            root.tree-context-y = min(root.height - 196px,
+                                            root.tree-context-y = min(root.height - 226px,
                                                 self.absolute-position.y + self.mouse-y);
                                             root.tree-context-visible = true;
                                         } else if (event.kind == PointerEventKind.up && self.drag-armed) {
@@ -2490,7 +2511,7 @@ export component AppWindow inherits Window {
             x: root.tree-context-x;
             y: root.tree-context-y;
             width: 198px;
-            height: 188px;
+            height: root.tree-context-is-directory ? 218px : 188px;
             background: Chrome.elevated;
             border-color: Chrome.border;
             border-width: 1px;
@@ -2543,7 +2564,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle {
+                if !root.tree-context-is-added-root: Rectangle {
                     height: 30px;
                     background: context-rename-touch.has-hover ? Chrome.hover : transparent;
                     Text { text: "✎"; color: Chrome.muted; x: 9px; width: 19px; horizontal-alignment: center; vertical-alignment: center; }
@@ -2579,7 +2600,7 @@ export component AppWindow inherits Window {
                     height: 30px;
                     background: context-delete-touch.has-hover ? #593440 : transparent;
                     Text { text: "×"; color: Chrome.danger; x: 9px; width: 19px; horizontal-alignment: center; vertical-alignment: center; }
-                    Text { text: "Delete"; color: Chrome.danger; x: 36px; vertical-alignment: center; }
+                    Text { text: root.tree-context-is-added-root ? "Remove Folder" : "Delete"; color: Chrome.danger; x: 36px; vertical-alignment: center; }
                     context-delete-touch := TouchArea {
                         enabled: !root.tree-action-pending;
                         clicked => {
@@ -2587,6 +2608,74 @@ export component AppWindow inherits Window {
                             root.tree-delete-path = root.tree-context-path;
                             root.tree-delete-name = root.tree-context-name;
                             root.tree-delete-visible = true;
+                        }
+                    }
+                }
+                if root.tree-context-is-directory: Rectangle {
+                    height: 30px;
+                    background: context-terminal-touch.has-hover ? Chrome.hover : transparent;
+                    Text { text: ">_"; color: Chrome.accent; x: 9px; width: 19px; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Open Terminal Here"; color: Chrome.text; x: 36px; vertical-alignment: center; }
+                    context-terminal-touch := TouchArea {
+                        clicked => {
+                            root.tree-context-visible = false;
+                            root.tree-terminal-requested(root.tree-context-path);
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.add-folder-visible: Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: #000000;
+            opacity: 0.55;
+            TouchArea { clicked => { root.add-folder-visible = false; } }
+        }
+        if root.add-folder-visible: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 480px;
+            height: 184px;
+            background: Chrome.elevated;
+            border-color: Chrome.border;
+            border-width: 1px;
+            border-radius: 8px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text { text: "Add Folder to Workspace"; color: Chrome.text; font-size: 16px; font-weight: 600; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    add-folder-input := LineEdit {
+                        text <=> root.add-folder-path;
+                        placeholder-text: "Absolute WSL path, e.g. /home/user/project";
+                        horizontal-stretch: 1;
+                        accepted => {
+                            if (root.add-folder-path != "") {
+                                root.add-folder-visible = false;
+                                root.add-folder-requested(root.add-folder-path);
+                            }
+                        }
+                    }
+                    if root.folder-browser-available: ActionButton {
+                        label: "Browse...";
+                        clicked => { root.browse-folder-requested(); }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    ActionButton { label: "Cancel"; clicked => { root.add-folder-visible = false; } }
+                    ActionButton {
+                        label: "Add Folder";
+                        intent: "primary";
+                        available: root.add-folder-path != "";
+                        clicked => {
+                            root.add-folder-visible = false;
+                            root.add-folder-requested(root.add-folder-path);
                         }
                     }
                 }
@@ -2660,9 +2749,10 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 padding: 18px;
                 spacing: 12px;
-                Text { text: "Delete " + root.tree-delete-name + "?"; color: Chrome.text; font-size: 16px; font-weight: 600; }
+                Text { text: (root.tree-context-is-added-root ? "Remove " : "Delete ") + root.tree-delete-name + "?"; color: Chrome.text; font-size: 16px; font-weight: 600; }
                 Text {
-                    text: root.tree-context-is-directory
+                    text: root.tree-context-is-added-root ? "This removes the folder from this workspace. Files on disk are kept."
+                        : root.tree-context-is-directory
                         ? "This permanently deletes the folder and everything inside it."
                         : "This permanently deletes the file.";
                     color: Chrome.muted;
