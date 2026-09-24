@@ -1,14 +1,13 @@
 # Araseo
 
-**A lightweight, Rust-native code editor built for WSL.**
+**A lightweight native editor for WSL workspaces.**
 
 Araseo brings the essentials of a coding IDE into one fast, focused desktop
 application: browse a workspace, open and edit files, inspect Git changes, and
 run WSL commands or coding agents without leaving the window.
 
-Araseo is built from the ground up in **Rust**. It favors a small native
-application and a focused feature set over the memory and complexity of a
-full-scale IDE.
+The Windows app is built with Rust and Slint. Files, Git commands, and terminal
+sessions stay in the selected WSL distribution.
 
 ## Preview
 
@@ -16,52 +15,28 @@ full-scale IDE.
 
 Two terminal sessions alongside source files in a split workspace.
 
-## Built with Rust
+## What it does
 
-- **Rust application core** for workspace, document, Git, and terminal logic
-- **Slint native UI** instead of a browser-based desktop shell
-- **Real PTY and VT100 rendering** for interactive WSL terminal applications
-- **Single Windows executable** with a WSL-aware command-line launcher
+- Browse a lazy-loading file tree. Create or rename entries, delete them after
+  confirmation, copy a Linux path, or drop files from Windows Explorer.
+- Edit files in tabs with line numbers, syntax highlighting, find, undo and
+  redo. Open files are refreshed when disk changes are detected; unsaved edits
+  are protected by a reload or overwrite choice.
+- Inspect changes in Git repositories nested inside the workspace. Open a
+  side-by-side diff or discard a change after confirmation.
+- Run independent WSL terminals in tabs. PTY and VT100 rendering support
+  interactive programs, ANSI colors, Korean text, IME input, and selection.
+- Arrange file, diff, and terminal tabs in repeatable horizontal or vertical
+  splits, with a separate tab bar and resizable dividers in each pane.
+- Open read-only WSL diagnostics from the status bar, including disk, memory,
+  processes, running distributions, Git, and available Docker information.
 
-## Current Features
+## Install and open a workspace
 
-- Lazy, expandable file tree with context-aware icons
-- File-tree creation, rename, confirmed deletion, path copying, Explorer file drops, terminal paste, and drag-to-terminal paths
-- Git status detection across multiple nested repositories
-- VS Code-style Git changes view with confirmed discard actions and side-by-side working-tree diffs
-- Unified file and terminal tabs, organized in Orca-style pane-local tab bars
-- Multiple independent WSL terminals with ANSI colors, Korean text, IME input, and visible start paths
-- On-demand, read-only WSL diagnostics from the status bar (workspace and host disk, running distributions, top processes, Docker containers, available memory, and Git)
-- Repeatable horizontal and vertical tab-pane splits with independent tabs and resizable dividers
-- WSL-aware CLI arguments and Linux-to-UNC path mapping
-- Headless behavioral Harness for editor isolation, multiple terminals, docking layouts, Git, and UI regressions
-
-## Actively Evolving
-
-Araseo is an active personal project. More editor, terminal, Git, workspace,
-and quality-of-life features will continue to be added while keeping startup,
-resource usage, and the overall interface lightweight.
-
-To split a pane, open another file or terminal tab and drag its tab to the
-left, right, top, or bottom edge of the target pane. Drop in the center to
-move the tab into that pane. You can repeat this on any pane; closing or moving
-its last tab removes the empty pane. Drag a divider to resize its two sides.
-
-Workspace startup, file opening, tree scanning, and emoji preparation run on
-background workers. Rapid file selections keep the latest requested file;
-activating or closing a tab cancels a pending open. While typing, text is shown
-immediately in plain color and syntax colors return after a 120 ms pause plus
-background processing. Unchanged line numbers and editor buffers are retained.
-Continuous terminal output is processed in bounded batches to let input run.
-
-A manual presentation microbenchmark is available with
-`cargo test --manifest-path ui-harness/Cargo.toml benchmark_edit_presentation -- --ignored --nocapture`.
-It compares the old per-edit highlighting work with the deferred input path;
-it excludes document edits, rendering, and eventual background highlighting.
-
-The product specification is in [docs/PRD.md](docs/PRD.md).
-
-## Installation
+Araseo requires Windows 10 version 1809 or newer, or Windows 11, with WSL2.
+Ubuntu is the documented setup. The terminal uses `/bin/bash` and
+`/usr/bin/script`, and automatic file and Git refresh uses `/usr/bin/python3`
+inside the selected distribution.
 
 From WSL, install the newest release with:
 
@@ -70,10 +45,35 @@ curl -fsSL https://github.com/mincheol-lee/araseo/releases/latest/download/insta
 araseo .
 ```
 
-The same command updates an existing installation. It installs the native
-executable under Windows LocalAppData and the `araseo` command under
-`~/.local/bin`. See [INSTALL.md](INSTALL.md) for pinned versions, manual
-installation, checksum verification, and removal instructions.
+Run `araseo path/to/project` to open another directory, or
+`araseo path/to/file.rs` to open a file in its parent directory. The launcher
+uses the current WSL distribution and converts the path for the Windows app.
+
+The install command also updates an existing installation. It verifies release
+checksums, places the executable under Windows LocalAppData, and installs the
+`araseo` launcher in `~/.local/bin`. See [INSTALL.md](INSTALL.md) for pinned
+versions, manual installation, and removal.
+
+## Using Araseo
+
+- Click a file in the tree to open it. Use the **FILES** toolbar or an item's
+  context menu for file operations. Drag a file from the tree into a terminal
+  to paste its Linux path.
+- Press `Ctrl+S` to save, `Ctrl+F` to find in the active file, and `Ctrl+Z`
+  or `Ctrl+Y` to undo or redo. `Ctrl+Tab` and `Ctrl+Shift+Tab` cycle tabs.
+- Select **GIT** in the sidebar to browse changed and untracked files. Click
+  a change to open its diff.
+- Drag a tab to a pane edge to split the workspace, or to the center of a pane
+  to move it there. Drag a divider to resize the panes. Use **+** in a pane's
+  tab bar to start another terminal.
+- Use **Aa** in the status bar to set terminal, editor, and file tree font size
+  and brightness independently; **Reset defaults** restores the initial values.
+  Use **WSL** to request environment diagnostics.
+
+The editor accepts UTF-8 text files up to 2 MiB and preserves LF or CRLF line
+endings. Binary files and files with invalid UTF-8 cannot be edited. Araseo
+opens one workspace per window; language-server features and extensions are
+outside its current scope.
 
 ## Development
 
@@ -91,16 +91,18 @@ Build the native application on Windows:
 
 This produces `dist/araseo.exe`.
 
-For a development checkout, put `scripts/araseo` on the WSL `PATH`; the launcher
-will use `dist/araseo.exe`. If the executable is elsewhere, set `ARASEO_EXE` in
-WSL to its interop path:
+The PowerShell build script runs the core Harness tests before building the
+Windows executable. For a development checkout, put `scripts/araseo` on the WSL
+`PATH`; it will use `dist/araseo.exe`. If the executable is elsewhere, set
+`ARASEO_EXE` to its WSL interop path:
 
 ```bash
 export ARASEO_EXE=/mnt/c/Tools/Araseo/araseo.exe
 araseo .
 ```
 
-For UI development on Linux/WSLg, running `cargo run -- .` opens the current Linux directory and uses a Unix PTY instead of ConPTY.
+For UI development on Linux/WSLg, `cargo run -- .` opens the current Linux
+directory and uses a Unix PTY instead of ConPTY.
 
 Ubuntu development builds require Fontconfig and pkg-config headers:
 
@@ -108,38 +110,46 @@ Ubuntu development builds require Fontconfig and pkg-config headers:
 sudo apt install pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev
 ```
 
-Run the headless verification harness and release-script tests after a change:
+Run the core and Slint UI Harness tests, plus release installer tests:
 
 ```bash
 ./scripts/verify
 ```
 
-It executes the production editor/document code, file tree, workspace path
-checks, terminal key and Korean character-width checks, and a real multi-repo
-Git/inotify integration scenario. It does not need the Linux Slint/fontconfig
-development packages.
+The tests use the production modules for editor, file tree, workspace, Git,
+terminal, and UI behavior. On Linux, this command needs the `libfontconfig1`
+runtime library, but not the UI development headers.
 
-Set `ARASEO_UI_SNAPSHOT_DIR` to have the UI Harness also write full-frame PNG
-snapshots of the single-editor, split-pane, and single-terminal layouts:
+Set `ARASEO_UI_SNAPSHOT_DIR` to have the UI Harness write PNG snapshots of key
+editor, terminal, dialog, Git diff, and split-pane states:
 
 ```bash
 ARASEO_UI_SNAPSHOT_DIR=/tmp/araseo-ui-snapshots ./scripts/verify
 ```
 
 Before distributing a Windows build, also compile every test and the Slint UI
-for the Windows target:
+for the Windows target. From WSL, this requires the
+`x86_64-pc-windows-gnu` Rust target and a MinGW-w64 cross compiler:
 
 ```bash
 ./scripts/verify --windows
 ```
 
-`scripts/build-windows.ps1` runs the headless harness automatically before it
-creates `dist/araseo.exe`. Pushing a version tag such as `v0.1.9` runs both
-verification modes, builds the Windows executable, checks that the tag matches
-the Cargo package version, and publishes the GitHub Release assets. Tags with a
-pre-release suffix, such as `v0.2.0-beta.1`, create a GitHub pre-release.
+Pushing a `v`-prefixed tag matching the version in `Cargo.toml` runs the
+release workflow: it verifies Linux and Windows targets, builds the Windows
+executable, and publishes the GitHub Release assets. A suffix such as
+`-beta.1` marks a pre-release.
 
-Use **Aa** in the status bar to change terminal, file viewer, and file list font sizes and brightness independently. **Reset** restores the Orca-matched defaults (14, 14, and 12 px at 120% brightness). Settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or `$XDG_CONFIG_HOME/araseo/fonts.conf` (default `~/.config/araseo/fonts.conf`) on Linux.
+The app uses Rust for workspace, document, Git, and terminal logic and Slint
+for its native UI. Workspace startup, file loading, tree scanning, and syntax
+highlighting run on background workers. The manual presentation microbenchmark
+is `cargo test --manifest-path ui-harness/Cargo.toml benchmark_edit_presentation -- --ignored --nocapture`;
+it measures part of the editor update path, not end-to-end typing latency.
+
+Font settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or
+`$XDG_CONFIG_HOME/araseo/fonts.conf` on Linux (default:
+`~/.config/araseo/fonts.conf`). The original MVP specification is in
+[docs/PRD.md](docs/PRD.md); it predates several features described here.
 
 ## Support
 
