@@ -6,7 +6,9 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+hayro = "0.7.1"
 portable-pty = "0.9"
+pulldown-cmark = "0.13.4"
 vt100 = "0.16"
 
 [patch.crates-io]

@@ -136,6 +136,18 @@ export struct DiffRow {
     new-kind: string,
 }
 
+export struct PreviewBlock {
+    kind: string,
+    text: styled-text,
+}
+
+export struct PdfSelectionRect {
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+}
+
 export struct PaneEntry {
     group: int,
     x: float,
@@ -148,6 +160,15 @@ export struct PaneEntry {
     active-kind: string,
     active-title: string,
     active-detail: string,
+    preview-image: image,
+    preview-blocks: [PreviewBlock],
+    preview-page: int,
+    preview-page-count: int,
+    preview-natural-width: float,
+    preview-natural-height: float,
+    preview-zoom: int,
+    pdf-selection: [PdfSelectionRect],
+    markdown-source: bool,
     editor-text: string,
     highlighted-text: styled-text,
     syntax-highlight-enabled: bool,
@@ -262,6 +283,25 @@ component WorkspaceGroup inherits Rectangle {
     in property <string> active-kind: "";
     in property <string> active-title: "";
     in property <string> active-detail: "";
+    in property <image> preview-image;
+    in property <[PreviewBlock]> preview-blocks;
+    in property <int> preview-page: 0;
+    in property <int> preview-page-count: 0;
+    in property <float> preview-natural-width: 0;
+    in property <float> preview-natural-height: 0;
+    in property <int> preview-zoom: 0;
+    in property <[PdfSelectionRect]> pdf-selection;
+    private property <float> preview-fit-zoom: root.preview-natural-width > 0 && root.preview-natural-height > 0
+        ? min(root.active-kind == "image" ? 1 : 4,
+            max(0.1, min(((content-stack.width - 24px) / 1px) / root.preview-natural-width,
+                ((content-stack.height - 62px) / 1px) / root.preview-natural-height)))
+        : 1;
+    private property <float> preview-effective-zoom: root.preview-zoom == 0
+        ? root.preview-fit-zoom : root.preview-zoom / 100;
+    private property <length> preview-display-width: root.preview-natural-width * root.preview-effective-zoom * 1px;
+    private property <length> preview-display-height: root.preview-natural-height * root.preview-effective-zoom * 1px;
+    out property <length> preview-displayed-width: root.preview-display-width;
+    in property <bool> markdown-source: false;
     in-out property <string> editor-text;
     in property <styled-text> highlighted-text;
     in property <bool> syntax-highlight-enabled: false;
@@ -312,6 +352,12 @@ component WorkspaceGroup inherits Rectangle {
     callback undo-requested(int);
     callback redo-requested(int);
     callback save-requested(int);
+    callback markdown-mode-requested(int);
+    callback pdf-page-requested(int, int);
+    callback preview-zoom-requested(int, int, float);
+    callback pdf-selection-event(int, float, float, int);
+    callback pdf-copy-requested(int) -> string;
+    callback pdf-copy-text(string);
     callback find-requested(int, string);
     callback find-visibility-requested(int, bool);
     callback terminal-key(int, string, bool, bool, bool);
@@ -378,6 +424,13 @@ component WorkspaceGroup inherits Rectangle {
             terminal-ime-input.copy();
             terminal-ime-input.text = "";
             terminal-ime-input.set-selection-offsets(0, 0);
+        }
+    }
+
+    function copy-pdf-selection() {
+        let selected = root.pdf-copy-requested(root.active-tab-id);
+        if (selected != "") {
+            root.pdf-copy-text(selected);
         }
     }
 
@@ -592,6 +645,7 @@ component WorkspaceGroup inherits Rectangle {
         content-stack := Rectangle {
             horizontal-stretch: 1;
             vertical-stretch: 1;
+            height: parent.height - 36px;
             background: Chrome.canvas;
             clip: true;
 
@@ -600,8 +654,9 @@ component WorkspaceGroup inherits Rectangle {
             width: parent.width;
             height: parent.height;
             background: Chrome.canvas;
-
             VerticalLayout {
+                width: parent.width;
+                height: parent.height;
                 spacing: 0px;
                 Rectangle {
                     height: root.find-visible ? 36px : 0px;
@@ -777,6 +832,189 @@ component WorkspaceGroup inherits Rectangle {
                                 clicked => { code-input.copy(); root.show-copy-feedback(); }
                             }
                         }
+                    }
+                }
+            }
+            if root.markdown-source: ActionButton {
+                x: parent.width - self.width - 16px;
+                y: 8px;
+                label: "Preview";
+                clicked => { root.markdown-mode-requested(root.active-tab-id); }
+            }
+        }
+
+        preview-layer := Rectangle {
+            visible: root.active-kind == "markdown" || root.active-kind == "image" || root.active-kind == "pdf";
+            width: parent.width;
+            height: parent.height;
+            background: Chrome.canvas;
+            VerticalLayout {
+                spacing: 0px;
+                Rectangle {
+                    height: 38px;
+                    background: Chrome.surface;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: root.active-kind == "markdown" ? "Markdown Preview" :
+                                (root.active-kind == "pdf" ? "PDF Preview" : "Image Preview");
+                            color: Chrome.muted;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        if root.active-kind == "markdown": ActionButton {
+                            label: "Source";
+                            clicked => { root.markdown-mode-requested(root.active-tab-id); }
+                        }
+                        if root.active-kind == "image" || root.active-kind == "pdf": ActionButton {
+                            label: "Fit";
+                            width: 48px;
+                            clicked => { root.preview-zoom-requested(root.active-tab-id, 0, root.preview-fit-zoom); }
+                        }
+                        if root.active-kind == "image" || root.active-kind == "pdf": ActionButton {
+                            label: "100%";
+                            width: 58px;
+                            clicked => { root.preview-zoom-requested(root.active-tab-id, 100, 1); }
+                        }
+                        if root.active-kind == "image" || root.active-kind == "pdf": ActionButton {
+                            label: "−";
+                            width: 32px;
+                            available: root.preview-effective-zoom > 0.25;
+                            clicked => {
+                                root.preview-zoom-requested(root.active-tab-id,
+                                    max(25, root.preview-zoom == 0
+                                        ? round(root.preview-fit-zoom * 100 / 25) * 25 - 25
+                                        : root.preview-zoom - 25), 1);
+                            }
+                        }
+                        if root.active-kind == "image" || root.active-kind == "pdf": Text {
+                            text: root.preview-zoom == 0 ? "Fit" : root.preview-zoom + "%";
+                            color: Chrome.text;
+                            vertical-alignment: center;
+                        }
+                        if root.active-kind == "image" || root.active-kind == "pdf": ActionButton {
+                            label: "+";
+                            width: 32px;
+                            available: root.preview-effective-zoom < 4;
+                            clicked => {
+                                root.preview-zoom-requested(root.active-tab-id,
+                                    min(400, root.preview-zoom == 0
+                                        ? round(root.preview-fit-zoom * 100 / 25) * 25 + 25
+                                        : root.preview-zoom + 25), 1);
+                            }
+                        }
+                        if root.active-kind == "pdf": ActionButton {
+                            label: "‹";
+                            available: root.preview-page > 0;
+                            clicked => { root.pdf-page-requested(root.active-tab-id, -1); }
+                        }
+                        if root.active-kind == "pdf": Text {
+                            text: (root.preview-page + 1) + " / " + root.preview-page-count;
+                            color: Chrome.text;
+                            vertical-alignment: center;
+                        }
+                        if root.active-kind == "pdf": ActionButton {
+                            label: "›";
+                            available: root.preview-page + 1 < root.preview-page-count;
+                            clicked => { root.pdf-page-requested(root.active-tab-id, 1); }
+                        }
+                        if root.active-kind == "pdf": ActionButton {
+                            label: "Copy";
+                            available: root.pdf-selection.length > 0;
+                            clicked => { root.copy-pdf-selection(); }
+                        }
+                    }
+                }
+                if root.active-kind == "markdown": ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        width: max(0px, parent.width - 40px);
+                        padding: 20px;
+                        spacing: 12px;
+                        for block in root.preview-blocks: StyledText {
+                            width: parent.width;
+                            height: self.preferred-height;
+                            text: block.text;
+                            default-color: block.kind == "code" ? #b9d7f0 : Chrome.text;
+                            default-font-family: block.kind == "code" ? "Cascadia Mono" : "Segoe UI";
+                            default-font-size: block.kind == "h1" ? 28px :
+                                (block.kind == "h2" ? 23px :
+                                (block.kind == "h3" ? 20px :
+                                (block.kind == "code" ? 13px : 15px)));
+                        }
+                    }
+                }
+                if root.active-kind == "image" || root.active-kind == "pdf": preview-canvas := Rectangle {
+                    vertical-stretch: 1;
+                    background: Chrome.canvas;
+                    clip: true;
+                    pdf-focus := FocusScope {
+                        width: parent.width;
+                        height: parent.height;
+                        focus-on-click: true;
+                        key-pressed(event) => {
+                            if (root.active-kind == "pdf" && event.modifiers.control
+                                && (event.text == "c" || event.text == "C")) {
+                                root.copy-pdf-selection();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    preview-scroll := ScrollView {
+                        width: parent.width;
+                        height: parent.height;
+                        viewport-width: max(self.visible-width, root.preview-display-width + 24px);
+                        viewport-height: max(self.visible-height, root.preview-display-height + 24px);
+                        pdf-page-layer := Rectangle {
+                            width: root.preview-display-width;
+                            height: root.preview-display-height;
+                            x: max(12px, (preview-scroll.viewport-width - self.width) / 2);
+                            y: max(12px, (preview-scroll.viewport-height - self.height) / 2);
+                            Image {
+                                source: root.preview-image;
+                                width: parent.width;
+                                height: parent.height;
+                                image-fit: contain;
+                            }
+                            for rect in root.pdf-selection: Rectangle {
+                                x: rect.x * root.preview-effective-zoom * 1px;
+                                y: rect.y * root.preview-effective-zoom * 1px;
+                                width: rect.width * root.preview-effective-zoom * 1px;
+                                height: rect.height * root.preview-effective-zoom * 1px;
+                                background: #7fbbe080;
+                            }
+                            if root.active-kind == "pdf": TouchArea {
+                                width: parent.width;
+                                height: parent.height;
+                                mouse-cursor: text;
+                                scroll-event(event) => { return reject; }
+                                moved => {
+                                    if (self.pressed) {
+                                        root.pdf-selection-event(root.active-tab-id,
+                                            (self.mouse-x / 1px) / root.preview-effective-zoom,
+                                            (self.mouse-y / 1px) / root.preview-effective-zoom, 1);
+                                    }
+                                }
+                                pointer-event(event) => {
+                                    if (event.button == PointerEventButton.left
+                                        && event.kind == PointerEventKind.down) {
+                                        pdf-focus.focus();
+                                        root.group-focused(root.group-id);
+                                        root.pdf-selection-event(root.active-tab-id,
+                                            (self.mouse-x / 1px) / root.preview-effective-zoom,
+                                            (self.mouse-y / 1px) / root.preview-effective-zoom, 0);
+                                    } else if (event.button == PointerEventButton.left
+                                        && event.kind == PointerEventKind.up) {
+                                        root.pdf-selection-event(root.active-tab-id,
+                                            (self.mouse-x / 1px) / root.preview-effective-zoom,
+                                            (self.mouse-y / 1px) / root.preview-effective-zoom, 2);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     }
                 }
             }
@@ -1226,6 +1464,25 @@ export component AppWindow inherits Window {
     in-out property <int> editor-cursor-generation: 0;
     in property <string> line-numbers: "1";
     in property <string> active-path: "";
+    in property <image> primary-preview-image;
+    in property <[PreviewBlock]> primary-preview-blocks;
+    in property <int> primary-preview-page: 0;
+    in property <int> primary-preview-page-count: 0;
+    in property <float> primary-preview-natural-width: 0;
+    in property <float> primary-preview-natural-height: 0;
+    in property <int> primary-preview-zoom: 0;
+    in property <[PdfSelectionRect]> primary-pdf-selection;
+    out property <length> primary-preview-displayed-width: primary-view.preview-displayed-width;
+    in property <bool> primary-markdown-source: false;
+    in property <image> secondary-preview-image;
+    in property <[PreviewBlock]> secondary-preview-blocks;
+    in property <int> secondary-preview-page: 0;
+    in property <int> secondary-preview-page-count: 0;
+    in property <float> secondary-preview-natural-width: 0;
+    in property <float> secondary-preview-natural-height: 0;
+    in property <int> secondary-preview-zoom: 0;
+    in property <[PdfSelectionRect]> secondary-pdf-selection;
+    in property <bool> secondary-markdown-source: false;
     in property <string> status-text: "Ready";
     in property <bool> save-conflict: false;
     in property <bool> tree-action-pending: false;
@@ -1406,6 +1663,11 @@ export component AppWindow inherits Window {
     callback undo-requested(int);
     callback redo-requested(int);
     callback save-requested(int);
+    callback markdown-mode-requested(int);
+    callback pdf-page-requested(int, int);
+    callback preview-zoom-requested(int, int, float);
+    callback pdf-selection-event(int, float, float, int);
+    callback pdf-copy-requested(int) -> string;
     callback force-save-requested();
     callback reload-requested();
     callback find-requested(int, string);
@@ -1586,6 +1848,13 @@ export component AppWindow inherits Window {
         root.tree-drag-name = "";
         root.tree-drop-terminal-id = -1;
         root.tree-drop-group = -1;
+    }
+
+    function copy-pdf-text(selected: string) {
+        clipboard-staging.text = selected;
+        clipboard-staging.select-all();
+        clipboard-staging.copy();
+        clipboard-staging.text = "";
     }
 
     shortcut-scope := FocusScope {
@@ -2077,6 +2346,15 @@ export component AppWindow inherits Window {
                     active-kind: root.primary-active-kind;
                     active-title: root.primary-active-title;
                     active-detail: root.primary-active-detail;
+                    preview-image: root.primary-preview-image;
+                    preview-blocks: root.primary-preview-blocks;
+                    preview-page: root.primary-preview-page;
+                    preview-page-count: root.primary-preview-page-count;
+                    preview-natural-width: root.primary-preview-natural-width;
+                    preview-natural-height: root.primary-preview-natural-height;
+                    preview-zoom: root.primary-preview-zoom;
+                    pdf-selection: root.primary-pdf-selection;
+                    markdown-source: root.primary-markdown-source;
                     editor-text <=> root.editor-text;
                     highlighted-text: root.highlighted-text;
                     syntax-highlight-enabled: root.syntax-highlight-enabled;
@@ -2110,6 +2388,12 @@ export component AppWindow inherits Window {
                     undo-requested(tab-id) => { root.undo-requested(tab-id); }
                     redo-requested(tab-id) => { root.redo-requested(tab-id); }
                     save-requested(tab-id) => { root.save-requested(tab-id); }
+                    markdown-mode-requested(tab-id) => { root.markdown-mode-requested(tab-id); }
+                    pdf-page-requested(tab-id, delta) => { root.pdf-page-requested(tab-id, delta); }
+                    preview-zoom-requested(tab-id, zoom, fit-scale) => { root.preview-zoom-requested(tab-id, zoom, fit-scale); }
+                    pdf-selection-event(tab-id, x, y, phase) => { root.pdf-selection-event(tab-id, x, y, phase); }
+                    pdf-copy-requested(tab-id) => { root.pdf-copy-requested(tab-id) }
+                    pdf-copy-text(selected) => { root.copy-pdf-text(selected); }
                     find-requested(tab-id, query) => { root.find-requested(tab-id, query); }
                     find-visibility-requested(group, visible) => {
                         root.focused-group = group;
@@ -2158,6 +2442,15 @@ export component AppWindow inherits Window {
                     active-kind: root.secondary-active-kind;
                     active-title: root.secondary-active-title;
                     active-detail: root.secondary-active-detail;
+                    preview-image: root.secondary-preview-image;
+                    preview-blocks: root.secondary-preview-blocks;
+                    preview-page: root.secondary-preview-page;
+                    preview-page-count: root.secondary-preview-page-count;
+                    preview-natural-width: root.secondary-preview-natural-width;
+                    preview-natural-height: root.secondary-preview-natural-height;
+                    preview-zoom: root.secondary-preview-zoom;
+                    pdf-selection: root.secondary-pdf-selection;
+                    markdown-source: root.secondary-markdown-source;
                     editor-text <=> root.secondary-editor-text;
                     highlighted-text: root.secondary-highlighted-text;
                     syntax-highlight-enabled: root.secondary-syntax-highlight-enabled;
@@ -2191,6 +2484,12 @@ export component AppWindow inherits Window {
                     undo-requested(tab-id) => { root.undo-requested(tab-id); }
                     redo-requested(tab-id) => { root.redo-requested(tab-id); }
                     save-requested(tab-id) => { root.save-requested(tab-id); }
+                    markdown-mode-requested(tab-id) => { root.markdown-mode-requested(tab-id); }
+                    pdf-page-requested(tab-id, delta) => { root.pdf-page-requested(tab-id, delta); }
+                    preview-zoom-requested(tab-id, zoom, fit-scale) => { root.preview-zoom-requested(tab-id, zoom, fit-scale); }
+                    pdf-selection-event(tab-id, x, y, phase) => { root.pdf-selection-event(tab-id, x, y, phase); }
+                    pdf-copy-requested(tab-id) => { root.pdf-copy-requested(tab-id) }
+                    pdf-copy-text(selected) => { root.copy-pdf-text(selected); }
                     find-requested(tab-id, query) => { root.find-requested(tab-id, query); }
                     find-visibility-requested(group, visible) => {
                         root.focused-group = group;
@@ -2249,6 +2548,15 @@ export component AppWindow inherits Window {
                     active-kind: pane.active-kind;
                     active-title: pane.active-title;
                     active-detail: pane.active-detail;
+                    preview-image: pane.preview-image;
+                    preview-blocks: pane.preview-blocks;
+                    preview-page: pane.preview-page;
+                    preview-page-count: pane.preview-page-count;
+                    preview-natural-width: pane.preview-natural-width;
+                    preview-natural-height: pane.preview-natural-height;
+                    preview-zoom: pane.preview-zoom;
+                    pdf-selection: pane.pdf-selection;
+                    markdown-source: pane.markdown-source;
                     editor-text <=> pane.editor-text;
                     highlighted-text: pane.highlighted-text;
                     syntax-highlight-enabled: pane.syntax-highlight-enabled;
@@ -2280,6 +2588,12 @@ export component AppWindow inherits Window {
                     undo-requested(tab-id) => { root.undo-requested(tab-id); }
                     redo-requested(tab-id) => { root.redo-requested(tab-id); }
                     save-requested(tab-id) => { root.save-requested(tab-id); }
+                    markdown-mode-requested(tab-id) => { root.markdown-mode-requested(tab-id); }
+                    pdf-page-requested(tab-id, delta) => { root.pdf-page-requested(tab-id, delta); }
+                    preview-zoom-requested(tab-id, zoom, fit-scale) => { root.preview-zoom-requested(tab-id, zoom, fit-scale); }
+                    pdf-selection-event(tab-id, x, y, phase) => { root.pdf-selection-event(tab-id, x, y, phase); }
+                    pdf-copy-requested(tab-id) => { root.pdf-copy-requested(tab-id) }
+                    pdf-copy-text(selected) => { root.copy-pdf-text(selected); }
                     find-requested(tab-id, query) => { root.find-requested(tab-id, query); }
                     find-visibility-requested(group, visible) => {
                         root.focused-group = group;
