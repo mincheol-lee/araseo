@@ -8,7 +8,9 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1"
+hayro = "0.7.1"
 portable-pty = "0.9"
+pulldown-cmark = "0.13.4"
 slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "unstable-winit-030"] }
 swash = "0.2"
 vt100 = "0.16"

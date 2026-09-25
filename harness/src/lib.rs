@@ -8,6 +8,10 @@
 pub mod workspace;
 #[path = "../../src/document.rs"]
 pub mod document;
+#[path = "../../src/preview.rs"]
+pub mod preview;
+#[path = "../../src/markdown_preview.rs"]
+pub mod markdown_preview;
 #[path = "../../src/tree.rs"]
 pub mod tree;
 #[path = "../../src/git.rs"]

@@ -313,7 +313,9 @@ mod tests {
         assert!(
             ui.get_primary_editor_surface_width() > 850.0
                 && ui.get_primary_editor_surface_height() > 650.0,
-            "the editor surface used only part of the initial pane"
+            "the editor surface used only part of the initial pane: {} x {}",
+            ui.get_primary_editor_surface_width(),
+            ui.get_primary_editor_surface_height()
         );
 
         let window_drags = Rc::new(RefCell::new(0));
@@ -2049,6 +2051,80 @@ mod tests {
         ui.window().dispatch_event(WindowEvent::KeyReleased { text: "X".into() });
         assert!(model.row_data(0).unwrap().editor_text.contains('X'));
         assert_eq!(ui.get_editor_text().as_str(), "Brightness sample text");
+
+        ui.set_workspace_layout(0);
+        ui.set_primary_active_kind("image".into());
+        ui.set_primary_preview_natural_width(16.0);
+        ui.set_primary_preview_natural_height(16.0);
+        let mut red = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(16, 16);
+        for pixel in red.make_mut_slice() {
+            *pixel = slint::Rgba8Pixel::new(255, 0, 0, 255);
+        }
+        ui.set_primary_preview_image(slint::Image::from_rgba8(red));
+        let image_pixels = render(&window);
+        assert!(image_pixels.iter().filter(|pixel| pixel.red > 180 && pixel.green < 80).count() > 100);
+        assert_eq!(ui.get_primary_preview_displayed_width(), 16.0);
+        ui.set_primary_preview_natural_width(1198.0);
+        ui.set_primary_preview_natural_height(807.0);
+        assert!(ui.get_primary_preview_displayed_width() < 1198.0);
+        ui.set_primary_preview_zoom(100);
+        assert_eq!(ui.get_primary_preview_displayed_width(), 1198.0);
+        ui.set_primary_preview_zoom(200);
+        assert_eq!(ui.get_primary_preview_displayed_width(), 2396.0);
+
+        ui.set_primary_active_kind("pdf".into());
+        ui.set_primary_preview_zoom(100);
+        let pdf_events = Rc::new(RefCell::new(Vec::new()));
+        let recorded_events = pdf_events.clone();
+        ui.on_pdf_selection_event(move |tab, x, y, phase| {
+            recorded_events.borrow_mut().push((tab, x, y, phase));
+        });
+        ui.on_pdf_copy_requested(|_| "Hello PDF".into());
+        let pdf_pixels = render(&window);
+        let pdf_hit = pdf_pixels.iter().enumerate().find_map(|(index, pixel)| {
+            (pixel.red > 180 && pixel.green < 80 && pixel.blue < 80)
+                .then_some(LogicalPosition::new((index % 1200) as f32, (index / 1200) as f32))
+        }).expect("PDF image should be visible");
+        ui.window().dispatch_event(WindowEvent::PointerPressed {
+            position: pdf_hit,
+            button: PointerEventButton::Left,
+        });
+        ui.window().dispatch_event(WindowEvent::PointerMoved {
+            position: LogicalPosition::new(pdf_hit.x + 30.0, pdf_hit.y + 10.0),
+        });
+        ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position: LogicalPosition::new(pdf_hit.x + 30.0, pdf_hit.y + 10.0),
+            button: PointerEventButton::Left,
+        });
+        assert!(pdf_events.borrow().iter().any(|event| event.3 == 0), "PDF pointer missed at {pdf_hit:?}");
+        assert!(pdf_events.borrow().iter().any(|event| event.3 == 2));
+        let (_, page_x, page_y, _) = pdf_events.borrow()[0];
+        ui.set_primary_pdf_selection(ModelRc::new(VecModel::from(vec![PdfSelectionRect {
+            x: page_x, y: page_y, width: 40.0, height: 20.0,
+        }])));
+        let selected_pixels = render(&window);
+        let highlight_pixel = (pdf_hit.y as usize + 5) * 1200 + pdf_hit.x as usize + 5;
+        assert_ne!(pdf_pixels[highlight_pixel], selected_pixels[highlight_pixel],
+            "PDF selection band should visibly cover the line");
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: "c".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: "c".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        assert_eq!(clipboard.borrow().as_str(), "Hello PDF");
+
+        ui.set_primary_active_kind("markdown".into());
+        ui.set_primary_preview_blocks(ModelRc::new(VecModel::from(vec![
+            PreviewBlock {
+                kind: "h1".into(),
+                text: slint::StyledText::from_plain_text("Preview heading"),
+            },
+            PreviewBlock {
+                kind: "paragraph".into(),
+                text: slint::StyledText::from_markdown("**Bold content**").unwrap(),
+            },
+        ])));
+        let markdown_pixels = render(&window);
+        assert_ne!(image_pixels, markdown_pixels, "Markdown preview did not replace the image viewer");
     }
 
     fn dispatch_pointer(ui: &AppWindow, event: WindowEvent) {

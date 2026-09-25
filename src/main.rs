@@ -4,6 +4,8 @@ mod appearance;
 mod background;
 mod document;
 mod editor_view;
+mod markdown_preview;
+mod preview;
 mod emoji;
 #[cfg(windows)]
 mod folder_picker;
@@ -19,12 +21,14 @@ mod wsl_diagnostics;
 use anyhow::{Context, Result, bail};
 use background::Background;
 use document::{Document, ExternalRefresh};
+use preview::{LoadedPreview, PdfTextPage, PreviewKind, RenderedPage};
 use slint::winit_030::WinitWindowAccessor;
 use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tabs::{Axis, Dock, Rect, TabGroups, TabId};
 use terminal::TerminalSession;
@@ -57,7 +61,10 @@ struct AppState {
     syncing_editor: Cell<bool>,
     emoji_icons: emoji::EmojiIcons,
     tree_loader: Background<Result<Vec<FlatNode>>>,
-    file_loader: Background<Result<(Document, usize)>>,
+    file_loader: Background<Result<(OpenedFile, usize)>>,
+    page_loader: Background<Result<(TabId, usize, i32, f32, RenderedPage)>>,
+    markdown_source_tabs: HashSet<TabId>,
+    markdown_preview_cache: RefCell<HashMap<TabId, (String, ModelRc<PreviewBlock>)>>,
     diff_loader: Background<Result<(git::FileDiff, usize)>>,
     git_action_loader: Background<Result<PathBuf>>,
     tree_action_loader: Background<Result<TreeActionResult>>,
@@ -91,12 +98,34 @@ enum TreeActionResult {
 
 enum TabContent {
     File(Document),
+    Preview(PreviewTab),
     Diff(git::FileDiff),
     Terminal {
         session: TerminalSession,
         start_path: PathBuf,
         number: u32,
     },
+}
+
+enum OpenedFile {
+    Text(Document),
+    Preview(LoadedPreview),
+}
+
+struct PreviewTab {
+    linux_path: PathBuf,
+    kind: PreviewKind,
+    image: slint::Image,
+    pdf_bytes: Option<Arc<Vec<u8>>>,
+    page_index: usize,
+    page_count: usize,
+    natural_width: f32,
+    natural_height: f32,
+    zoom_percent: i32,
+    render_zoom: f32,
+    text: PdfTextPage,
+    selection_anchor: Option<usize>,
+    selection_focus: Option<usize>,
 }
 
 struct WorkspaceTab {
@@ -156,6 +185,9 @@ fn main() -> Result<()> {
         emoji_icons: emoji::EmojiIcons::default(),
         tree_loader: Background::default(),
         file_loader: Background::default(),
+        page_loader: Background::default(),
+        markdown_source_tabs: HashSet::new(),
+        markdown_preview_cache: RefCell::new(HashMap::new()),
         diff_loader: Background::default(),
         git_action_loader: Background::default(),
         tree_action_loader: Background::default(),
@@ -344,6 +376,103 @@ fn main() -> Result<()> {
             if let Some(ui) = weak.upgrade() {
                 sync_ui(&ui, &state);
             }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_markdown_mode_requested(move |tab_id| {
+            let mut state = state.borrow_mut();
+            let id = tab_id as TabId;
+            if !state.markdown_source_tabs.insert(id) {
+                state.markdown_source_tabs.remove(&id);
+            }
+            if let Some(ui) = weak.upgrade()
+                && let Some(group) = state.tab_groups.group_of(id)
+            {
+                sync_group(&ui, &state, group);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_pdf_page_requested(move |tab_id, delta| {
+            let mut state = state.borrow_mut();
+            let id = tab_id as TabId;
+            let Some((index, percent, render_zoom)) = state.tabs.iter().find_map(|tab| {
+                if tab.id != id { return None; }
+                let TabContent::Preview(preview) = &tab.content else { return None; };
+                preview.pdf_bytes.as_ref()?;
+                let index = preview.page_index as i32 + delta;
+                (index >= 0 && (index as usize) < preview.page_count)
+                    .then_some((index as usize, preview.zoom_percent, preview.render_zoom))
+            }) else { return; };
+            request_pdf_render(&mut state, id, index, percent, render_zoom);
+            if let Some(ui) = weak.upgrade() {
+                ui.set_status_text(state.status.clone().into());
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_preview_zoom_requested(move |tab_id, percent, fit_scale| {
+            let mut state = state.borrow_mut();
+            let id = tab_id as TabId;
+            let percent = if percent == 0 { 0 } else { percent.clamp(25, 400) };
+            let render_zoom = if percent == 0 {
+                fit_scale.clamp(0.25, 4.0)
+            } else {
+                percent as f32 / 100.0
+            };
+            let Some(tab) = state.tabs.iter_mut().find(|tab| tab.id == id) else { return; };
+            let TabContent::Preview(preview) = &mut tab.content else { return; };
+            if preview.pdf_bytes.is_some() {
+                let index = preview.page_index;
+                request_pdf_render(&mut state, id, index, percent, render_zoom);
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_status_text(state.status.clone().into());
+                }
+            } else {
+                preview.zoom_percent = percent;
+                if let Some(ui) = weak.upgrade()
+                    && let Some(group) = state.tab_groups.group_of(id)
+                {
+                    sync_group(&ui, &state, group);
+                }
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_pdf_selection_event(move |tab_id, x, y, phase| {
+            let mut state = state.borrow_mut();
+            let id = tab_id as TabId;
+            let Some(tab) = state.tabs.iter_mut().find(|tab| tab.id == id) else { return; };
+            let TabContent::Preview(preview) = &mut tab.content else { return; };
+            if preview.kind != PreviewKind::Pdf { return; }
+            let Some(index) = preview.text.nearest_glyph(x, y) else { return; };
+            if phase == 0 { preview.selection_anchor = Some(index); }
+            if preview.selection_anchor.is_none() { return; }
+            preview.selection_focus = Some(index);
+            if let Some(ui) = weak.upgrade()
+                && let Some(group) = state.tab_groups.group_of(id)
+            {
+                sync_group(&ui, &state, group);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        ui.on_pdf_copy_requested(move |tab_id| {
+            let state = state.borrow();
+            state.tabs.iter().find_map(|tab| {
+                if tab.id != tab_id as TabId { return None; }
+                let TabContent::Preview(preview) = &tab.content else { return None; };
+                Some(preview.text.selected_text(preview.selection_anchor?, preview.selection_focus?))
+            }).unwrap_or_default().into()
         });
     }
     {
@@ -1196,14 +1325,44 @@ fn main() -> Result<()> {
             }
             if let Some(result) = state.file_loader.poll() {
                 match result {
-                    Ok((document, group)) => {
-                        let tab_id = take_next_tab_id(&mut state);
-                        state.tabs.push(WorkspaceTab {
-                            id: tab_id,
-                            content: TabContent::File(document),
-                        });
-                        state.tab_groups.add(tab_id, group);
-                        state.status = "File opened".into();
+                    Ok((opened, group)) => {
+                        let content = match opened {
+                            OpenedFile::Text(document) => Ok(TabContent::File(document)),
+                            OpenedFile::Preview(loaded) => preview_tab(loaded).map(TabContent::Preview),
+                        };
+                        match content {
+                            Ok(content) => {
+                                let tab_id = take_next_tab_id(&mut state);
+                                state.tabs.push(WorkspaceTab { id: tab_id, content });
+                                state.tab_groups.add(tab_id, group);
+                                state.status = "File opened".into();
+                            }
+                            Err(error) => state.status = error.to_string(),
+                        }
+                    }
+                    Err(error) => state.status = error.to_string(),
+                }
+                sync_ui(&ui, &state);
+            }
+            if let Some(result) = state.page_loader.poll() {
+                match result {
+                    Ok((tab_id, index, percent, render_zoom, page)) => {
+                        if let Some(tab) = state.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                            && let TabContent::Preview(preview) = &mut tab.content
+                        {
+                            preview.natural_width = page.page_width;
+                            preview.natural_height = page.page_height;
+                            if preview.page_index != index {
+                                preview.selection_anchor = None;
+                                preview.selection_focus = None;
+                            }
+                            preview.text = page.text.clone();
+                            preview.image = image_from_page(page);
+                            preview.page_index = index;
+                            preview.zoom_percent = percent;
+                            preview.render_zoom = render_zoom;
+                            state.status = format!("Page {} of {}", index + 1, preview.page_count);
+                        }
                     }
                     Err(error) => state.status = error.to_string(),
                 }
@@ -1721,6 +1880,7 @@ fn apply_history_change(
 
 fn cancel_file_open(state: &mut AppState) {
     state.file_loader.cancel();
+    state.page_loader.cancel();
     state.diff_loader.cancel();
     if state.status.starts_with("Opening ") || state.status.starts_with("Loading diff for ") {
         state.status = "Ready".into();
@@ -1731,6 +1891,7 @@ fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
     cancel_file_open(state);
     if let Some(tab_id) = state.tabs.iter().find_map(|tab| match &tab.content {
         TabContent::File(document) if document.linux_path == linux_path => Some(tab.id),
+        TabContent::Preview(preview) if preview.linux_path == linux_path => Some(tab.id),
         _ => None,
     }) {
         state.tab_groups.activate(tab_id);
@@ -1742,9 +1903,71 @@ fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
     state.status = format!("Opening {}...", linux_path.display());
     state.file_loader.request(move || {
         let host_path = workspace.host_path(&linux_path)?;
-        Ok((Document::open(linux_path, host_path)?, group))
+        let opened = match preview::kind_for(&linux_path) {
+            Some(kind) => OpenedFile::Preview(preview::open(linux_path, host_path, kind)?),
+            None => OpenedFile::Text(Document::open(linux_path, host_path)?),
+        };
+        Ok((opened, group))
     });
     Ok(())
+}
+
+fn image_from_page(page: RenderedPage) -> slint::Image {
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(page.width, page.height);
+    buffer.make_mut_bytes().copy_from_slice(&page.rgba);
+    slint::Image::from_rgba8_premultiplied(buffer)
+}
+
+fn request_pdf_render(
+    state: &mut AppState,
+    tab_id: TabId,
+    index: usize,
+    percent: i32,
+    render_zoom: f32,
+) {
+    let Some(bytes) = state.tabs.iter().find_map(|tab| {
+        if tab.id != tab_id { return None; }
+        let TabContent::Preview(preview) = &tab.content else { return None; };
+        preview.pdf_bytes.clone()
+    }) else { return; };
+    state.status = format!("Rendering page {}...", index + 1);
+    state.page_loader.request(move || {
+        Ok((tab_id, index, percent, render_zoom,
+            preview::render_page(&bytes, index, render_zoom)?))
+    });
+}
+
+fn preview_tab(loaded: LoadedPreview) -> Result<PreviewTab> {
+    let (image, natural_width, natural_height, text) = match loaded.kind {
+        PreviewKind::Image => slint::Image::load_from_path(&loaded.host_path)
+            .with_context(|| format!("cannot display {}", loaded.linux_path.display()))
+            .map(|image| {
+                let size = image.size();
+                (image, size.width as f32, size.height as f32, PdfTextPage::default())
+            })?,
+        PreviewKind::Pdf => {
+            let page = loaded.first_page.context("PDF page is missing")?;
+            let natural_width = page.page_width;
+            let natural_height = page.page_height;
+            let text = page.text.clone();
+            (image_from_page(page), natural_width, natural_height, text)
+        }
+    };
+    Ok(PreviewTab {
+        linux_path: loaded.linux_path,
+        kind: loaded.kind,
+        image,
+        pdf_bytes: loaded.pdf_bytes.map(Arc::new),
+        page_index: 0,
+        page_count: loaded.page_count,
+        natural_width,
+        natural_height,
+        zoom_percent: 0,
+        render_zoom: 1.5,
+        text,
+        selection_anchor: None,
+        selection_focus: None,
+    })
 }
 
 fn open_git_diff(state: &mut AppState, path: PathBuf) -> Result<()> {
@@ -1815,6 +2038,8 @@ fn close_tab(state: &mut AppState, tab_id: TabId) {
     }
 
     state.tab_groups.remove(tab_id);
+    state.markdown_source_tabs.remove(&tab_id);
+    state.markdown_preview_cache.borrow_mut().remove(&tab_id);
     state.tabs.remove(index);
     if state.save_conflict == Some(tab_id) {
         state.save_conflict = None;
@@ -1962,6 +2187,7 @@ fn close_file_tabs_at_or_below(state: &mut AppState, path: &std::path::Path) {
         .filter_map(|tab| {
             let matches = match &tab.content {
                 TabContent::File(document) => document.linux_path.starts_with(path),
+                TabContent::Preview(preview) => preview.linux_path.starts_with(path),
                 TabContent::Diff(diff) => diff.path.starts_with(path),
                 TabContent::Terminal { .. } => false,
             };
@@ -2105,7 +2331,7 @@ fn document_ref(state: &AppState, tab_id: TabId) -> Option<&Document> {
         }
         match &tab.content {
             TabContent::File(document) => Some(document),
-            TabContent::Diff(_) | TabContent::Terminal { .. } => None,
+            TabContent::Preview(_) | TabContent::Diff(_) | TabContent::Terminal { .. } => None,
         }
     })
 }
@@ -2117,7 +2343,7 @@ fn document_mut(state: &mut AppState, tab_id: TabId) -> Option<&mut Document> {
         }
         match &mut tab.content {
             TabContent::File(document) => Some(document),
-            TabContent::Diff(_) | TabContent::Terminal { .. } => None,
+            TabContent::Preview(_) | TabContent::Diff(_) | TabContent::Terminal { .. } => None,
         }
     })
 }
@@ -2129,7 +2355,7 @@ fn terminal_ref(state: &AppState, tab_id: TabId) -> Option<&TerminalSession> {
         }
         match &tab.content {
             TabContent::Terminal { session, .. } => Some(session),
-            TabContent::File(_) | TabContent::Diff(_) => None,
+            TabContent::File(_) | TabContent::Preview(_) | TabContent::Diff(_) => None,
         }
     })
 }
@@ -2141,7 +2367,7 @@ fn terminal_mut(state: &mut AppState, tab_id: TabId) -> Option<&mut TerminalSess
         }
         match &mut tab.content {
             TabContent::Terminal { session, .. } => Some(session),
-            TabContent::File(_) | TabContent::Diff(_) => None,
+            TabContent::File(_) | TabContent::Preview(_) | TabContent::Diff(_) => None,
         }
     })
 }
@@ -2348,6 +2574,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
     }
     let active_id = state.tab_groups.active(group);
     let active_tab = active_id.and_then(|id| state.tabs.iter().find(|tab| tab.id == id));
+    sync_preview_properties(ui, state, group, active_tab);
 
     match (group, active_tab) {
         (0, Some(tab)) => {
@@ -2356,13 +2583,22 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
             ui.set_primary_active_detail(tab_detail(tab).into());
             match &tab.content {
                 TabContent::File(document) => {
-                    ui.set_primary_active_kind("file".into());
+                    let markdown_preview = is_markdown(&document.linux_path)
+                        && !state.markdown_source_tabs.contains(&tab.id);
+                    ui.set_primary_active_kind(if markdown_preview { "markdown" } else { "file" }.into());
                     state.syncing_editor.set(true);
                     if ui.get_editor_text().as_str() != document.text {
                         ui.set_editor_text(document.text.clone().into());
                     }
                     state.syncing_editor.set(false);
-                    sync_editor_view(ui, state, document, 0, ui.get_editor_text());
+                    if !markdown_preview {
+                        sync_editor_view(ui, state, document, 0, ui.get_editor_text());
+                    }
+                    clear_terminal_group(ui, 0);
+                }
+                TabContent::Preview(preview) => {
+                    state.editor_views.borrow_mut()[0].clear();
+                    ui.set_primary_active_kind(preview_kind_name(preview.kind).into());
                     clear_terminal_group(ui, 0);
                 }
                 TabContent::Diff(diff) => {
@@ -2388,13 +2624,22 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
             ui.set_secondary_active_detail(tab_detail(tab).into());
             match &tab.content {
                 TabContent::File(document) => {
-                    ui.set_secondary_active_kind("file".into());
+                    let markdown_preview = is_markdown(&document.linux_path)
+                        && !state.markdown_source_tabs.contains(&tab.id);
+                    ui.set_secondary_active_kind(if markdown_preview { "markdown" } else { "file" }.into());
                     state.syncing_editor.set(true);
                     if ui.get_secondary_editor_text().as_str() != document.text {
                         ui.set_secondary_editor_text(document.text.clone().into());
                     }
                     state.syncing_editor.set(false);
-                    sync_editor_view(ui, state, document, 1, ui.get_secondary_editor_text());
+                    if !markdown_preview {
+                        sync_editor_view(ui, state, document, 1, ui.get_secondary_editor_text());
+                    }
+                    clear_terminal_group(ui, 1);
+                }
+                TabContent::Preview(preview) => {
+                    state.editor_views.borrow_mut()[1].clear();
+                    ui.set_secondary_active_kind(preview_kind_name(preview.kind).into());
                     clear_terminal_group(ui, 1);
                 }
                 TabContent::Diff(diff) => {
@@ -2444,11 +2689,135 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
     }
 }
 
+fn is_markdown(path: &std::path::Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+        matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx")
+    })
+}
+
+fn preview_kind_name(kind: PreviewKind) -> &'static str {
+    match kind {
+        PreviewKind::Image => "image",
+        PreviewKind::Pdf => "pdf",
+    }
+}
+
+fn sync_preview_properties(
+    ui: &AppWindow,
+    state: &AppState,
+    group: usize,
+    tab: Option<&WorkspaceTab>,
+) {
+    let image = match tab.map(|tab| &tab.content) {
+        Some(TabContent::Preview(preview)) => preview.image.clone(),
+        _ => slint::Image::default(),
+    };
+    let blocks = match tab {
+        Some(WorkspaceTab {
+            id,
+            content: TabContent::File(document),
+        }) if is_markdown(&document.linux_path) && !state.markdown_source_tabs.contains(id) => {
+            let cached = state
+                .markdown_preview_cache
+                .borrow()
+                .get(id)
+                    .filter(|(cached_text, _)| cached_text == &document.text)
+                    .map(|(_, blocks)| blocks.clone());
+            if let Some(blocks) = cached {
+                blocks
+            } else {
+                let blocks = markdown_preview::parse(&document.text)
+                    .into_iter()
+                    .map(|block| PreviewBlock {
+                        text: if block.kind == "code" {
+                            slint::StyledText::from_plain_text(&block.markup)
+                        } else {
+                            slint::StyledText::from_markdown(&block.markup)
+                                .unwrap_or_else(|_| slint::StyledText::from_plain_text(&block.markup))
+                        },
+                        kind: block.kind.into(),
+                    })
+                    .collect::<Vec<_>>();
+                let model = ModelRc::new(VecModel::from(blocks));
+                state
+                    .markdown_preview_cache
+                    .borrow_mut()
+                    .insert(*id, (document.text.clone(), model.clone()));
+                model
+            }
+        }
+        _ => ModelRc::new(VecModel::from(Vec::<PreviewBlock>::new())),
+    };
+    let page = match tab.map(|tab| &tab.content) {
+        Some(TabContent::Preview(preview)) => preview.page_index as i32,
+        _ => 0,
+    };
+    let page_count = match tab.map(|tab| &tab.content) {
+        Some(TabContent::Preview(preview)) => preview.page_count as i32,
+        _ => 0,
+    };
+    let (natural_width, natural_height, zoom_percent) = match tab.map(|tab| &tab.content) {
+        Some(TabContent::Preview(preview)) => (
+            preview.natural_width,
+            preview.natural_height,
+            preview.zoom_percent,
+        ),
+        _ => (0.0, 0.0, 0),
+    };
+    let selection = match tab.map(|tab| &tab.content) {
+        Some(TabContent::Preview(preview)) => preview.selection_anchor.zip(preview.selection_focus)
+            .map(|(anchor, focus)| preview.text.selection_rects(anchor, focus))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(x, y, width, height)| PdfSelectionRect { x, y, width, height })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let selection = ModelRc::new(VecModel::from(selection));
+    let markdown_source = tab.is_some_and(|tab| state.markdown_source_tabs.contains(&tab.id));
+    match group {
+        0 => {
+            ui.set_primary_preview_image(image);
+            ui.set_primary_preview_blocks(blocks);
+            ui.set_primary_preview_page(page);
+            ui.set_primary_preview_page_count(page_count);
+            ui.set_primary_preview_natural_width(natural_width);
+            ui.set_primary_preview_natural_height(natural_height);
+            ui.set_primary_preview_zoom(zoom_percent);
+            ui.set_primary_pdf_selection(selection);
+            ui.set_primary_markdown_source(markdown_source);
+        }
+        1 => {
+            ui.set_secondary_preview_image(image);
+            ui.set_secondary_preview_blocks(blocks);
+            ui.set_secondary_preview_page(page);
+            ui.set_secondary_preview_page_count(page_count);
+            ui.set_secondary_preview_natural_width(natural_width);
+            ui.set_secondary_preview_natural_height(natural_height);
+            ui.set_secondary_preview_zoom(zoom_percent);
+            ui.set_secondary_pdf_selection(selection);
+            ui.set_secondary_markdown_source(markdown_source);
+        }
+        _ => edit_extra_pane(ui, group, |pane| {
+            pane.preview_image = image;
+            pane.preview_blocks = blocks;
+            pane.preview_page = page;
+            pane.preview_page_count = page_count;
+            pane.preview_natural_width = natural_width;
+            pane.preview_natural_height = natural_height;
+            pane.preview_zoom = zoom_percent;
+            pane.pdf_selection = selection;
+            pane.markdown_source = markdown_source;
+        }),
+    }
+}
+
 fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
     let active = state
         .tab_groups
         .active(group)
         .and_then(|id| state.tabs.iter().find(|tab| tab.id == id));
+    sync_preview_properties(ui, state, group, active);
     let Some(tab) = active else {
         state.extra_editor_views.borrow_mut().remove(&group);
         edit_extra_pane(ui, group, |pane| {
@@ -2469,7 +2838,9 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
         pane.active_title = tab_title(tab).into();
         pane.active_detail = tab_detail(tab).into();
         pane.active_kind = match tab.content {
-            TabContent::File(_) => "file",
+            TabContent::File(ref document) => if is_markdown(&document.linux_path)
+                && !state.markdown_source_tabs.contains(&tab.id) { "markdown" } else { "file" },
+            TabContent::Preview(ref preview) => preview_kind_name(preview.kind),
             TabContent::Diff(_) => "diff",
             TabContent::Terminal { .. } => "terminal",
         }
@@ -2484,9 +2855,14 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
                 }
             });
             state.syncing_editor.set(false);
-            if let Some(pane) = extra_pane(ui, group) {
+            if (!is_markdown(&document.linux_path) || state.markdown_source_tabs.contains(&tab.id))
+                && let Some(pane) = extra_pane(ui, group) {
                 sync_editor_view(ui, state, document, group, pane.editor_text);
             }
+            clear_terminal_group(ui, group);
+        }
+        TabContent::Preview(_) => {
+            state.extra_editor_views.borrow_mut().remove(&group);
             clear_terminal_group(ui, group);
         }
         TabContent::Diff(diff) => {
@@ -2825,6 +3201,7 @@ fn clear_terminal_group(ui: &AppWindow, group: usize) {
 fn tab_title(tab: &WorkspaceTab) -> String {
     match &tab.content {
         TabContent::File(document) => document.title(),
+        TabContent::Preview(preview) => preview.linux_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
         TabContent::Diff(diff) => {
             let name = diff
                 .path
@@ -2848,6 +3225,7 @@ fn tab_title(tab: &WorkspaceTab) -> String {
 fn tab_detail(tab: &WorkspaceTab) -> String {
     match &tab.content {
         TabContent::File(document) => document.linux_path.to_string_lossy().to_string(),
+        TabContent::Preview(preview) => preview.linux_path.to_string_lossy().to_string(),
         TabContent::Diff(diff) => diff.path.to_string_lossy().to_string(),
         TabContent::Terminal { start_path, .. } => start_path.to_string_lossy().to_string(),
     }
@@ -2985,6 +3363,7 @@ fn sync_tabs(ui: &AppWindow, state: &AppState) {
                 detail: tab_detail(tab).into(),
                 kind: match tab.content {
                     TabContent::File(_) => "file",
+                    TabContent::Preview(_) => "preview",
                     TabContent::Diff(_) => "diff",
                     TabContent::Terminal { .. } => "terminal",
                 }
