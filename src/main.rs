@@ -1681,7 +1681,7 @@ fn install_windows_file_drop(ui: &AppWindow, state: Rc<RefCell<AppState>>) {
             && let Some(ui) = weak.upgrade()
             && let Some((x, y)) = windows_cursor_position(window)
         {
-            begin_external_file_copy(&ui, &state, source.clone(), x, y);
+            handle_external_file_drop(&ui, &state, source.clone(), x, y);
         }
         EventResult::Propagate
     });
@@ -1714,6 +1714,45 @@ fn windows_cursor_position(window: &slint::Window) -> Option<(f32, f32)> {
             Some((point.x as f32 / scale, point.y as f32 / scale))
         })
         .flatten()
+}
+
+#[cfg(target_os = "windows")]
+fn handle_external_file_drop(
+    ui: &AppWindow,
+    state: &Rc<RefCell<AppState>>,
+    source: PathBuf,
+    x: f32,
+    y: f32,
+) {
+    let Ok(group) = usize::try_from(ui.invoke_tree_target_requested(x, y)) else {
+        begin_external_file_copy(ui, state, source, x, y);
+        return;
+    };
+
+    let mut state = state.borrow_mut();
+    let result = if source.is_file() {
+        workspace::dropped_file_linux_path(&state.workspace.distro, &source)
+    } else {
+        Err(anyhow::anyhow!("only files can be dropped into a terminal"))
+    };
+    match result {
+        Ok(path) => {
+            let Some(tab_id) = state.tab_groups.active(group) else {
+                return;
+            };
+            if let Some(terminal) = terminal_mut(&mut state, tab_id) {
+                terminal.write(format!(" {} ", path.display()).as_bytes());
+                state.tab_groups.set_focused_group(group);
+                state.status = format!("Inserted {} into terminal", path.display());
+                sync_ui(ui, &state);
+                ui.invoke_focus_terminal();
+            }
+        }
+        Err(error) => {
+            state.status = format!("Could not use dropped file: {error}");
+            ui.set_status_text(state.status.clone().into());
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]

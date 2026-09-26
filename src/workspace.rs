@@ -117,6 +117,27 @@ pub fn wsl_unc_to_linux_path(distro: &str, selected: &str) -> Result<Option<Path
     Ok(Some(PathBuf::from(format!("/{}", components.join("/")))))
 }
 
+/// Convert an Explorer file path into a path understood by the current WSL shell.
+/// This is deliberately independent of the workspace: a dropped file need not
+/// be copied into the project before Codex can read it.
+pub fn dropped_file_linux_path(distro: &str, source: &Path) -> Result<PathBuf> {
+    let selected = source.to_string_lossy();
+    if let Some(path) = wsl_unc_to_linux_path(distro, &selected)? {
+        return Ok(path);
+    }
+    let bytes = selected.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        bail!("dropped file must be on a Windows drive or in the current WSL distribution");
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let suffix = selected[3..].replace('\\', "/");
+    Ok(PathBuf::from(format!("/mnt/{drive}/{suffix}")))
+}
+
 fn normalize_linux_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -200,6 +221,28 @@ mod tests {
         );
         assert!(wsl_unc_to_linux_path("Ubuntu", r"\\wsl.localhost\Debian\home\user").is_err());
         assert!(wsl_unc_to_linux_path("Ubuntu", r"\\wsl.localhost\Ubuntu\..\user").is_err());
+    }
+
+    #[test]
+    fn dropped_explorer_file_can_be_referenced_without_a_workspace_copy() {
+        assert_eq!(
+            dropped_file_linux_path("Ubuntu", Path::new(r"C:\Users\Minch\한글 file.txt")).unwrap(),
+            PathBuf::from("/mnt/c/Users/Minch/한글 file.txt")
+        );
+        assert_eq!(
+            dropped_file_linux_path(
+                "Ubuntu",
+                Path::new(r"\\wsl.localhost\Ubuntu\home\minch\file.txt")
+            )
+            .unwrap(),
+            PathBuf::from("/home/minch/file.txt")
+        );
+        assert!(dropped_file_linux_path("Ubuntu", Path::new(r"C:relative.txt")).is_err());
+        assert!(dropped_file_linux_path("Ubuntu", Path::new(r"\\server\share\file.txt")).is_err());
+        assert!(
+            dropped_file_linux_path("Ubuntu", Path::new(r"\\wsl.localhost\Debian\home\file.txt"))
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
