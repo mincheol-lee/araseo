@@ -3,11 +3,11 @@ use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-#[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -17,8 +17,27 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[cfg(target_os = "windows")]
-static NEXT_WINDOWS_TERMINAL_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_TERMINAL_ID: AtomicU32 = AtomicU32::new(1);
+
+// These hooks are scoped to CLIs started inside an Araseo terminal. Each writes
+// only to that terminal's private status file; no user configuration is edited.
+const CODEX_HOOKS: &str = r#"hooks={UserPromptSubmit=[{hooks=[{type="command",command="printf codex:running > $ARASEO_AGENT_STATE_FILE"}]}],PermissionRequest=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}],PostToolUse=[{hooks=[{type="command",command="printf codex:running > $ARASEO_AGENT_STATE_FILE"}]}],Stop=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}],Interrupt=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}]}"#;
+const CLAUDE_SETTINGS: &str = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf claude:running > $ARASEO_AGENT_STATE_FILE"}]}],"PermissionRequest":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"printf claude:running > $ARASEO_AGENT_STATE_FILE"}]}],"Stop":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"Notification":[{"matcher":"permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input","hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}]}}"#;
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn agent_shell_command(status_path: &str) -> String {
+    format!(
+        "export ARASEO_AGENT_STATE_FILE={}; export ARASEO_CODEX_HOOKS={}; export ARASEO_CLAUDE_SETTINGS={}; \
+         : > \"$ARASEO_AGENT_STATE_FILE\"; \
+         codex() {{ printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; command codex -c \"$ARASEO_CODEX_HOOKS\" \"$@\"; araseo_result=$?; printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
+         claude() {{ printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; command claude --settings \"$ARASEO_CLAUDE_SETTINGS\" \"$@\"; araseo_result=$?; printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
+         export -f codex claude; exec /bin/bash --login -i",
+        shell_quote(status_path), shell_quote(CODEX_HOOKS), shell_quote(CLAUDE_SETTINGS)
+    )
+}
 
 #[cfg(any(target_os = "windows", test))]
 #[derive(Default)]
@@ -199,6 +218,7 @@ impl OutputSignal {
 }
 
 pub struct TerminalSession {
+    agent_probe: AgentProbe,
     #[cfg(not(target_os = "windows"))]
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -209,6 +229,102 @@ pub struct TerminalSession {
     _pipe_child: Option<std::process::Child>,
     #[cfg(target_os = "windows")]
     windows_resize: WindowsPtyResize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentKind {
+    Codex,
+    Claude,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentStatus {
+    pub kind: AgentKind,
+    pub running: bool,
+}
+
+#[derive(Clone)]
+pub struct AgentProbe {
+    tty: String,
+    status_path: String,
+    #[cfg(windows)]
+    distro: String,
+}
+
+impl AgentProbe {
+    pub fn detect(&self) -> Option<AgentStatus> {
+        #[cfg(windows)]
+        let output = {
+            let mut command = Command::new(r"C:\Windows\System32\wsl.exe");
+            command.creation_flags(CREATE_NO_WINDOW);
+            command.args([
+                "-d",
+                &self.distro,
+                "--exec",
+                "/bin/sh",
+                "-c",
+                "tty=$(cat \"$1\") && ps -t \"$tty\" -o comm=,args=; printf '\\034'; cat \"$2\" 2>/dev/null",
+                "araseo-agent-probe",
+                &self.tty,
+                &self.status_path,
+            ]);
+            command.output().ok()?
+        };
+        #[cfg(windows)]
+        let (processes, activity) = String::from_utf8_lossy(&output.stdout)
+            .split_once('\x1c')
+            .map(|(processes, activity)| (processes.to_owned(), activity.to_owned()))?;
+        #[cfg(not(windows))]
+        let output = Command::new("ps")
+            .args(["-t", &self.tty, "-o", "comm=,args="])
+            .output()
+            .ok()?;
+        #[cfg(not(windows))]
+        let (processes, activity) = (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            std::fs::read_to_string(&self.status_path).unwrap_or_default(),
+        );
+        output
+            .status
+            .success()
+            .then(|| agent_status(&processes, &activity))?
+    }
+}
+
+fn agent_status(processes: &str, activity: &str) -> Option<AgentStatus> {
+    let kind = detect_agent(processes)?;
+    let active_marker = match kind {
+        AgentKind::Codex => "codex:running",
+        AgentKind::Claude => "claude:running",
+    };
+    Some(AgentStatus {
+        kind,
+        running: activity.trim() == active_marker,
+    })
+}
+
+fn detect_agent(processes: &str) -> Option<AgentKind> {
+    let mut found = None;
+    for line in processes.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(command) = fields.next() else {
+            continue;
+        };
+        let executable = command.rsplit('/').next().unwrap_or(command);
+        if executable == "codex" || executable.starts_with("codex-") {
+            found = Some(AgentKind::Codex);
+        } else if executable == "claude" || executable.starts_with("claude-") {
+            found = Some(AgentKind::Claude);
+        } else if executable == "node" {
+            let args = fields.collect::<Vec<_>>().join(" ");
+            if args.contains("/@openai/codex/") {
+                found = Some(AgentKind::Codex);
+            } else if args.contains("/@anthropic-ai/claude-code/") {
+                found = Some(AgentKind::Claude);
+            }
+        }
+    }
+    found
 }
 
 impl TerminalSession {
@@ -224,12 +340,15 @@ impl TerminalSession {
 
     #[cfg(target_os = "windows")]
     fn spawn_windows(distro: &str, linux_root: &Path) -> Result<Self> {
-        let terminal_id = NEXT_WINDOWS_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
+        let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
         let tty_path_file = format!("/tmp/araseo-pty-{}-{terminal_id}", std::process::id());
+        let status_path = format!("/tmp/araseo-agent-{}-{terminal_id}", std::process::id());
+        let agent_shell = agent_shell_command(&status_path);
         let shell_command = format!(
             "stty rows 24 cols 80; tty > {tty_path_file}; \
-             /usr/bin/env TERM=xterm-256color COLORTERM=truecolor /bin/bash --login -i; \
-             araseo_status=$?; rm -f {tty_path_file}; exit $araseo_status"
+             /usr/bin/env TERM=xterm-256color COLORTERM=truecolor /bin/bash -c {}; \
+             araseo_status=$?; rm -f {tty_path_file} {status_path}; exit $araseo_status",
+            shell_quote(&agent_shell)
         );
         let mut command = std::process::Command::new(r"C:\Windows\System32\wsl.exe");
         command.creation_flags(CREATE_NO_WINDOW);
@@ -255,6 +374,11 @@ impl TerminalSession {
         spawn_reader(stderr, sender, output_signal.clone());
 
         Ok(Self {
+            agent_probe: AgentProbe {
+                tty: tty_path_file.clone(),
+                status_path,
+                distro: distro.to_string(),
+            },
             writer: Arc::new(Mutex::new(Box::new(stdin))),
             receiver,
             output_signal,
@@ -270,6 +394,8 @@ impl TerminalSession {
 
     #[cfg(not(target_os = "windows"))]
     fn spawn_pty(linux_root: &Path) -> Result<Self> {
+        let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
+        let status_path = format!("/tmp/araseo-agent-{}-{terminal_id}", std::process::id());
         let pair = native_pty_system().openpty(PtySize {
             rows: 24,
             cols: 100,
@@ -278,7 +404,8 @@ impl TerminalSession {
         })?;
 
         let mut command = CommandBuilder::new("bash");
-        command.args(["--login", "-i"]);
+        command.arg("-c");
+        command.arg(agent_shell_command(&status_path));
         command.cwd(linux_root);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -294,11 +421,25 @@ impl TerminalSession {
         spawn_reader(reader, sender, output_signal.clone());
 
         Ok(Self {
+            agent_probe: AgentProbe {
+                tty: pair
+                    .master
+                    .tty_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                status_path,
+            },
             master: pair.master,
             writer,
             receiver,
             output_signal,
-            parser: vt100::Parser::new_with_callbacks(24, 100, 10_000, TerminalCallbacks::default()),
+            parser: vt100::Parser::new_with_callbacks(
+                24,
+                100,
+                10_000,
+                TerminalCallbacks::default(),
+            ),
             _pty_child: Some(child),
             _pipe_child: None,
         })
@@ -313,6 +454,10 @@ impl TerminalSession {
             write_terminal_replies(&mut *writer, self.parser.callbacks_mut());
         }
         changed
+    }
+
+    pub fn agent_probe(&self) -> AgentProbe {
+        self.agent_probe.clone()
     }
 
     pub fn set_output_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
@@ -437,8 +582,8 @@ fn poll_output<CB: vt100::Callbacks>(
 
 fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
     let (rows, columns) = screen.size();
-    let cursor_position = (!screen.hide_cursor() && screen.scrollback() == 0)
-        .then(|| screen.cursor_position());
+    let cursor_position =
+        (!screen.hide_cursor() && screen.scrollback() == 0).then(|| screen.cursor_position());
     let mut cells = Vec::new();
     for row in 0..rows {
         for column in 0..columns {
@@ -671,21 +816,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detects_only_agent_processes_on_the_terminal() {
+        assert_eq!(
+            detect_agent("bash bash\nps ps -t /dev/pts/2 -o comm=,args=\n"),
+            None
+        );
+        assert_eq!(
+            detect_agent("codex /home/user/.cargo/bin/codex\n"),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            detect_agent("claude /home/user/.local/bin/claude\n"),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            detect_agent(
+                "node node /home/user/.npm/lib/node_modules/@anthropic-ai/claude-code/cli.js\n"
+            ),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            detect_agent("node node /home/user/.npm/lib/node_modules/@openai/codex/bin/codex.js\n"),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(detect_agent("bash bash -c echo codex\n"), None);
+    }
+
+    #[test]
+    fn agent_activity_is_tied_to_the_detected_process() {
+        let codex = "codex /home/user/.cargo/bin/codex\n";
+        let claude = "claude /home/user/.local/bin/claude\n";
+        assert_eq!(agent_status(codex, "codex:running"), Some(AgentStatus { kind: AgentKind::Codex, running: true }));
+        assert_eq!(agent_status(codex, "codex:waiting"), Some(AgentStatus { kind: AgentKind::Codex, running: false }));
+        assert_eq!(agent_status(claude, "claude:running"), Some(AgentStatus { kind: AgentKind::Claude, running: true }));
+        assert_eq!(agent_status(claude, "codex:running"), Some(AgentStatus { kind: AgentKind::Claude, running: false }));
+        assert_eq!(agent_status("bash bash\n", "codex:running"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_wrappers_keep_agent_commands_and_reset_activity_after_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "araseo-agent-shell-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in ["codex", "claude"] {
+            let path = directory.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARASEO_AGENT_STATE_FILE.{name}-args\"\nprintf '{name}:running' > \"$ARASEO_AGENT_STATE_FILE\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let status_path = directory.join("status");
+        let script = agent_shell_command(status_path.to_str().unwrap()).replace(
+            "exec /bin/bash --login -i",
+            "codex --help; printf 'codex=%s\\n' \"$(cat \"$ARASEO_AGENT_STATE_FILE\")\"; \
+             claude --help; printf 'claude=%s\\n' \"$(cat \"$ARASEO_AGENT_STATE_FILE\")\"",
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "codex=codex:waiting\nclaude=claude:waiting\n");
+        let codex_args = std::fs::read_to_string(directory.join("status.codex-args")).unwrap();
+        let claude_args = std::fs::read_to_string(directory.join("status.claude-args")).unwrap();
+        assert!(codex_args.contains("UserPromptSubmit") && codex_args.contains("PermissionRequest"));
+        assert!(claude_args.contains("--settings") && claude_args.contains("PostToolUse"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instrumented_terminal_still_runs_interactive_shell_commands() {
+        let mut terminal = TerminalSession::spawn("", Path::new("/tmp")).unwrap();
+        terminal.write(b"printf '\\x50\\x54\\x59\\x5f\\x52\\x45\\x41\\x44\\x59\\n'\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            terminal.poll();
+            if terminal.parser.screen().contents().contains("PTY_READY") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "instrumented shell did not process input");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn answers_split_default_color_queries_without_moving_scrollback() {
         let (sender, receiver) = mpsc::channel();
         let signal = OutputSignal::default();
-        let mut parser = vt100::Parser::new_with_callbacks(
-            3,
-            12,
-            20,
-            TerminalCallbacks::default(),
-        );
+        let mut parser = vt100::Parser::new_with_callbacks(3, 12, 20, TerminalCallbacks::default());
         parser.process(b"one\r\ntwo\r\nthree\r\nfour");
         assert!(scroll_screen(parser.screen_mut(), 1));
 
         sender.send(b"\x1b]10;?\x1b".to_vec()).unwrap();
         sender.send(b"\\\x1b]11;?\x07".to_vec()).unwrap();
-        sender.send(b"\x1b]12;?\x07\x1b]11;rgb:0000/0000/0000\x07".to_vec()).unwrap();
+        sender
+            .send(b"\x1b]12;?\x07\x1b]11;rgb:0000/0000/0000\x07".to_vec())
+            .unwrap();
         assert!(poll_output(&receiver, &signal, &mut parser));
         assert_eq!(parser.screen().scrollback(), 1);
         assert!(parser.screen().contents().contains("one"));
@@ -768,7 +1006,11 @@ mod tests {
         assert!(scroll_screen(parser.screen_mut(), 2));
         assert!(parser.screen().scrollback() > 0);
         assert!(parser.screen().contents().contains("one"));
-        assert!(display_cells(parser.screen()).iter().all(|cell| !cell.cursor));
+        assert!(
+            display_cells(parser.screen())
+                .iter()
+                .all(|cell| !cell.cursor)
+        );
 
         assert!(scroll_screen(parser.screen_mut(), -20));
         assert_eq!(parser.screen().scrollback(), 0);
@@ -851,8 +1093,22 @@ mod tests {
         let plain = cells.iter().find(|cell| cell.glyph == "A").unwrap();
         assert_eq!(plain.foreground, [255, 255, 255]);
         assert_eq!(plain.background, [0x28, 0x2c, 0x34]);
-        assert_eq!(cells.iter().find(|cell| cell.glyph == "B").unwrap().foreground, [0x7a, 0xa6, 0xda]);
-        assert_eq!(cells.iter().find(|cell| cell.glyph == "C").unwrap().foreground, [10, 20, 30]);
+        assert_eq!(
+            cells
+                .iter()
+                .find(|cell| cell.glyph == "B")
+                .unwrap()
+                .foreground,
+            [0x7a, 0xa6, 0xda]
+        );
+        assert_eq!(
+            cells
+                .iter()
+                .find(|cell| cell.glyph == "C")
+                .unwrap()
+                .foreground,
+            [10, 20, 30]
+        );
     }
 
     #[test]

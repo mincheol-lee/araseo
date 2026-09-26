@@ -31,6 +31,10 @@ source file open in the panes below.
   side-by-side diff or discard a change after confirmation.
 - Run independent WSL terminals in tabs. PTY and VT100 rendering support
   interactive programs, ANSI colors, Korean text, IME input, and selection.
+  Codex and Claude Code icons stay still while waiting for input or approval and
+  rotate while handling a prompt. Araseo passes session-scoped activity hooks
+  to these CLIs without changing their saved configuration. Codex may ask you
+  to trust the hooks through `/hooks` before its activity can be shown.
 - Arrange file, diff, and terminal tabs in repeatable horizontal or vertical
   splits, with a separate tab bar and resizable dividers in each pane.
 - Open read-only WSL diagnostics from the status bar, including disk, memory,

@@ -80,7 +80,7 @@ If `PATH` is omitted, the launcher uses the current directory. It converts relat
 
 1. The user activates an existing terminal tab or creates one with the new-terminal button.
 2. The user enters `codex` just as they would in their existing WSL shell.
-3. Araseo only relays PTY input/output and the terminal screen. It does not modify the Codex installation, authentication, or configuration.
+3. Araseo relays PTY input/output and the terminal screen, and passes session-scoped activity hooks so the tab can distinguish work from input or approval waits. It does not edit the Codex installation, authentication, or saved configuration.
 
 ## 5. Screen and Interaction Design
 
