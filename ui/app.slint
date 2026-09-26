@@ -68,6 +68,8 @@ export struct TabEntry {
     group: int,
     active: bool,
     dirty: bool,
+    agent: string,
+    agent-running: bool,
 }
 
 export struct DividerEntry {
@@ -254,6 +256,7 @@ component DiffCell inherits Rectangle {
 
 component WorkspaceGroup inherits Rectangle {
     in property <int> group-id: 0;
+    in property <int> agent-frame: 0;
     in property <int> terminal-font-size: 14;
     in property <int> editor-font-size: 14;
     in property <int> terminal-font-brightness: 120;
@@ -531,9 +534,9 @@ component WorkspaceGroup inherits Rectangle {
                                 }
 
                                 local-tab-title := Text {
-                                    x: 9px;
-                                    width: parent.width - 43px;
-                                    text: (tab.kind == "terminal" ? "›_  " : (tab.kind == "diff" ? "⇄  " : "▤  ")) + tab.title
+                                    x: tab.agent == "" ? 9px : 28px;
+                                    width: parent.width - self.x - 34px;
+                                    text: (tab.agent != "" ? "" : (tab.kind == "terminal" ? "›_  " : (tab.kind == "diff" ? "⇄  " : "▤  "))) + tab.title
                                         + (tab.dirty ? " ●" : "");
                                     color: parent.active ? Chrome.text : Chrome.muted;
                                     font-family: "Segoe UI";
@@ -541,6 +544,31 @@ component WorkspaceGroup inherits Rectangle {
                                     font-weight: parent.active ? 600 : 400;
                                     vertical-alignment: center;
                                     overflow: elide;
+                                }
+
+                                if tab.agent != "": Image {
+                                    private property <int> icon-frame: tab.agent-running ? root.agent-frame : 0;
+                                    x: 9px;
+                                    y: 9px;
+                                    width: 16px;
+                                    height: 16px;
+                                    source: tab.agent == "codex"
+                                        ? (self.icon-frame == 0 ? @image-url("../assets/codex.svg")
+                                        : self.icon-frame == 1 ? @image-url("../assets/codex-1.svg")
+                                        : self.icon-frame == 2 ? @image-url("../assets/codex-2.svg")
+                                        : self.icon-frame == 3 ? @image-url("../assets/codex-3.svg")
+                                        : self.icon-frame == 4 ? @image-url("../assets/codex-4.svg")
+                                        : self.icon-frame == 5 ? @image-url("../assets/codex-5.svg")
+                                        : self.icon-frame == 6 ? @image-url("../assets/codex-6.svg")
+                                        : @image-url("../assets/codex-7.svg"))
+                                        : (self.icon-frame == 0 ? @image-url("../assets/claude.svg")
+                                        : self.icon-frame == 1 ? @image-url("../assets/claude-1.svg")
+                                        : self.icon-frame == 2 ? @image-url("../assets/claude-2.svg")
+                                        : self.icon-frame == 3 ? @image-url("../assets/claude-3.svg")
+                                        : self.icon-frame == 4 ? @image-url("../assets/claude-4.svg")
+                                        : self.icon-frame == 5 ? @image-url("../assets/claude-5.svg")
+                                        : self.icon-frame == 6 ? @image-url("../assets/claude-6.svg")
+                                        : @image-url("../assets/claude-7.svg"));
                                 }
 
                                 local-tab-touch := TouchArea {
@@ -1387,6 +1415,7 @@ component WorkspaceGroup inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Araseo";
+    in property <int> agent-frame: 0;
     init => { Palette.color-scheme = ColorScheme.dark; }
     in-out property <int> terminal-font-size: 14;
     in-out property <int> editor-font-size: 14;
@@ -2339,6 +2368,7 @@ export component AppWindow inherits Window {
                     window-drag-requested => { root.window-drag-requested(); }
                     window-maximize-requested => { root.maximized = !root.maximized; }
                     group-id: 0;
+                    agent-frame: root.agent-frame;
                     tabs: root.primary-tabs;
                     focused: root.focused-group == 0;
                     focus-generation: root.terminal-focus-generation;
@@ -2435,6 +2465,7 @@ export component AppWindow inherits Window {
                     window-drag-requested => { root.window-drag-requested(); }
                     window-maximize-requested => { root.maximized = !root.maximized; }
                     group-id: 1;
+                    agent-frame: root.agent-frame;
                     tabs: root.secondary-tabs;
                     focused: root.focused-group == 1;
                     focus-generation: root.terminal-focus-generation;
@@ -2524,6 +2555,7 @@ export component AppWindow inherits Window {
                     height: workspace-area.height * pane.height;
                     visible: root.dynamic-panes && pane.visible;
                     group-id: pane.group;
+                    agent-frame: root.agent-frame;
                     terminal-font-size: root.terminal-font-size;
                     editor-font-size: root.editor-font-size;
                     terminal-font-brightness: root.terminal-font-brightness;

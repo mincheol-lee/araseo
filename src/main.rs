@@ -4,13 +4,13 @@ mod appearance;
 mod background;
 mod document;
 mod editor_view;
-mod markdown_preview;
-mod preview;
 mod emoji;
 #[cfg(windows)]
 mod folder_picker;
 mod git;
 mod highlight;
+mod markdown_preview;
+mod preview;
 mod tabs;
 mod terminal;
 mod tree;
@@ -31,7 +31,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tabs::{Axis, Dock, Rect, TabGroups, TabId};
-use terminal::TerminalSession;
+use terminal::{AgentKind, AgentStatus, TerminalSession};
 use tree::{FlatNode, GitStatus};
 use workspace::Workspace;
 
@@ -74,6 +74,10 @@ struct AppState {
     editor_views: RefCell<[editor_view::EditorView; 2]>,
     extra_editor_views: RefCell<HashMap<usize, editor_view::EditorView>>,
     extra_terminal_sizes: HashMap<usize, (u16, u16)>,
+    agent_kinds: HashMap<TabId, AgentStatus>,
+    agent_probe_loader: Background<Vec<(TabId, Option<AgentStatus>)>>,
+    agent_probe_in_flight: bool,
+    agent_animation_tick: u8,
     maximized_group: Option<usize>,
 }
 
@@ -197,6 +201,10 @@ fn main() -> Result<()> {
         editor_views: RefCell::new(Default::default()),
         extra_editor_views: RefCell::new(HashMap::new()),
         extra_terminal_sizes: HashMap::new(),
+        agent_kinds: HashMap::new(),
+        agent_probe_loader: Background::default(),
+        agent_probe_in_flight: false,
+        agent_animation_tick: 0,
         maximized_group: None,
     }));
 
@@ -401,13 +409,22 @@ fn main() -> Result<()> {
             let mut state = state.borrow_mut();
             let id = tab_id as TabId;
             let Some((index, percent, render_zoom)) = state.tabs.iter().find_map(|tab| {
-                if tab.id != id { return None; }
-                let TabContent::Preview(preview) = &tab.content else { return None; };
+                if tab.id != id {
+                    return None;
+                }
+                let TabContent::Preview(preview) = &tab.content else {
+                    return None;
+                };
                 preview.pdf_bytes.as_ref()?;
                 let index = preview.page_index as i32 + delta;
-                (index >= 0 && (index as usize) < preview.page_count)
-                    .then_some((index as usize, preview.zoom_percent, preview.render_zoom))
-            }) else { return; };
+                (index >= 0 && (index as usize) < preview.page_count).then_some((
+                    index as usize,
+                    preview.zoom_percent,
+                    preview.render_zoom,
+                ))
+            }) else {
+                return;
+            };
             request_pdf_render(&mut state, id, index, percent, render_zoom);
             if let Some(ui) = weak.upgrade() {
                 ui.set_status_text(state.status.clone().into());
@@ -420,14 +437,22 @@ fn main() -> Result<()> {
         ui.on_preview_zoom_requested(move |tab_id, percent, fit_scale| {
             let mut state = state.borrow_mut();
             let id = tab_id as TabId;
-            let percent = if percent == 0 { 0 } else { percent.clamp(25, 400) };
+            let percent = if percent == 0 {
+                0
+            } else {
+                percent.clamp(25, 400)
+            };
             let render_zoom = if percent == 0 {
                 fit_scale.clamp(0.25, 4.0)
             } else {
                 percent as f32 / 100.0
             };
-            let Some(tab) = state.tabs.iter_mut().find(|tab| tab.id == id) else { return; };
-            let TabContent::Preview(preview) = &mut tab.content else { return; };
+            let Some(tab) = state.tabs.iter_mut().find(|tab| tab.id == id) else {
+                return;
+            };
+            let TabContent::Preview(preview) = &mut tab.content else {
+                return;
+            };
             if preview.pdf_bytes.is_some() {
                 let index = preview.page_index;
                 request_pdf_render(&mut state, id, index, percent, render_zoom);
@@ -450,12 +475,24 @@ fn main() -> Result<()> {
         ui.on_pdf_selection_event(move |tab_id, x, y, phase| {
             let mut state = state.borrow_mut();
             let id = tab_id as TabId;
-            let Some(tab) = state.tabs.iter_mut().find(|tab| tab.id == id) else { return; };
-            let TabContent::Preview(preview) = &mut tab.content else { return; };
-            if preview.kind != PreviewKind::Pdf { return; }
-            let Some(index) = preview.text.nearest_glyph(x, y) else { return; };
-            if phase == 0 { preview.selection_anchor = Some(index); }
-            if preview.selection_anchor.is_none() { return; }
+            let Some(tab) = state.tabs.iter_mut().find(|tab| tab.id == id) else {
+                return;
+            };
+            let TabContent::Preview(preview) = &mut tab.content else {
+                return;
+            };
+            if preview.kind != PreviewKind::Pdf {
+                return;
+            }
+            let Some(index) = preview.text.nearest_glyph(x, y) else {
+                return;
+            };
+            if phase == 0 {
+                preview.selection_anchor = Some(index);
+            }
+            if preview.selection_anchor.is_none() {
+                return;
+            }
             preview.selection_focus = Some(index);
             if let Some(ui) = weak.upgrade()
                 && let Some(group) = state.tab_groups.group_of(id)
@@ -468,11 +505,24 @@ fn main() -> Result<()> {
         let state = state.clone();
         ui.on_pdf_copy_requested(move |tab_id| {
             let state = state.borrow();
-            state.tabs.iter().find_map(|tab| {
-                if tab.id != tab_id as TabId { return None; }
-                let TabContent::Preview(preview) = &tab.content else { return None; };
-                Some(preview.text.selected_text(preview.selection_anchor?, preview.selection_focus?))
-            }).unwrap_or_default().into()
+            state
+                .tabs
+                .iter()
+                .find_map(|tab| {
+                    if tab.id != tab_id as TabId {
+                        return None;
+                    }
+                    let TabContent::Preview(preview) = &tab.content else {
+                        return None;
+                    };
+                    Some(
+                        preview
+                            .text
+                            .selected_text(preview.selection_anchor?, preview.selection_focus?),
+                    )
+                })
+                .unwrap_or_default()
+                .into()
         });
     }
     {
@@ -1328,12 +1378,17 @@ fn main() -> Result<()> {
                     Ok((opened, group)) => {
                         let content = match opened {
                             OpenedFile::Text(document) => Ok(TabContent::File(document)),
-                            OpenedFile::Preview(loaded) => preview_tab(loaded).map(TabContent::Preview),
+                            OpenedFile::Preview(loaded) => {
+                                preview_tab(loaded).map(TabContent::Preview)
+                            }
                         };
                         match content {
                             Ok(content) => {
                                 let tab_id = take_next_tab_id(&mut state);
-                                state.tabs.push(WorkspaceTab { id: tab_id, content });
+                                state.tabs.push(WorkspaceTab {
+                                    id: tab_id,
+                                    content,
+                                });
                                 state.tab_groups.add(tab_id, group);
                                 state.status = "File opened".into();
                             }
@@ -1529,6 +1584,12 @@ fn main() -> Result<()> {
                 ),
             ];
             let mut state = state.borrow_mut();
+            if state.agent_kinds.values().any(|agent| agent.running) {
+                state.agent_animation_tick = (state.agent_animation_tick + 1) % 3;
+                if state.agent_animation_tick == 0 {
+                    ui.set_agent_frame((ui.get_agent_frame() + 1) % 8);
+                }
+            }
             let active = state
                 .tab_groups
                 .groups()
@@ -1557,6 +1618,57 @@ fn main() -> Result<()> {
                 sync_group(&ui, &state, group);
             }
         });
+    }
+
+    let agent_timer = Timer::default();
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        agent_timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(500),
+            move || {
+                let Some(ui) = weak.upgrade() else { return };
+                let mut state = state.borrow_mut();
+                if state.agent_probe_in_flight {
+                    let Some(detected) = state.agent_probe_loader.poll() else {
+                        return;
+                    };
+                    state.agent_probe_in_flight = false;
+                    let previous = state.agent_kinds.clone();
+                    state.agent_kinds.clear();
+                    for (tab_id, agent) in detected {
+                        if state.tabs.iter().any(|tab| tab.id == tab_id)
+                            && let Some(agent) = agent
+                        {
+                            state.agent_kinds.insert(tab_id, agent);
+                        }
+                    }
+                    if state.agent_kinds != previous {
+                        sync_tabs(&ui, &state);
+                    }
+                }
+                let probes = state
+                    .tabs
+                    .iter()
+                    .filter_map(|tab| match &tab.content {
+                        TabContent::Terminal { session, .. } => {
+                            Some((tab.id, session.agent_probe()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if !probes.is_empty() {
+                    state.agent_probe_loader.request(move || {
+                        probes
+                            .into_iter()
+                            .map(|(id, probe)| (id, probe.detect()))
+                            .collect()
+                    });
+                    state.agent_probe_in_flight = true;
+                }
+            },
+        );
     }
 
     let workspace_timer = Timer::default();
@@ -1627,6 +1739,7 @@ fn main() -> Result<()> {
 
     ui.run()?;
     drop(timer);
+    drop(agent_timer);
     drop(workspace_timer);
     Ok(())
 }
@@ -1965,14 +2078,25 @@ fn request_pdf_render(
     render_zoom: f32,
 ) {
     let Some(bytes) = state.tabs.iter().find_map(|tab| {
-        if tab.id != tab_id { return None; }
-        let TabContent::Preview(preview) = &tab.content else { return None; };
+        if tab.id != tab_id {
+            return None;
+        }
+        let TabContent::Preview(preview) = &tab.content else {
+            return None;
+        };
         preview.pdf_bytes.clone()
-    }) else { return; };
+    }) else {
+        return;
+    };
     state.status = format!("Rendering page {}...", index + 1);
     state.page_loader.request(move || {
-        Ok((tab_id, index, percent, render_zoom,
-            preview::render_page(&bytes, index, render_zoom)?))
+        Ok((
+            tab_id,
+            index,
+            percent,
+            render_zoom,
+            preview::render_page(&bytes, index, render_zoom)?,
+        ))
     });
 }
 
@@ -1982,7 +2106,12 @@ fn preview_tab(loaded: LoadedPreview) -> Result<PreviewTab> {
             .with_context(|| format!("cannot display {}", loaded.linux_path.display()))
             .map(|image| {
                 let size = image.size();
-                (image, size.width as f32, size.height as f32, PdfTextPage::default())
+                (
+                    image,
+                    size.width as f32,
+                    size.height as f32,
+                    PdfTextPage::default(),
+                )
             })?,
         PreviewKind::Pdf => {
             let page = loaded.first_page.context("PDF page is missing")?;
@@ -2624,7 +2753,9 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                 TabContent::File(document) => {
                     let markdown_preview = is_markdown(&document.linux_path)
                         && !state.markdown_source_tabs.contains(&tab.id);
-                    ui.set_primary_active_kind(if markdown_preview { "markdown" } else { "file" }.into());
+                    ui.set_primary_active_kind(
+                        if markdown_preview { "markdown" } else { "file" }.into(),
+                    );
                     state.syncing_editor.set(true);
                     if ui.get_editor_text().as_str() != document.text {
                         ui.set_editor_text(document.text.clone().into());
@@ -2665,7 +2796,9 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                 TabContent::File(document) => {
                     let markdown_preview = is_markdown(&document.linux_path)
                         && !state.markdown_source_tabs.contains(&tab.id);
-                    ui.set_secondary_active_kind(if markdown_preview { "markdown" } else { "file" }.into());
+                    ui.set_secondary_active_kind(
+                        if markdown_preview { "markdown" } else { "file" }.into(),
+                    );
                     state.syncing_editor.set(true);
                     if ui.get_secondary_editor_text().as_str() != document.text {
                         ui.set_secondary_editor_text(document.text.clone().into());
@@ -2729,9 +2862,9 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
 }
 
 fn is_markdown(path: &std::path::Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-        matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx")
-    })
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx"))
 }
 
 fn preview_kind_name(kind: PreviewKind) -> &'static str {
@@ -2760,8 +2893,8 @@ fn sync_preview_properties(
                 .markdown_preview_cache
                 .borrow()
                 .get(id)
-                    .filter(|(cached_text, _)| cached_text == &document.text)
-                    .map(|(_, blocks)| blocks.clone());
+                .filter(|(cached_text, _)| cached_text == &document.text)
+                .map(|(_, blocks)| blocks.clone());
             if let Some(blocks) = cached {
                 blocks
             } else {
@@ -2771,8 +2904,9 @@ fn sync_preview_properties(
                         text: if block.kind == "code" {
                             slint::StyledText::from_plain_text(&block.markup)
                         } else {
-                            slint::StyledText::from_markdown(&block.markup)
-                                .unwrap_or_else(|_| slint::StyledText::from_plain_text(&block.markup))
+                            slint::StyledText::from_markdown(&block.markup).unwrap_or_else(|_| {
+                                slint::StyledText::from_plain_text(&block.markup)
+                            })
                         },
                         kind: block.kind.into(),
                     })
@@ -2804,11 +2938,18 @@ fn sync_preview_properties(
         _ => (0.0, 0.0, 0),
     };
     let selection = match tab.map(|tab| &tab.content) {
-        Some(TabContent::Preview(preview)) => preview.selection_anchor.zip(preview.selection_focus)
+        Some(TabContent::Preview(preview)) => preview
+            .selection_anchor
+            .zip(preview.selection_focus)
             .map(|(anchor, focus)| preview.text.selection_rects(anchor, focus))
             .unwrap_or_default()
             .into_iter()
-            .map(|(x, y, width, height)| PdfSelectionRect { x, y, width, height })
+            .map(|(x, y, width, height)| PdfSelectionRect {
+                x,
+                y,
+                width,
+                height,
+            })
             .collect(),
         _ => Vec::new(),
     };
@@ -2877,8 +3018,15 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
         pane.active_title = tab_title(tab).into();
         pane.active_detail = tab_detail(tab).into();
         pane.active_kind = match tab.content {
-            TabContent::File(ref document) => if is_markdown(&document.linux_path)
-                && !state.markdown_source_tabs.contains(&tab.id) { "markdown" } else { "file" },
+            TabContent::File(ref document) => {
+                if is_markdown(&document.linux_path)
+                    && !state.markdown_source_tabs.contains(&tab.id)
+                {
+                    "markdown"
+                } else {
+                    "file"
+                }
+            }
             TabContent::Preview(ref preview) => preview_kind_name(preview.kind),
             TabContent::Diff(_) => "diff",
             TabContent::Terminal { .. } => "terminal",
@@ -2895,7 +3043,8 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
             });
             state.syncing_editor.set(false);
             if (!is_markdown(&document.linux_path) || state.markdown_source_tabs.contains(&tab.id))
-                && let Some(pane) = extra_pane(ui, group) {
+                && let Some(pane) = extra_pane(ui, group)
+            {
                 sync_editor_view(ui, state, document, group, pane.editor_text);
             }
             clear_terminal_group(ui, group);
@@ -3240,7 +3389,12 @@ fn clear_terminal_group(ui: &AppWindow, group: usize) {
 fn tab_title(tab: &WorkspaceTab) -> String {
     match &tab.content {
         TabContent::File(document) => document.title(),
-        TabContent::Preview(preview) => preview.linux_path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        TabContent::Preview(preview) => preview
+            .linux_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
         TabContent::Diff(diff) => {
             let name = diff
                 .path
@@ -3410,6 +3564,13 @@ fn sync_tabs(ui: &AppWindow, state: &AppState) {
                 group: group as i32,
                 active: state.tab_groups.active(group) == Some(tab.id),
                 dirty: matches!(&tab.content, TabContent::File(document) if document.dirty),
+                agent: match state.agent_kinds.get(&tab.id) {
+                    Some(AgentStatus { kind: AgentKind::Codex, .. }) => "codex",
+                    Some(AgentStatus { kind: AgentKind::Claude, .. }) => "claude",
+                    None => "",
+                }
+                .into(),
+                agent_running: state.agent_kinds.get(&tab.id).is_some_and(|agent| agent.running),
             })
             .collect::<Vec<_>>()
     };

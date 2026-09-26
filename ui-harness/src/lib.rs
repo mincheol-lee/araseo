@@ -128,6 +128,49 @@ mod tests {
             group: 0,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
+        }])));
+        let render_agent_tab = |agent: &str, running: bool, frame: i32| {
+            ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+                id: 0,
+                title: "Terminal 1".into(),
+                detail: "/workspace".into(),
+                kind: "terminal".into(),
+                group: 0,
+                active: true,
+                dirty: false,
+                agent: agent.into(),
+                agent_running: running,
+            }])));
+            ui.set_agent_frame(frame);
+            render(&window)
+        };
+        let codex_upright = render_agent_tab("codex", true, 0);
+        let codex_turned = render_agent_tab("codex", true, 1);
+        let claude_upright = render_agent_tab("claude", true, 0);
+        let claude_turned = render_agent_tab("claude", true, 1);
+        assert!(codex_upright != claude_upright, "agent tabs showed the same icon");
+        assert!(codex_upright != codex_turned, "Codex tab icon did not rotate");
+        assert!(claude_upright != claude_turned, "Claude tab icon did not rotate");
+        assert!(
+            render_agent_tab("codex", false, 0) == render_agent_tab("codex", false, 1),
+            "waiting Codex icon rotated"
+        );
+        assert!(
+            render_agent_tab("claude", false, 0) == render_agent_tab("claude", false, 1),
+            "waiting Claude icon rotated"
+        );
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
+            id: 0,
+            title: "sample.js".into(),
+            detail: "/workspace/sample.js".into(),
+            kind: "file".into(),
+            group: 0,
+            active: true,
+            dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_tree_entries(ModelRc::new(VecModel::from(vec![TreeEntry {
             name: "local-project".into(),
@@ -643,6 +686,8 @@ mod tests {
                 group: 0,
                 active: index == 15,
                 dirty: index == 4,
+                agent: "".into(),
+                agent_running: false,
             })
             .collect::<Vec<_>>();
         ui.set_primary_tabs(ModelRc::new(VecModel::from(many_tabs)));
@@ -712,6 +757,8 @@ mod tests {
             group: 0,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_secondary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
             id: 51,
@@ -721,6 +768,8 @@ mod tests {
             group: 1,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_primary_active_tab_id(50);
         ui.set_primary_active_kind("file".into());
@@ -774,6 +823,8 @@ mod tests {
             group: 0,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_primary_active_tab_id(-1);
         render(&window);
@@ -804,6 +855,8 @@ mod tests {
             group: 0,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_secondary_tabs(ModelRc::new(VecModel::from(vec![TabEntry {
             id: 51,
@@ -813,6 +866,8 @@ mod tests {
             group: 1,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_primary_active_tab_id(50);
         ui.set_secondary_active_tab_id(51);
@@ -1263,6 +1318,8 @@ mod tests {
             group: 0,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_secondary_active_tab_id(-1);
         ui.set_primary_active_tab_id(1);
@@ -1800,6 +1857,8 @@ mod tests {
             group: 0,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_primary_active_tab_id(77);
         ui.set_primary_active_kind("diff".into());
@@ -1962,6 +2021,8 @@ mod tests {
             group: 0,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }])));
         ui.set_primary_active_tab_id(50);
         ui.set_secondary_layout_x(0.5);
@@ -1986,6 +2047,8 @@ mod tests {
                 group: 2,
                 active: true,
                 dirty: false,
+                agent: "".into(),
+                agent_running: false,
             }])),
             active_tab_id: 52,
             active_kind: "terminal".into(),
@@ -2043,6 +2106,8 @@ mod tests {
             group: 2,
             active: true,
             dirty: false,
+            agent: "".into(),
+            agent_running: false,
         }]));
         model.set_row_data(0, third);
         render(&window);
