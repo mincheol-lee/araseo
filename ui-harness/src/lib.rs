@@ -49,6 +49,21 @@ mod tests {
         assert_eq!(shortcuts::tab_cycle_delta(true, false, false, false), None);
     }
 
+    #[test]
+    fn tab_hover_uses_click_cursor_while_drag_remains_available() {
+        let tab_touch = include_str!("../../ui/app.slint")
+            .split_once("local-tab-touch := TouchArea {")
+            .expect("tab interaction area is present")
+            .1
+            .split_once("\n                                }")
+            .expect("tab interaction area closes")
+            .0;
+
+        assert!(tab_touch.contains("mouse-cursor: pointer;"));
+        assert!(tab_touch.contains("root.tab-drag-moved("));
+        assert!(tab_touch.contains("clicked => { root.tab-activated(tab.id); }"));
+    }
+
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     struct TestPixel {
         red: u8,
