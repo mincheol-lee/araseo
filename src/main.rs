@@ -11,6 +11,7 @@ mod git;
 mod highlight;
 mod markdown_preview;
 mod preview;
+mod shortcuts;
 mod tabs;
 mod terminal;
 mod tree;
@@ -22,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use background::Background;
 use document::{Document, ExternalRefresh};
 use preview::{LoadedPreview, PdfTextPage, PreviewKind, RenderedPage};
-use slint::winit_030::WinitWindowAccessor;
+use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -269,7 +270,7 @@ fn main() -> Result<()> {
             ui.set_wsl_docker_usage_error("".into());
         });
     }
-    install_windows_file_drop(&ui, state.clone());
+    install_window_events(&ui, state.clone());
     #[cfg(windows)]
     install_windows_folder_browser(&ui, &state.borrow().workspace);
     {
@@ -1784,24 +1785,51 @@ fn install_windows_folder_browser(ui: &AppWindow, workspace: &Workspace) {
     });
 }
 
-#[cfg(target_os = "windows")]
-fn install_windows_file_drop(ui: &AppWindow, state: Rc<RefCell<AppState>>) {
-    use slint::winit_030::{EventResult, winit};
-
+fn install_window_events(ui: &AppWindow, _state: Rc<RefCell<AppState>>) {
     let weak = ui.as_weak();
+    let mut modifiers = winit::keyboard::ModifiersState::default();
     ui.window().on_winit_window_event(move |window, event| {
-        if let winit::event::WindowEvent::DroppedFile(source) = event
-            && let Some(ui) = weak.upgrade()
-            && let Some((x, y)) = windows_cursor_position(window)
-        {
-            handle_external_file_drop(&ui, &state, source.clone(), x, y);
+        match event {
+            winit::event::WindowEvent::ModifiersChanged(changed) => {
+                modifiers = changed.state();
+            }
+            winit::event::WindowEvent::Focused(false) => {
+                modifiers = winit::keyboard::ModifiersState::default();
+            }
+            winit::event::WindowEvent::KeyboardInput { event, .. }
+                if event.state == winit::event::ElementState::Pressed =>
+            {
+                let tab = matches!(
+                    &event.logical_key,
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab)
+                );
+                if let Some(delta) = shortcuts::tab_cycle_delta(
+                    modifiers.control_key(),
+                    modifiers.shift_key(),
+                    modifiers.alt_key(),
+                    tab,
+                ) {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.invoke_tab_cycle(delta);
+                    }
+                    return EventResult::PreventDefault;
+                }
+            }
+            #[cfg(target_os = "windows")]
+            winit::event::WindowEvent::DroppedFile(source) => {
+                if let Some(ui) = weak.upgrade()
+                    && let Some((x, y)) = windows_cursor_position(window)
+                {
+                    handle_external_file_drop(&ui, &_state, source.clone(), x, y);
+                }
+            }
+            _ => {}
         }
+        #[cfg(not(target_os = "windows"))]
+        let _ = window;
         EventResult::Propagate
     });
 }
-
-#[cfg(not(target_os = "windows"))]
-fn install_windows_file_drop(_ui: &AppWindow, _state: Rc<RefCell<AppState>>) {}
 
 #[cfg(target_os = "windows")]
 fn windows_cursor_position(window: &slint::Window) -> Option<(f32, f32)> {
