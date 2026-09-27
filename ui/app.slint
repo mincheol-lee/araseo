@@ -575,7 +575,7 @@ component WorkspaceGroup inherits Rectangle {
                                     private property <length> press-x: 0px;
                                     private property <length> press-y: 0px;
                                     width: parent.width - 32px;
-                                    mouse-cursor: move;
+                                    mouse-cursor: pointer;
                                     moved => {
                                         if (!self.pressed || (abs(self.mouse-x - self.press-x) < 5px
                                             && abs(self.mouse-y - self.press-y) < 5px)) {
