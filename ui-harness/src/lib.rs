@@ -22,6 +22,10 @@ mod appearance;
 mod editor_view;
 
 #[cfg(test)]
+#[path = "../../src/shortcuts.rs"]
+mod shortcuts;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use i_slint_core::input::{InternalKeyEvent, KeyEvent as InternalKeyEventData, KeyEventType};
@@ -35,6 +39,15 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::Path;
     use std::rc::Rc;
+
+    #[test]
+    fn tab_shortcuts_are_available_before_any_focus_change() {
+        assert_eq!(shortcuts::tab_cycle_delta(true, false, false, true), Some(1));
+        assert_eq!(shortcuts::tab_cycle_delta(true, true, false, true), Some(-1));
+        assert_eq!(shortcuts::tab_cycle_delta(false, true, false, true), None);
+        assert_eq!(shortcuts::tab_cycle_delta(true, false, true, true), None);
+        assert_eq!(shortcuts::tab_cycle_delta(true, false, false, false), None);
+    }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     struct TestPixel {
