@@ -276,8 +276,10 @@ mod tests {
         });
         let terminal_scrolls = Rc::new(RefCell::new(Vec::new()));
         let observed_terminal_scrolls = terminal_scrolls.clone();
-        ui.on_terminal_scrollback(move |tab_id, rows| {
-            observed_terminal_scrolls.borrow_mut().push((tab_id, rows));
+        ui.on_terminal_scrollback(move |tab_id, rows, row, column, control, alt, shift| {
+            observed_terminal_scrolls.borrow_mut().push((
+                tab_id, rows, row, column, control, alt, shift,
+            ));
         });
         let terminal_copy_requests = Rc::new(RefCell::new(Vec::new()));
         let observed_terminal_copy_requests = terminal_copy_requests.clone();
@@ -1518,8 +1520,8 @@ mod tests {
             delta_y: 120.0,
         });
         assert_eq!(
-            terminal_scrolls.borrow().last(),
-            Some(&(1, 3)),
+            terminal_scrolls.borrow().last().map(|event| (event.0, event.1)),
+            Some((1, 3)),
             "mouse wheel over the terminal did not request retained output"
         );
         ui.window().dispatch_event(WindowEvent::PointerScrolled {
@@ -1528,10 +1530,26 @@ mod tests {
             delta_y: -120.0,
         });
         assert_eq!(
-            terminal_scrolls.borrow().last(),
-            Some(&(1, -3)),
+            terminal_scrolls.borrow().last().map(|event| (event.0, event.1)),
+            Some((1, -3)),
             "downward mouse wheel over the terminal was not delivered"
         );
+        let first_wheel = *terminal_scrolls.borrow().last().unwrap();
+        assert!(first_wheel.2 >= 0 && first_wheel.2 < ui.get_terminal_grid_rows());
+        assert!(first_wheel.3 >= 0 && first_wheel.3 < ui.get_terminal_grid_columns());
+        assert_eq!((first_wheel.4, first_wheel.5, first_wheel.6), (false, false, false));
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Shift.into() });
+        ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position: LogicalPosition::new(800.0, 400.0),
+            delta_x: 0.0,
+            delta_y: 120.0,
+        });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Shift.into() });
+        let shift_wheel = *terminal_scrolls.borrow().last().unwrap();
+        assert_eq!((shift_wheel.0, shift_wheel.1, shift_wheel.6), (1, 3, true),
+            "Shift-wheel did not request local terminal history");
+        assert!(shift_wheel.2 > first_wheel.2 && shift_wheel.3 > first_wheel.3,
+            "wheel reports did not track the pointer's grid position");
         let top_left_cell_pixels = terminal_ui
             .iter()
             .enumerate()

@@ -184,6 +184,16 @@ pub struct DisplayCell {
     pub column_span: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminalWheel {
+    pub rows: i32,
+    pub row: i32,
+    pub column: i32,
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
 type OutputWaker = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
@@ -504,16 +514,16 @@ impl TerminalSession {
         )
     }
 
-    pub fn scroll_scrollback(&mut self, rows: i32) -> bool {
-        if let Some(input) = alternate_screen_scroll_input(self.parser.screen(), rows) {
+    pub fn scroll_scrollback(&mut self, wheel: TerminalWheel) -> bool {
+        if let Some(input) = mouse_scroll_input(self.parser.screen(), wheel) {
             if let Ok(mut writer) = self.writer.lock() {
-                let _ = writer.write_all(&input);
-                let _ = writer.flush();
+                return report_mouse_scroll(self.parser.screen_mut(), &mut *writer, &input);
             }
-            // Full-screen applications redraw in response to the key events.
             return false;
         }
-        scroll_screen(self.parser.screen_mut(), rows)
+        // Never guess an application's scroll key bindings. Shift overrides
+        // mouse capture so retained output remains accessible locally.
+        scroll_screen(self.parser.screen_mut(), wheel.rows)
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> bool {
@@ -669,16 +679,66 @@ fn selection_text(
     screen.contents_between(start.0, start.1, end.0, end.1.saturating_add(1))
 }
 
-fn alternate_screen_scroll_input(screen: &vt100::Screen, rows: i32) -> Option<Vec<u8>> {
-    if !screen.alternate_screen() || rows == 0 {
+fn mouse_scroll_input(screen: &vt100::Screen, wheel: TerminalWheel) -> Option<Vec<u8>> {
+    if wheel.shift
+        || wheel.rows == 0
+        || matches!(
+            screen.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None | vt100::MouseProtocolMode::Press
+        )
+    {
         return None;
     }
 
-    // The alternate grid has no terminal scrollback. Like xterm's alternate
-    // scroll mode, turn wheel steps into cursor keys so TUIs (including Codex)
-    // can scroll their own viewport.
-    let key = if rows > 0 { b"\x1b[A" } else { b"\x1b[B" };
-    Some(key.repeat(rows.unsigned_abs().min(100) as usize))
+    // Follow the modes requested by the program, in either screen buffer.
+    // Mouse reports are one-based; legacy protocols cannot encode large cells.
+    let (rows, columns) = screen.size();
+    let row = wheel.row.clamp(0, i32::from(rows.saturating_sub(1))) as u32 + 1;
+    let column = wheel.column.clamp(0, i32::from(columns.saturating_sub(1))) as u32 + 1;
+    let button = if wheel.rows > 0 { 64 } else { 65 }
+        | if wheel.alt { 8 } else { 0 }
+        | if wheel.control { 16 } else { 0 };
+    let report = match screen.mouse_protocol_encoding() {
+        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{column};{row}M").into_bytes(),
+        vt100::MouseProtocolEncoding::Default => {
+            if row > 223 || column > 223 {
+                return None;
+            }
+            vec![
+                0x1b,
+                b'[',
+                b'M',
+                button + 32,
+                (column + 32) as u8,
+                (row + 32) as u8,
+            ]
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            if row > 2015 || column > 2015 {
+                return None;
+            }
+            let mut report = String::from("\x1b[M");
+            for value in [u32::from(button) + 32, column + 32, row + 32] {
+                report.push(char::from_u32(value)?);
+            }
+            report.into_bytes()
+        }
+    };
+    Some(report.repeat(wheel.rows.unsigned_abs().min(100) as usize))
+}
+
+fn report_mouse_scroll(screen: &mut vt100::Screen, writer: &mut impl Write, input: &[u8]) -> bool {
+    if writer
+        .write_all(input)
+        .and_then(|()| writer.flush())
+        .is_err()
+    {
+        return false;
+    }
+    // A mouse report refers to the live grid, not a local history row.
+    let returned_to_bottom = screen.scrollback() > 0;
+    screen.set_scrollback(0);
+    returned_to_bottom
 }
 
 impl Drop for TerminalSession {
@@ -1017,29 +1077,185 @@ mod tests {
         assert!(parser.screen().contents().contains("four"));
     }
 
+    fn wheel(rows: i32) -> TerminalWheel {
+        TerminalWheel {
+            rows,
+            row: 1,
+            column: 4,
+            ..TerminalWheel::default()
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn wheel_scrolls_full_screen_app_via_cursor_keys_instead_of_empty_scrollback() {
+    fn pty_application_receives_wheel_reports_and_shift_stays_local() {
+        let mut terminal = TerminalSession::spawn("", Path::new("/tmp")).unwrap();
+        terminal.write(b"stty -echo -icanon min 1 time 0; printf '\\033[?1049h\\033[?1000h\\033[?1006h'; dd bs=1 count=10 2>/dev/null | od -An -tx1; stty sane\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !terminal.parser.screen().alternate_screen()
+            || terminal.parser.screen().mouse_protocol_encoding() != vt100::MouseProtocolEncoding::Sgr
+        {
+            terminal.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mock TUI did not enable mouse capture"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        terminal.scroll_scrollback(TerminalWheel {
+            shift: true,
+            ..wheel(1)
+        });
+        // If Shift had injected bytes, dd would consume them before this report.
+        terminal.scroll_scrollback(wheel(1));
+        while !terminal.parser.screen().contents().contains("1b 5b 3c 36 34 3b 35 3b 32 4d") {
+            terminal.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PTY received incorrect wheel bytes: {}",
+                terminal.parser.screen().contents()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn wheel_uses_requested_mouse_protocol_in_both_screen_buffers() {
         let mut parser = vt100::Parser::new(3, 12, 20);
-        parser.process(b"one\r\ntwo\r\nthree\r\nfour");
-        assert_eq!(alternate_screen_scroll_input(parser.screen(), 3), None);
+        for enter in [b"".as_slice(), b"\x1b[?1049h".as_slice()] {
+            parser.process(enter);
+            assert_eq!(mouse_scroll_input(parser.screen(), wheel(3)), None);
+            for mode in [1000, 1002, 1003] {
+                parser.process(format!("\x1b[?{mode}h\x1b[?1006h").as_bytes());
+                assert_eq!(
+                    mouse_scroll_input(parser.screen(), wheel(3)),
+                    Some(b"\x1b[<64;5;2M".repeat(3))
+                );
+                assert_eq!(
+                    mouse_scroll_input(parser.screen(), wheel(-2)),
+                    Some(b"\x1b[<65;5;2M".repeat(2))
+                );
+                assert_eq!(mouse_scroll_input(parser.screen(), wheel(0)), None);
+                parser.process(format!("\x1b[?{mode}l").as_bytes());
+                assert_eq!(mouse_scroll_input(parser.screen(), wheel(3)), None);
+            }
+            // X10 asks for button presses only, not wheel reports.
+            parser.process(b"\x1b[?9h");
+            assert_eq!(mouse_scroll_input(parser.screen(), wheel(3)), None);
+            parser.process(b"\x1b[?9l");
+        }
+    }
 
-        parser.process(b"\x1b[?1049h");
-        assert!(parser.screen().alternate_screen());
+    #[test]
+    fn wheel_encodes_legacy_and_utf8_mouse_coordinates_without_overflow() {
+        let mut parser = vt100::Parser::new(300, 400, 20);
+        parser.process(b"\x1b[?1000h");
+        assert_eq!(
+            mouse_scroll_input(parser.screen(), wheel(1)),
+            Some(b"\x1b[M`%\"".to_vec())
+        );
+        let large = TerminalWheel {
+            column: 299,
+            ..wheel(-1)
+        };
+        assert_eq!(mouse_scroll_input(parser.screen(), large), None);
+        parser.process(b"\x1b[?1005h");
+        assert_eq!(
+            mouse_scroll_input(parser.screen(), large),
+            Some("\x1b[Ma\u{14c}\"".as_bytes().to_vec())
+        );
+        parser.process(b"\x1b[?1006h");
+        assert_eq!(
+            mouse_scroll_input(parser.screen(), large),
+            Some(b"\x1b[<65;300;2M".to_vec())
+        );
+        let modifiers = TerminalWheel {
+            control: true,
+            alt: true,
+            ..wheel(1)
+        };
+        assert_eq!(
+            mouse_scroll_input(parser.screen(), modifiers),
+            Some(b"\x1b[<88;5;2M".to_vec())
+        );
+        let outside = TerminalWheel {
+            row: -2,
+            column: i32::MAX,
+            ..wheel(1)
+        };
+        assert_eq!(
+            mouse_scroll_input(parser.screen(), outside),
+            Some(b"\x1b[<64;400;1M".to_vec())
+        );
+        assert_eq!(
+            mouse_scroll_input(parser.screen(), wheel(i32::MIN)),
+            Some(b"\x1b[<65;5;2M".repeat(100))
+        );
+    }
+
+    #[test]
+    fn shift_wheel_reads_retained_output_without_reporting_input() {
+        let mut parser = vt100::Parser::new(3, 12, 20);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour\x1b[?1000h\x1b[?1006h");
+        let local = TerminalWheel {
+            shift: true,
+            ..wheel(1)
+        };
+        assert_eq!(mouse_scroll_input(parser.screen(), local), None);
+        assert!(scroll_screen(parser.screen_mut(), local.rows));
+        assert!(parser.screen().contents().contains("one"));
+        let report = mouse_scroll_input(parser.screen(), wheel(-1)).unwrap();
+        let mut writer = Vec::new();
+        assert!(report_mouse_scroll(
+            parser.screen_mut(),
+            &mut writer,
+            &report
+        ));
+        assert_eq!(writer, b"\x1b[<65;5;2M");
         assert_eq!(parser.screen().scrollback(), 0);
-        assert_eq!(
-            alternate_screen_scroll_input(parser.screen(), 3),
-            Some(b"\x1b[A\x1b[A\x1b[A".to_vec())
-        );
-        assert_eq!(
-            alternate_screen_scroll_input(parser.screen(), -2),
-            Some(b"\x1b[B\x1b[B".to_vec())
-        );
-        assert_eq!(alternate_screen_scroll_input(parser.screen(), 0), None);
+        assert!(parser.screen().contents().contains("four"));
+    }
 
+    #[test]
+    fn failed_mouse_report_keeps_local_history_position() {
+        let mut parser = vt100::Parser::new(3, 12, 20);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour\x1b[?1000h\x1b[?1006h");
+        assert!(scroll_screen(parser.screen_mut(), 1));
+        let report = mouse_scroll_input(parser.screen(), wheel(-1)).unwrap();
+        assert!(!report_mouse_scroll(
+            parser.screen_mut(),
+            &mut &mut [0_u8; 0][..],
+            &report
+        ));
+        assert_eq!(parser.screen().scrollback(), 1);
+    }
+
+    #[test]
+    fn alternate_screen_history_is_bounded_isolated_and_reset_on_new_session() {
+        let mut parser = vt100::Parser::new(3, 12, 2);
+        parser.process(b"shell1\r\nshell2\r\nshell3\r\nshell4");
+        parser.process(b"\x1b[?1049hone\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+        // Inspect displaced output without injecting arrow keys.
+        assert_eq!(mouse_scroll_input(parser.screen(), wheel(3)), None);
+        assert!(scroll_screen(parser.screen_mut(), 100));
+        assert_eq!(parser.screen().scrollback(), 2);
+        assert_eq!(parser.screen().contents(), "two\nthree\nfour");
+        parser.process(b"\r\nseven");
+        assert_eq!(parser.screen().scrollback(), 2);
+        assert_eq!(parser.screen().contents(), "three\nfour\nfive");
+        assert!(
+            display_cells(parser.screen())
+                .iter()
+                .all(|cell| !cell.cursor)
+        );
         parser.process(b"\x1b[?1049l");
-        assert!(!parser.screen().alternate_screen());
-        assert_eq!(alternate_screen_scroll_input(parser.screen(), 3), None);
-        assert!(scroll_screen(parser.screen_mut(), 3));
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert!(scroll_screen(parser.screen_mut(), 1));
+        assert!(parser.screen().contents().contains("shell1"));
+        parser.process(b"\x1b[?1049hnew session");
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert!(!scroll_screen(parser.screen_mut(), 100));
+        assert_eq!(parser.screen().contents(), "new session");
     }
 
     #[test]

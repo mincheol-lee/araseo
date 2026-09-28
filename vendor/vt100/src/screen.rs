@@ -73,7 +73,9 @@ impl Screen {
         grid.allocate_rows();
         Self {
             grid,
-            alternate_grid: crate::grid::Grid::new(size, 0),
+            // Keep displaced rows for local wheel/Shift-wheel inspection.
+            // This history is separate from the shell's main-screen history.
+            alternate_grid: crate::grid::Grid::new(size, scrollback_len),
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
@@ -652,6 +654,7 @@ impl Screen {
         self.grid_mut().set_scrollback(0);
         self.set_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_grid.allocate_rows();
+        self.alternate_grid.set_scrollback(0);
     }
 
     fn exit_alternate_grid(&mut self) {
@@ -1164,6 +1167,7 @@ impl Screen {
                 [1049] => {
                     self.decsc();
                     self.alternate_grid.clear();
+                    self.alternate_grid.clear_scrollback();
                     self.enter_alternate_grid();
                 }
                 [2004] => self.set_mode(MODE_BRACKETED_PASTE),
