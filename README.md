@@ -84,6 +84,13 @@ versions, manual installation, and removal.
 - Drag a tab to a pane edge to split the workspace, or to the center of a pane
   to move it there. Drag a divider to resize the panes. Use **+** in a pane's
   tab bar to start another terminal.
+- Scroll terminal output with the mouse wheel. Apps that request mouse capture
+  receive wheel events in their requested terminal protocol; otherwise the wheel
+  reads retained output. Hold **Shift** while scrolling to read local history
+  even when an app captures the mouse. Main and alternate screen history are
+  separate and capped at 10,000 displaced rows each; a new alternate-screen
+  session starts with fresh history. Local history only contains rows the app
+  has scrolled off screen, not transcript content it has never rendered.
 - Use **Aa** in the status bar to set terminal, editor, and file tree font size
   and brightness independently; **Reset defaults** restores the initial values.
   Use **WSL** to request environment diagnostics.

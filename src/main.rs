@@ -908,7 +908,7 @@ fn main() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
-        ui.on_terminal_scrollback(move |tab_id, rows| {
+        ui.on_terminal_scrollback(move |tab_id, rows, row, column, control, alt, shift| {
             let Ok(tab_id) = TabId::try_from(tab_id) else {
                 return;
             };
@@ -920,8 +920,16 @@ fn main() -> Result<()> {
                 .tab_groups
                 .group_of(tab_id)
                 .filter(|group| state.tab_groups.active(*group) == Some(tab_id));
-            let changed = terminal_mut(&mut state, tab_id)
-                .is_some_and(|terminal| terminal.scroll_scrollback(rows));
+            let changed = terminal_mut(&mut state, tab_id).is_some_and(|terminal| {
+                terminal.scroll_scrollback(terminal::TerminalWheel {
+                    rows,
+                    row,
+                    column,
+                    control,
+                    alt,
+                    shift,
+                })
+            });
             if changed && let Some(group) = visible_group {
                 sync_group(&ui, &state, group);
             }
