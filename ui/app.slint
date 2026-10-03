@@ -1587,9 +1587,11 @@ export component AppWindow inherits Window {
     in-out property <bool> tree-dragging: false;
     in-out property <string> tree-drag-path: "";
     in-out property <string> tree-drag-name: "";
+    private property <bool> tree-drag-is-directory: false;
     in-out property <length> tree-drag-x: 0px;
     in-out property <length> tree-drag-y: 0px;
     in-out property <int> tree-drop-terminal-id: -1;
+    in-out property <string> tree-drop-folder-path: "";
     private property <int> tree-drop-group: -1;
     private property <float> tree-drop-x: 0;
     private property <float> tree-drop-y: 0;
@@ -1680,6 +1682,7 @@ export component AppWindow inherits Window {
     callback add-folder-requested(string);
     callback browse-folder-requested();
     callback tree-rename-requested(string, string);
+    callback tree-move-requested(string, string);
     callback tree-delete-requested(string);
     callback tree-path-copied(string);
     callback tree-terminal-requested(string);
@@ -1806,15 +1809,27 @@ export component AppWindow inherits Window {
         root.dock-target-group = -1;
     }
 
-    function update-tree-drag(path: string, name: string, x: length, y: length) {
+    function update-tree-drag(path: string, name: string, is-directory: bool, x: length, y: length) {
         root.tree-context-visible = false;
         root.tree-dragging = true;
         root.tree-drag-path = path;
         root.tree-drag-name = name;
+        root.tree-drag-is-directory = is-directory;
         root.tree-drag-x = x;
         root.tree-drag-y = y;
         root.tree-drop-terminal-id = -1;
         root.tree-drop-group = -1;
+        root.tree-drop-folder-path = "";
+
+        if (!is-directory && root.sidebar-view == 0
+            && x >= root.file-tree-x && x < root.file-tree-x + root.file-tree-width
+            && y >= root.file-tree-y && y < root.file-tree-y + root.file-tree-height) {
+            let row = floor((y - root.file-tree-y - root.file-tree-scroll-offset)
+                / root.file-tree-row-height);
+            if (row >= 0 && row < root.tree-entries.length && root.tree-entries[row].is-directory) {
+                root.tree-drop-folder-path = root.tree-entries[row].path;
+            }
+        }
 
         if (root.dynamic-panes) {
             let group = root.tree-target-requested(x, y);
@@ -1850,18 +1865,22 @@ export component AppWindow inherits Window {
         }
     }
 
-    function finish-tree-drag(path: string, name: string, x: length, y: length) {
+    function finish-tree-drag(path: string, name: string, is-directory: bool, x: length, y: length) {
         if (!root.tree-dragging || root.tree-drag-path != path) {
             root.cancel-tree-drag();
             return;
         }
-        root.update-tree-drag(path, name, x, y);
+        root.update-tree-drag(path, name, is-directory, x, y);
         let terminal-id = root.tree-drop-terminal-id;
         let terminal-group = root.tree-drop-group;
+        let folder-path = root.tree-drop-folder-path;
         root.tree-dragging = false;
         root.tree-drop-terminal-id = -1;
         root.tree-drop-group = -1;
-        if (terminal-id >= 0) {
+        root.tree-drop-folder-path = "";
+        if (folder-path != "") {
+            root.tree-move-requested(path, folder-path);
+        } else if (terminal-id >= 0) {
             clipboard-staging.text = path;
             clipboard-staging.select-all();
             clipboard-staging.copy();
@@ -1877,8 +1896,10 @@ export component AppWindow inherits Window {
         root.tree-dragging = false;
         root.tree-drag-path = "";
         root.tree-drag-name = "";
+        root.tree-drag-is-directory = false;
         root.tree-drop-terminal-id = -1;
         root.tree-drop-group = -1;
+        root.tree-drop-folder-path = "";
     }
 
     function copy-pdf-text(selected: string) {
@@ -2042,7 +2063,8 @@ export component AppWindow inherits Window {
                             spacing: 0px;
                             for entry[index] in root.tree-entries: Rectangle {
                                 height: root.file-tree-row-height;
-                                background: tree-touch.has-hover ? Chrome.hover : transparent;
+                                background: root.tree-dragging && root.tree-drop-folder-path == entry.path
+                                    ? Chrome.accent-fill : (tree-touch.has-hover ? Chrome.hover : transparent);
                                 HorizontalLayout {
                                     padding-left: entry.depth * 14px + 12px;
                                     padding-right: 10px;
@@ -2104,6 +2126,7 @@ export component AppWindow inherits Window {
                                         root.update-tree-drag(
                                             entry.path,
                                             entry.name,
+                                            entry.is-directory,
                                             self.absolute-position.x + self.mouse-x,
                                             self.absolute-position.y + self.mouse-y
                                         );
@@ -2130,6 +2153,7 @@ export component AppWindow inherits Window {
                                             root.finish-tree-drag(
                                                 entry.path,
                                                 entry.name,
+                                                entry.is-directory,
                                                 self.absolute-position.x + self.mouse-x,
                                                 self.absolute-position.y + self.mouse-y
                                             );
@@ -2832,15 +2856,18 @@ export component AppWindow inherits Window {
             y: min(root.height - self.height - 28px, root.tree-drag-y + 12px);
             width: 240px;
             height: 32px;
-            background: root.tree-drop-terminal-id >= 0 ? #24547b : #30343c;
+            background: root.tree-drop-terminal-id >= 0 || root.tree-drop-folder-path != ""
+                ? #24547b : #30343c;
             border-width: 1px;
-            border-color: root.tree-drop-terminal-id >= 0 ? #79b8f3 : #555b66;
+            border-color: root.tree-drop-terminal-id >= 0 || root.tree-drop-folder-path != ""
+                ? #79b8f3 : #555b66;
             border-radius: 4px;
 
             Text {
                 x: 9px;
                 width: parent.width - 18px;
-                text: (root.tree-drop-terminal-id >= 0 ? "Paste  " : "Drag  ") + root.tree-drag-name;
+                text: (root.tree-drop-terminal-id >= 0 ? "Paste  "
+                    : (root.tree-drop-folder-path != "" ? "Move  " : "Drag  ")) + root.tree-drag-name;
                 color: #f0f0f0;
                 font-family: "Segoe UI";
                 font-size: 11px;

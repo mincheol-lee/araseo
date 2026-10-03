@@ -95,6 +95,13 @@ enum TreeActionResult {
         from_host: PathBuf,
         to_host: PathBuf,
     },
+    Moved {
+        from: PathBuf,
+        to: PathBuf,
+        from_host: PathBuf,
+        to_host: PathBuf,
+        parent: PathBuf,
+    },
     Copied {
         path: PathBuf,
         parent: PathBuf,
@@ -599,6 +606,58 @@ fn main() -> Result<()> {
                         to_host,
                     })
                 });
+            } else {
+                state.status = "The selected file tree item is no longer available".into();
+            }
+            if let Some(ui) = weak.upgrade() {
+                sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_tree_move_requested(move |source, target| {
+            let mut state = state.borrow_mut();
+            if state.tree_action_pending {
+                state.status = "A file tree action is already running".into();
+            } else if let (Some(source_node), Some(target_node)) = (
+                tree_node_for_ui_path(&state, source.as_str()),
+                tree_node_for_ui_path(&state, target.as_str()),
+            ) {
+                if source_node.is_directory || !target_node.is_directory {
+                    state.status = "Drop a file onto a folder".into();
+                } else {
+                    let from = source_node.linux_path;
+                    let parent = target_node.linux_path;
+                    let source_workspace = workspace_for_path(&state, &from);
+                    let target_workspace = workspace_for_path(&state, &parent);
+                    match (source_workspace, target_workspace) {
+                        (Ok(source_workspace), Ok(target_workspace)) => {
+                            let result_parent = parent.clone();
+                            state.tree_action_pending = true;
+                            state.status = format!("Moving {} to {}...", from.display(), parent.display());
+                            state.tree_action_loader.request(move || {
+                                let from_host = source_workspace.host_path(&from)?;
+                                let to = tree::move_file(
+                                    &source_workspace,
+                                    &from,
+                                    &target_workspace,
+                                    &parent,
+                                )?;
+                                let to_host = target_workspace.host_path(&to)?;
+                                Ok(TreeActionResult::Moved {
+                                    from,
+                                    to,
+                                    from_host,
+                                    to_host,
+                                    parent: result_parent,
+                                })
+                            });
+                        }
+                        (Err(error), _) | (_, Err(error)) => state.status = error.to_string(),
+                    }
+                }
             } else {
                 state.status = "The selected file tree item is no longer available".into();
             }
@@ -1494,45 +1553,24 @@ fn main() -> Result<()> {
                         from_host,
                         to_host,
                     }) => {
-                        state.file_loader.cancel();
-                        state.diff_loader.cancel();
-                        close_diff_tabs_at_or_below(&mut state, &from);
-                        state.expanded = state
-                            .expanded
-                            .iter()
-                            .map(|path| tree::rebased_path(path, &from, &to))
-                            .collect();
-                        state.expanded_git_repositories = state
-                            .expanded_git_repositories
-                            .iter()
-                            .map(|path| tree::rebased_path(path, &from, &to))
-                            .collect();
-                        state.repositories = state
-                            .repositories
-                            .iter()
-                            .map(|path| tree::rebased_path(path, &from, &to))
-                            .collect();
-                        for node in &mut state.tree {
-                            if node.linux_path == from {
-                                node.name = to
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned();
-                            }
-                            node.linux_path = tree::rebased_path(&node.linux_path, &from, &to);
-                        }
-                        for tab in &mut state.tabs {
-                            if let TabContent::File(document) = &mut tab.content {
-                                document.linux_path =
-                                    tree::rebased_path(&document.linux_path, &from, &to);
-                                document.host_path =
-                                    tree::rebased_path(&document.host_path, &from_host, &to_host);
-                            }
-                        }
-                        refresh_tree(&mut state);
-                        refresh_git_for_path(&mut state, &to);
+                        apply_tree_relocation(&mut state, &from, &to, &from_host, &to_host);
                         state.status = format!("Renamed {} to {}", from.display(), to.display());
+                    }
+                    Ok(TreeActionResult::Moved {
+                        from,
+                        to,
+                        from_host,
+                        to_host,
+                        parent,
+                    }) => {
+                        if from == to {
+                            state.status = format!("{} is already in that folder", from.display());
+                        } else {
+                            apply_tree_relocation(&mut state, &from, &to, &from_host, &to_host);
+                            state.expanded.insert(parent);
+                            refresh_tree(&mut state);
+                            state.status = format!("Moved {} to {}", from.display(), to.display());
+                        }
                     }
                     Ok(TreeActionResult::Copied { path, parent }) => {
                         state.expanded.insert(parent);
@@ -2372,6 +2410,54 @@ fn refresh_git_for_path(state: &mut AppState, path: &std::path::Path) {
             refresh_tree(state);
         }
     }
+}
+
+fn apply_tree_relocation(
+    state: &mut AppState,
+    from: &std::path::Path,
+    to: &std::path::Path,
+    from_host: &std::path::Path,
+    to_host: &std::path::Path,
+) {
+    state.file_loader.cancel();
+    state.diff_loader.cancel();
+    close_diff_tabs_at_or_below(state, from);
+    state.expanded = state
+        .expanded
+        .iter()
+        .map(|path| tree::rebased_path(path, from, to))
+        .collect();
+    state.expanded_git_repositories = state
+        .expanded_git_repositories
+        .iter()
+        .map(|path| tree::rebased_path(path, from, to))
+        .collect();
+    state.repositories = state
+        .repositories
+        .iter()
+        .map(|path| tree::rebased_path(path, from, to))
+        .collect();
+    for node in &mut state.tree {
+        if node.linux_path == from {
+            node.name = to.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        }
+        node.linux_path = tree::rebased_path(&node.linux_path, from, to);
+    }
+    for tab in &mut state.tabs {
+        match &mut tab.content {
+            TabContent::File(document) => {
+                document.linux_path = tree::rebased_path(&document.linux_path, from, to);
+                document.host_path = tree::rebased_path(&document.host_path, from_host, to_host);
+            }
+            TabContent::Preview(preview) => {
+                preview.linux_path = tree::rebased_path(&preview.linux_path, from, to);
+            }
+            _ => {}
+        }
+    }
+    refresh_tree(state);
+    refresh_git_for_path(state, from);
+    refresh_git_for_path(state, to);
 }
 
 fn has_dirty_document_at_or_below(state: &AppState, path: &std::path::Path) -> bool {
