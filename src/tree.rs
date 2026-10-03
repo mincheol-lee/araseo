@@ -207,9 +207,29 @@ pub fn external_drop_target(
     }
     let index = (content_y / row_height).floor() as usize;
     match tree.get(index) {
-        Some(node) if node.is_directory => Some(node.linux_path.clone()),
-        Some(node) => node.linux_path.parent().map(PathBuf::from),
+        Some(node) => drop_parent_for_node(node),
         None => Some(workspace_root.to_path_buf()),
+    }
+}
+
+pub fn internal_drop_target(
+    tree: &[FlatNode],
+    workspace_root: &Path,
+    target_path: &str,
+) -> Option<PathBuf> {
+    if target_path.is_empty() {
+        return Some(workspace_root.to_path_buf());
+    }
+    tree.iter()
+        .find(|node| linux_path_text(&node.linux_path) == target_path)
+        .and_then(drop_parent_for_node)
+}
+
+fn drop_parent_for_node(node: &FlatNode) -> Option<PathBuf> {
+    if node.is_directory {
+        Some(node.linux_path.clone())
+    } else {
+        node.linux_path.parent().map(PathBuf::from)
     }
 }
 
@@ -693,6 +713,19 @@ mod tests {
             Some(root.clone())
         );
         assert_eq!(external_drop_target(&tree, &root, -1.0, 25.0), None);
+        assert_eq!(
+            internal_drop_target(&tree, &root, "/workspace/src"),
+            Some(root.join("src"))
+        );
+        assert_eq!(
+            internal_drop_target(&tree, &root, "/workspace/src/main.rs"),
+            Some(root.join("src"))
+        );
+        assert_eq!(internal_drop_target(&tree, &root, ""), Some(root));
+        assert_eq!(
+            internal_drop_target(&tree, Path::new("/workspace"), "/missing"),
+            None
+        );
     }
 
     #[test]

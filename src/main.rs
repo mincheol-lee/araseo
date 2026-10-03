@@ -621,15 +621,15 @@ fn main() -> Result<()> {
             let mut state = state.borrow_mut();
             if state.tree_action_pending {
                 state.status = "A file tree action is already running".into();
-            } else if let (Some(source_node), Some(target_node)) = (
-                tree_node_for_ui_path(&state, source.as_str()),
-                tree_node_for_ui_path(&state, target.as_str()),
-            ) {
-                if source_node.is_directory || !target_node.is_directory {
-                    state.status = "Drop a file onto a folder".into();
-                } else {
+            } else if let Some(source_node) = tree_node_for_ui_path(&state, source.as_str()) {
+                if source_node.is_directory {
+                    state.status = "Only files can be moved into another folder".into();
+                } else if let Some(parent) = tree::internal_drop_target(
+                    &state.tree,
+                    &state.workspace.linux_root,
+                    target.as_str(),
+                ) {
                     let from = source_node.linux_path;
-                    let parent = target_node.linux_path;
                     let source_workspace = workspace_for_path(&state, &from);
                     let target_workspace = workspace_for_path(&state, &parent);
                     match (source_workspace, target_workspace) {
@@ -657,6 +657,8 @@ fn main() -> Result<()> {
                         }
                         (Err(error), _) | (_, Err(error)) => state.status = error.to_string(),
                     }
+                } else {
+                    state.status = "The selected file tree item is no longer available".into();
                 }
             } else {
                 state.status = "The selected file tree item is no longer available".into();
