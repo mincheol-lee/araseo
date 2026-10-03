@@ -97,6 +97,49 @@ pub fn rename_entry(workspace: &Workspace, path: &Path, new_name: &str) -> Resul
     Ok(destination)
 }
 
+pub fn move_file(
+    source_workspace: &Workspace,
+    source: &Path,
+    target_workspace: &Workspace,
+    target_directory: &Path,
+) -> Result<PathBuf> {
+    let source_host = source_workspace.host_path(source)?;
+    let metadata = fs::symlink_metadata(&source_host)
+        .with_context(|| format!("cannot access {}", source.display()))?;
+    if !metadata.is_file() {
+        bail!("only files can be moved into another folder");
+    }
+    let file_name = source.file_name().context("the file has no name")?;
+    let target_host = target_workspace.host_path(target_directory)?;
+    if !target_host.is_dir() {
+        bail!(
+            "drop target is not a folder: {}",
+            target_directory.display()
+        );
+    }
+    let destination = target_directory.join(file_name);
+    if destination == source {
+        return Ok(destination);
+    }
+    let destination_host = target_workspace.host_path(&destination)?;
+    match fs::symlink_metadata(&destination_host) {
+        Ok(_) => bail!(
+            "a file or folder named {} already exists",
+            file_name.to_string_lossy()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("cannot check the drop destination"),
+    }
+    fs::rename(&source_host, &destination_host).with_context(|| {
+        format!(
+            "cannot move {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(destination)
+}
+
 pub fn rebased_path(path: &Path, from: &Path, to: &Path) -> PathBuf {
     path.strip_prefix(from)
         .map_or_else(|_| path.to_path_buf(), |relative| to.join(relative))
@@ -164,9 +207,29 @@ pub fn external_drop_target(
     }
     let index = (content_y / row_height).floor() as usize;
     match tree.get(index) {
-        Some(node) if node.is_directory => Some(node.linux_path.clone()),
-        Some(node) => node.linux_path.parent().map(PathBuf::from),
+        Some(node) => drop_parent_for_node(node),
         None => Some(workspace_root.to_path_buf()),
+    }
+}
+
+pub fn internal_drop_target(
+    tree: &[FlatNode],
+    workspace_root: &Path,
+    target_path: &str,
+) -> Option<PathBuf> {
+    if target_path.is_empty() {
+        return Some(workspace_root.to_path_buf());
+    }
+    tree.iter()
+        .find(|node| linux_path_text(&node.linux_path) == target_path)
+        .and_then(drop_parent_for_node)
+}
+
+fn drop_parent_for_node(node: &FlatNode) -> Option<PathBuf> {
+    if node.is_directory {
+        Some(node.linux_path.clone())
+    } else {
+        node.linux_path.parent().map(PathBuf::from)
     }
 }
 
@@ -561,6 +624,41 @@ mod tests {
     }
 
     #[test]
+    fn moves_files_between_folders_without_overwriting_or_escaping_workspace() {
+        let root = temporary_directory("move-file");
+        fs::create_dir_all(root.join("source")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("source/note.txt"), "moved content").unwrap();
+        fs::write(root.join("target/occupied.txt"), "keep").unwrap();
+        let workspace = Workspace::new("Ubuntu", root.clone()).unwrap();
+        let source = root.join("source/note.txt");
+        let target = root.join("target");
+
+        assert!(move_file(&workspace, &source, &workspace, &root.join("missing")).is_err());
+        assert!(move_file(&workspace, &root.join("source"), &workspace, &target).is_err());
+        assert!(move_file(&workspace, &source, &workspace, &root.join("../outside")).is_err());
+        assert_eq!(
+            move_file(&workspace, &source, &workspace, &root.join("source")).unwrap(),
+            source
+        );
+        assert!(source.exists());
+
+        let destination = move_file(&workspace, &source, &workspace, &target).unwrap();
+        assert_eq!(destination, target.join("note.txt"));
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "moved content");
+        fs::write(&source, "second copy").unwrap();
+        assert!(move_file(&workspace, &source, &workspace, &target).is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "second copy");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "moved content");
+        assert_eq!(
+            fs::read_to_string(target.join("occupied.txt")).unwrap(),
+            "keep"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn copies_external_files_without_overwriting_existing_entries() {
         let root = temporary_directory("external-copy-workspace");
         let source_root = temporary_directory("external-copy-source");
@@ -615,6 +713,19 @@ mod tests {
             Some(root.clone())
         );
         assert_eq!(external_drop_target(&tree, &root, -1.0, 25.0), None);
+        assert_eq!(
+            internal_drop_target(&tree, &root, "/workspace/src"),
+            Some(root.join("src"))
+        );
+        assert_eq!(
+            internal_drop_target(&tree, &root, "/workspace/src/main.rs"),
+            Some(root.join("src"))
+        );
+        assert_eq!(internal_drop_target(&tree, &root, ""), Some(root));
+        assert_eq!(
+            internal_drop_target(&tree, Path::new("/workspace"), "/missing"),
+            None
+        );
     }
 
     #[test]

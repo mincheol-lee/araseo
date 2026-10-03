@@ -326,6 +326,13 @@ mod tests {
                 .borrow_mut()
                 .push((path.to_string(), name.to_string()));
         });
+        let tree_moves = Rc::new(RefCell::new(Vec::new()));
+        let observed_tree_moves = tree_moves.clone();
+        ui.on_tree_move_requested(move |source, target| {
+            observed_tree_moves
+                .borrow_mut()
+                .push((source.to_string(), target.to_string()));
+        });
         let tree_deletes = Rc::new(RefCell::new(Vec::new()));
         let observed_tree_deletes = tree_deletes.clone();
         ui.on_tree_delete_requested(move |path| {
@@ -1438,6 +1445,130 @@ mod tests {
             Some(&(1, "/workspace/local-project".to_string())),
             "dropping a tree path did not paste it into the target terminal"
         );
+
+        // Folder rows, file rows, and blank tree space all accept file moves.
+        // Terminal drops still use the separate clipboard and paste path.
+        let previous_tree_entries = ui.get_tree_entries();
+        ui.set_tree_entries(ModelRc::new(VecModel::from(vec![
+            previous_tree_entries.row_data(0).unwrap(),
+            previous_tree_entries.row_data(1).unwrap(),
+            TreeEntry {
+                name: "destination".into(),
+                path: "/workspace/destination".into(),
+                icon: slint::Image::default(),
+                icon_label: "".into(),
+                depth: 0,
+                is_directory: true,
+                is_expanded: false,
+                git_mark: "".into(),
+                project_kind: "".into(),
+                is_added_root: false,
+            },
+            TreeEntry {
+                name: "existing.txt".into(),
+                path: "/workspace/destination/existing.txt".into(),
+                icon: slint::Image::default(),
+                icon_label: "".into(),
+                depth: 1,
+                is_directory: false,
+                is_expanded: false,
+                git_mark: "".into(),
+                project_kind: "".into(),
+                is_added_root: false,
+            },
+        ])));
+        render(&window);
+        let pasted_before_move = terminal_text.borrow().len();
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 101.0),
+            button: PointerEventButton::Left,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved {
+            position: LogicalPosition::new(60.0, 126.0),
+        });
+        assert!(ui.get_tree_drop_in_tree());
+        assert_eq!(ui.get_tree_drop_target_path().as_str(), "/workspace/destination");
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 126.0),
+            button: PointerEventButton::Left,
+        });
+        assert_eq!(
+            tree_moves.borrow().last(),
+            Some(&("/workspace/sample.js".to_string(), "/workspace/destination".to_string()))
+        );
+        assert!(!ui.get_tree_dragging());
+        assert!(!ui.get_tree_drop_in_tree());
+        assert!(ui.get_tree_drop_target_path().is_empty());
+        assert_eq!(terminal_text.borrow().len(), pasted_before_move);
+        assert_eq!(clipboard.borrow().as_str(), "/workspace/local-project");
+
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 101.0),
+            button: PointerEventButton::Left,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved {
+            position: LogicalPosition::new(60.0, 151.0),
+        });
+        assert_eq!(
+            ui.get_tree_drop_target_path().as_str(),
+            "/workspace/destination/existing.txt"
+        );
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 151.0),
+            button: PointerEventButton::Left,
+        });
+        assert_eq!(
+            tree_moves.borrow().last(),
+            Some(&("/workspace/sample.js".to_string(), "/workspace/destination/existing.txt".to_string()))
+        );
+
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 101.0),
+            button: PointerEventButton::Left,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved {
+            position: LogicalPosition::new(60.0, 200.0),
+        });
+        assert!(ui.get_tree_drop_in_tree());
+        assert!(ui.get_tree_drop_target_path().is_empty());
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 200.0),
+            button: PointerEventButton::Left,
+        });
+        assert_eq!(
+            tree_moves.borrow().last(),
+            Some(&("/workspace/sample.js".to_string(), String::new()))
+        );
+
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 101.0),
+            button: PointerEventButton::Left,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved {
+            position: LogicalPosition::new(60.0, 45.0),
+        });
+        assert!(ui.get_tree_drop_in_tree());
+        assert!(ui.get_tree_drop_target_path().is_empty());
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 45.0),
+            button: PointerEventButton::Left,
+        });
+        assert_eq!(tree_moves.borrow().len(), 4);
+
+        dispatch_pointer(&ui, WindowEvent::PointerPressed {
+            position: LogicalPosition::new(60.0, 76.0),
+            button: PointerEventButton::Left,
+        });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved {
+            position: LogicalPosition::new(60.0, 126.0),
+        });
+        assert!(!ui.get_tree_drop_in_tree());
+        dispatch_pointer(&ui, WindowEvent::PointerReleased {
+            position: LogicalPosition::new(60.0, 126.0),
+            button: PointerEventButton::Left,
+        });
+        assert_eq!(tree_moves.borrow().len(), 4);
+        ui.set_tree_entries(previous_tree_entries);
         assert_eq!(
             copied_tree_paths.borrow().last().map(String::as_str),
             Some("/workspace/local-project"),
