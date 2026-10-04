@@ -3647,6 +3647,7 @@ fn sync_tree(ui: &AppWindow, state: &AppState) {
                 git_mark: match node.git_status {
                     GitStatus::Clean => "",
                     GitStatus::Modified => "M",
+                    GitStatus::Added => "A",
                     GitStatus::Untracked => "U",
                     GitStatus::Deleted => "D",
                 }
@@ -3719,6 +3720,7 @@ fn sync_git_changes(ui: &AppWindow, state: &AppState) {
                 path: path.to_string_lossy().to_string().into(),
                 status: match status {
                     GitStatus::Modified => "M",
+                    GitStatus::Added => "A",
                     GitStatus::Untracked => "U",
                     GitStatus::Deleted => "D",
                     GitStatus::Clean => "",
