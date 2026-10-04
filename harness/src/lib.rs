@@ -26,6 +26,8 @@ pub mod background;
 pub mod diagnostics_log;
 #[path = "../../src/wsl_diagnostics.rs"]
 pub mod wsl_diagnostics;
+#[path = "../../src/window_activity.rs"]
+pub mod window_activity;
 
 #[path = "../../src/appearance.rs"]
 pub mod appearance;
