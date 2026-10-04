@@ -2,6 +2,7 @@
 
 mod appearance;
 mod background;
+mod diagnostics_log;
 mod document;
 mod editor_view;
 mod emoji;
@@ -146,6 +147,16 @@ struct WorkspaceTab {
 }
 
 fn main() -> Result<()> {
+    diagnostics_log::init();
+    let result = run();
+    match &result {
+        Ok(()) => diagnostics_log::event("normal exit"),
+        Err(error) => diagnostics_log::event(&format!("application error: {error:#}")),
+    }
+    result
+}
+
+fn run() -> Result<()> {
     let (distro, root, initial_file) = parse_args()?;
     // Keep the production renderer identical to the behavioral UI harness.
     // In particular, this avoids renderer-specific handling of a transparent
@@ -1724,8 +1735,20 @@ fn main() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
+        let mut last_tick = Instant::now();
+        let mut last_heartbeat = Instant::now();
         workspace_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
             let Some(ui) = weak.upgrade() else { return };
+            let now = Instant::now();
+            let gap = now.duration_since(last_tick);
+            last_tick = now;
+            if gap >= Duration::from_secs(5) {
+                diagnostics_log::event(&format!("event loop resumed after {} ms", gap.as_millis()));
+            }
+            if now.duration_since(last_heartbeat) >= Duration::from_secs(60) {
+                diagnostics_log::event("event loop heartbeat");
+                last_heartbeat = now;
+            }
             let mut state = state.borrow_mut();
             let mut updates = Vec::new();
             if let Some(update) = state
@@ -1786,6 +1809,7 @@ fn main() -> Result<()> {
         });
     }
 
+    diagnostics_log::event("event loop started");
     ui.run()?;
     drop(timer);
     drop(agent_timer);
@@ -1836,13 +1860,39 @@ fn install_windows_folder_browser(ui: &AppWindow, workspace: &Workspace) {
 fn install_window_events(ui: &AppWindow, _state: Rc<RefCell<AppState>>) {
     let weak = ui.as_weak();
     let mut modifiers = winit::keyboard::ModifiersState::default();
+    let mut last_input = Instant::now();
     ui.window().on_winit_window_event(move |window, event| {
+        let input = matches!(
+            event,
+            winit::event::WindowEvent::KeyboardInput {
+                event: winit::event::KeyEvent {
+                    state: winit::event::ElementState::Pressed,
+                    ..
+                },
+                ..
+            } | winit::event::WindowEvent::MouseInput {
+                state: winit::event::ElementState::Pressed,
+                ..
+            } | winit::event::WindowEvent::MouseWheel { .. }
+        );
+        if input {
+            let now = Instant::now();
+            let gap = now.duration_since(last_input);
+            if gap >= Duration::from_secs(30) {
+                diagnostics_log::event(&format!("first user input after {} ms", gap.as_millis()));
+            }
+            last_input = now;
+        }
         match event {
             winit::event::WindowEvent::ModifiersChanged(changed) => {
                 modifiers = changed.state();
             }
             winit::event::WindowEvent::Focused(false) => {
+                diagnostics_log::event("window unfocused");
                 modifiers = winit::keyboard::ModifiersState::default();
+            }
+            winit::event::WindowEvent::Focused(true) => {
+                diagnostics_log::event("window focused");
             }
             winit::event::WindowEvent::KeyboardInput { event, .. }
                 if event.state == winit::event::ElementState::Pressed =>
