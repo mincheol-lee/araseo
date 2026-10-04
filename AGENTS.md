@@ -92,12 +92,18 @@
 ## Building a Windows test executable
 
 - From WSL, do not use `scripts/build-windows.ps1` unless Windows itself has a
-  working Rust installation. Build with the verified WSL cross-toolchain:
+  working Rust installation. Build with the verified WSL cross-toolchain.
+  Never overwrite `dist/araseo.exe` while a Windows process is running from
+  that path: Windows maps executable pages, and replacing the file from WSL
+  may disrupt the running process. Stage the build under a different name and
+  close all such Araseo processes before replacing `dist/araseo.exe`:
 
   ```sh
   bash -c \
     'source /home/minch/.cargo/env; export PATH=/tmp/araseo-mingw/usr/bin:$PATH; exec cargo build --locked --release --target x86_64-pc-windows-gnu'
-  cp -f target/x86_64-pc-windows-gnu/release/araseo.exe dist/araseo.exe
+  cp -f target/x86_64-pc-windows-gnu/release/araseo.exe dist/araseo-next.exe
+  # After the running Araseo process exits:
+  cp -f dist/araseo-next.exe dist/araseo.exe
   ```
 
 - Confirm that the copied file is the new Windows binary:

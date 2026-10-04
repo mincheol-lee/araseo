@@ -176,6 +176,17 @@ Font settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or
 `~/.config/araseo/fonts.conf`). The original MVP specification is in
 [docs/PRD.md](docs/PRD.md); it predates several features described here.
 
+For crash investigation, Araseo writes a small local log to
+`%LOCALAPPDATA%\araseo\logs\araseo.log` on Windows (or
+`$XDG_STATE_HOME/araseo/logs/araseo.log` on Linux, defaulting to
+`~/.local/state/araseo/logs/araseo.log`). It records startup, normal exit,
+window focus, event-loop pauses, Rust panics with backtraces, and unhandled
+Windows exception codes and addresses when available. It does not
+record editor text or terminal output. Once the log reaches 1 MiB, the next
+launch moves it to `araseo.previous.log`. A native access violation may end the
+process without a final log entry; the last timestamp still helps narrow down
+what the app was doing.
+
 ## Support
 
 If Araseo is useful to you and you'd like to support its development, you can
