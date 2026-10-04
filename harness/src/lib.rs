@@ -22,6 +22,8 @@ pub mod terminal;
 pub mod tabs;
 #[path = "../../src/background.rs"]
 pub mod background;
+#[path = "../../src/diagnostics_log.rs"]
+pub mod diagnostics_log;
 #[path = "../../src/wsl_diagnostics.rs"]
 pub mod wsl_diagnostics;
 
