@@ -18,6 +18,7 @@ mod terminal;
 mod tree;
 mod workspace;
 mod workspace_history;
+mod window_activity;
 mod wsl_diagnostics;
 
 use anyhow::{Context, Result, bail};
@@ -36,6 +37,7 @@ use tabs::{Axis, Dock, Rect, TabGroups, TabId};
 use terminal::{AgentKind, AgentStatus, TerminalSession};
 use tree::{FlatNode, GitStatus};
 use workspace::Workspace;
+use window_activity::WindowActivity;
 
 slint::include_modules!();
 
@@ -288,7 +290,8 @@ fn run() -> Result<()> {
             ui.set_wsl_docker_usage_error("".into());
         });
     }
-    install_window_events(&ui, state.clone());
+    let window_activity = Rc::new(WindowActivity::default());
+    install_window_events(&ui, state.clone(), window_activity.clone());
     #[cfg(windows)]
     install_windows_folder_browser(&ui, &state.borrow().workspace);
     {
@@ -1625,6 +1628,7 @@ fn run() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
+        let window_activity = window_activity.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = weak.upgrade() else { return };
             let fixed_terminal_sizes = [
@@ -1644,7 +1648,9 @@ fn run() -> Result<()> {
                 ),
             ];
             let mut state = state.borrow_mut();
-            if state.agent_kinds.values().any(|agent| agent.running) {
+            if window_activity
+                .should_animate_agents(state.agent_kinds.values().any(|agent| agent.running))
+            {
                 state.agent_animation_tick = (state.agent_animation_tick + 1) % 3;
                 if state.agent_animation_tick == 0 {
                     ui.set_agent_frame((ui.get_agent_frame() + 1) % 8);
@@ -1684,6 +1690,7 @@ fn run() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
+        let window_activity = window_activity.clone();
         agent_timer.start(
             TimerMode::Repeated,
             Duration::from_millis(500),
@@ -1707,6 +1714,9 @@ fn run() -> Result<()> {
                     if state.agent_kinds != previous {
                         sync_tabs(&ui, &state);
                     }
+                }
+                if !window_activity.should_probe_agents() {
+                    return;
                 }
                 let probes = state
                     .tabs
@@ -1857,7 +1867,11 @@ fn install_windows_folder_browser(ui: &AppWindow, workspace: &Workspace) {
     });
 }
 
-fn install_window_events(ui: &AppWindow, _state: Rc<RefCell<AppState>>) {
+fn install_window_events(
+    ui: &AppWindow,
+    _state: Rc<RefCell<AppState>>,
+    window_activity: Rc<WindowActivity>,
+) {
     let weak = ui.as_weak();
     let mut modifiers = winit::keyboard::ModifiersState::default();
     let mut last_input = Instant::now();
@@ -1889,10 +1903,12 @@ fn install_window_events(ui: &AppWindow, _state: Rc<RefCell<AppState>>) {
             }
             winit::event::WindowEvent::Focused(false) => {
                 diagnostics_log::event("window unfocused");
+                window_activity.set_focused(false);
                 modifiers = winit::keyboard::ModifiersState::default();
             }
             winit::event::WindowEvent::Focused(true) => {
                 diagnostics_log::event("window focused");
+                window_activity.set_focused(true);
             }
             winit::event::WindowEvent::KeyboardInput { event, .. }
                 if event.state == winit::event::ElementState::Pressed =>
