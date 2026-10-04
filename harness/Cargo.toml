@@ -11,5 +11,8 @@ portable-pty = "0.9"
 pulldown-cmark = "0.13.4"
 vt100 = "0.16"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
+
 [patch.crates-io]
 vt100 = { path = "../vendor/vt100" }

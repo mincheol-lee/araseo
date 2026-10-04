@@ -39,6 +39,11 @@ cargo test \
     --manifest-path "$repository_root/Cargo.toml" \
     --target x86_64-pc-windows-gnu \
     --no-run
+cargo test \
+    --locked \
+    --manifest-path "$repository_root/harness/Cargo.toml" \
+    --target x86_64-pc-windows-gnu \
+    --no-run
 cargo check \
     --locked \
     --manifest-path "$repository_root/Cargo.toml" \

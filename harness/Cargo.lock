@@ -38,6 +38,7 @@ dependencies = [
  "portable-pty",
  "pulldown-cmark",
  "vt100",
+ "windows-sys",
 ]
 
 [[package]]
