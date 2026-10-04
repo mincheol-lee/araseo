@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[cfg(windows)]
@@ -158,8 +158,18 @@ while True:
 pub struct StatusMonitor {
     child: Child,
     input: ChildStdin,
-    receiver: Receiver<Result<Vec<(Vec<u8>, Vec<u8>)>, String>>,
+    latest: Arc<Mutex<Option<MonitorUpdate>>>,
     root: PathBuf,
+}
+
+type MonitorUpdate = Result<Vec<(Vec<u8>, Vec<u8>)>, String>;
+
+fn store_monitor_update(latest: &Mutex<Option<MonitorUpdate>>, update: MonitorUpdate) {
+    *latest.lock().unwrap() = Some(update);
+}
+
+fn take_monitor_update(latest: &Mutex<Option<MonitorUpdate>>) -> Option<MonitorUpdate> {
+    latest.lock().unwrap().take()
 }
 
 impl StatusMonitor {
@@ -191,14 +201,17 @@ impl StatusMonitor {
         let output = child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "monitor stdout unavailable")
         })?;
-        let (sender, receiver) = mpsc::channel();
+        // The UI only uses the newest complete snapshot. Keep at most one
+        // while it is suspended or busy, rather than retaining every update.
+        let latest = Arc::new(Mutex::new(None));
+        let reader_latest = Arc::clone(&latest);
         thread::spawn(move || {
             let mut pending = None;
             for line in BufReader::new(output).lines() {
                 let line = match line {
                     Ok(line) => line,
                     Err(error) => {
-                        let _ = sender.send(Err(error.to_string()));
+                        store_monitor_update(&reader_latest, Err(error.to_string()));
                         break;
                     }
                 };
@@ -210,16 +223,12 @@ impl StatusMonitor {
                         }
                     }
                     Ok(MonitorLine::End) => {
-                        if let Some(batch) = pending.take()
-                            && sender.send(Ok(batch)).is_err()
-                        {
-                            break;
+                        if let Some(batch) = pending.take() {
+                            store_monitor_update(&reader_latest, Ok(batch));
                         }
                     }
                     Err(error) => {
-                        if sender.send(Err(error)).is_err() {
-                            break;
-                        }
+                        store_monitor_update(&reader_latest, Err(error));
                     }
                 }
             }
@@ -228,15 +237,14 @@ impl StatusMonitor {
         Ok(Self {
             child,
             input,
-            receiver,
+            latest,
             root: workspace.linux_root.clone(),
         })
     }
 
     pub fn poll_latest(&mut self) -> Option<Result<StatusSnapshot, String>> {
-        let mut latest = None;
-        while let Ok(message) = self.receiver.try_recv() {
-            latest = Some(message.map(|repositories| {
+        take_monitor_update(&self.latest).map(|message| {
+            message.map(|repositories| {
                 let mut snapshot = StatusSnapshot::default();
                 for (relative_path, bytes) in repositories {
                     let relative_path = PathBuf::from(String::from_utf8_lossy(&relative_path).as_ref());
@@ -249,9 +257,8 @@ impl StatusMonitor {
                     snapshot.statuses.extend(parse_porcelain(&repository, &bytes));
                 }
                 snapshot
-            }));
-        }
-        latest
+            })
+        })
     }
 
     pub fn force_refresh(&mut self) -> std::io::Result<()> {
@@ -791,6 +798,17 @@ mod tests {
         assert_eq!(status, b"? new.txt\0");
         assert_eq!(decode_monitor_line("E 6661696c6564").unwrap_err(), "failed");
         assert!(decode_monitor_line("R 0 ").is_err());
+    }
+
+    #[test]
+    fn monitor_keeps_only_the_newest_complete_update_while_ui_is_idle() {
+        let latest = Mutex::new(None);
+        store_monitor_update(&latest, Ok(vec![(b".".to_vec(), b"first".to_vec())]));
+        store_monitor_update(&latest, Err("temporary error".into()));
+        store_monitor_update(&latest, Ok(vec![(b".".to_vec(), b"last".to_vec())]));
+
+        assert_eq!(take_monitor_update(&latest).unwrap().unwrap()[0].1, b"last");
+        assert!(take_monitor_update(&latest).is_none());
     }
 
     #[cfg(target_os = "linux")]
