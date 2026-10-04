@@ -654,6 +654,11 @@ fn parse_porcelain(root: &std::path::Path, bytes: &[u8]) -> HashMap<PathBuf, Git
                 };
                 let status = if record.get(2..4).is_some_and(|xy| xy.contains(&b'D')) {
                     GitStatus::Deleted
+                } else if record
+                    .get(2..4)
+                    .is_some_and(|xy| xy.contains(&b'A') || xy.contains(&b'C'))
+                {
+                    GitStatus::Added
                 } else {
                     GitStatus::Modified
                 };
@@ -666,6 +671,11 @@ fn parse_porcelain(root: &std::path::Path, bytes: &[u8]) -> HashMap<PathBuf, Git
                 let _original_path = records.next();
                 let status = if record.get(2..4).is_some_and(|xy| xy.contains(&b'D')) {
                     GitStatus::Deleted
+                } else if record
+                    .get(2..4)
+                    .is_some_and(|xy| xy.contains(&b'A') || xy.contains(&b'C'))
+                {
+                    GitStatus::Added
                 } else {
                     GitStatus::Modified
                 };
@@ -697,10 +707,12 @@ mod tests {
         let parsed = parse_porcelain(
             &root,
             b"1 .M N... 100644 100644 100644 abcdef abcdef src/main.rs\0? new file.txt\0\
+              1 A. N... 000000 100644 100644 000000 abcdef staged.txt\0\
               1 .D N... 100644 100644 000000 abcdef 000000 old.txt\0",
         );
         assert_eq!(parsed[&root.join("src/main.rs")], GitStatus::Modified);
         assert_eq!(parsed[&root.join("new file.txt")], GitStatus::Untracked);
+        assert_eq!(parsed[&root.join("staged.txt")], GitStatus::Added);
         assert_eq!(parsed[&root.join("old.txt")], GitStatus::Deleted);
     }
 

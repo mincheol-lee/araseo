@@ -2092,7 +2092,8 @@ export component AppWindow inherits Window {
                                     Text {
                                         text: entry.name;
                                         color: root.adjusted-font-color(
-                                            entry.git-mark == "U" ? #80d8a3 : (entry.git-mark == "M" ? #f0c57e : Chrome.text),
+                                            entry.git-mark == "U" || entry.git-mark == "A" ? #80d8a3
+                                                : (entry.git-mark == "M" ? #f0c57e : Chrome.text),
                                             root.tree-font-brightness,
                                         );
                                         font-family: "Segoe UI";
@@ -2102,9 +2103,9 @@ export component AppWindow inherits Window {
                                         horizontal-stretch: 1;
                                     }
                                     Text {
-                                        text: entry.git-mark;
+                                        text: entry.is-directory ? "" : entry.git-mark;
                                         color: root.adjusted-font-color(
-                                            entry.git-mark == "U" ? #80d8a3 : #f0c57e,
+                                            entry.git-mark == "U" || entry.git-mark == "A" ? #80d8a3 : #f0c57e,
                                             root.tree-font-brightness,
                                         );
                                         font-family: "Segoe UI";
@@ -2333,7 +2334,7 @@ export component AppWindow inherits Window {
                                             }
                                             Text {
                                                 text: entry.status;
-                                                color: entry.status == "U" ? #73c991
+                                                color: entry.status == "U" || entry.status == "A" ? #73c991
                                                     : (entry.status == "D" ? #f14c4c : #e2c08d);
                                                 font-family: "Cascadia Mono";
                                                 font-size: 12px;

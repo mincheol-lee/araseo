@@ -10,6 +10,7 @@ pub enum GitStatus {
     #[default]
     Clean,
     Modified,
+    Added,
     Untracked,
     Deleted,
 }
@@ -352,6 +353,7 @@ pub fn build_tree(
     expanded: &HashSet<PathBuf>,
     statuses: &HashMap<PathBuf, GitStatus>,
 ) -> Result<Vec<FlatNode>> {
+    let directory_statuses = directory_git_statuses(statuses);
     let mut output = Vec::new();
     append_directory(
         workspace,
@@ -359,6 +361,7 @@ pub fn build_tree(
         0,
         expanded,
         statuses,
+        &directory_statuses,
         &mut output,
     )?;
     Ok(output)
@@ -370,7 +373,17 @@ pub fn build_tree_with_folders(
     expanded: &HashSet<PathBuf>,
     statuses: &HashMap<PathBuf, GitStatus>,
 ) -> Result<Vec<FlatNode>> {
-    let mut output = build_tree(primary, expanded, statuses)?;
+    let directory_statuses = directory_git_statuses(statuses);
+    let mut output = Vec::new();
+    append_directory(
+        primary,
+        &primary.host_root,
+        0,
+        expanded,
+        statuses,
+        &directory_statuses,
+        &mut output,
+    )?;
     for workspace in added {
         let root = &workspace.linux_root;
         let is_expanded = expanded.contains(root);
@@ -384,7 +397,7 @@ pub fn build_tree_with_folders(
             depth: 0,
             is_directory: true,
             is_expanded,
-            git_status: statuses.get(root).copied().unwrap_or_default(),
+            git_status: directory_git_status(root, statuses, &directory_statuses),
         });
         if is_expanded {
             append_directory(
@@ -393,11 +406,58 @@ pub fn build_tree_with_folders(
                 1,
                 expanded,
                 statuses,
+                &directory_statuses,
                 &mut output,
             )?;
         }
     }
     Ok(output)
+}
+
+fn directory_git_statuses(statuses: &HashMap<PathBuf, GitStatus>) -> HashMap<PathBuf, GitStatus> {
+    let mut directories = HashMap::new();
+    for (path, status) in statuses {
+        let status = folder_status(*status);
+        if status == GitStatus::Clean {
+            continue;
+        }
+        for ancestor in path.ancestors().skip(1) {
+            directories
+                .entry(ancestor.to_path_buf())
+                .and_modify(|current| *current = merge_folder_status(*current, status))
+                .or_insert(status);
+        }
+    }
+    directories
+}
+
+fn folder_status(status: GitStatus) -> GitStatus {
+    match status {
+        GitStatus::Added | GitStatus::Untracked => GitStatus::Added,
+        GitStatus::Modified | GitStatus::Deleted => GitStatus::Modified,
+        GitStatus::Clean => GitStatus::Clean,
+    }
+}
+
+fn merge_folder_status(current: GitStatus, next: GitStatus) -> GitStatus {
+    if current == GitStatus::Added || next == GitStatus::Added {
+        GitStatus::Added
+    } else if current == GitStatus::Modified || next == GitStatus::Modified {
+        GitStatus::Modified
+    } else {
+        GitStatus::Clean
+    }
+}
+
+fn directory_git_status(
+    path: &Path,
+    statuses: &HashMap<PathBuf, GitStatus>,
+    directories: &HashMap<PathBuf, GitStatus>,
+) -> GitStatus {
+    merge_folder_status(
+        folder_status(statuses.get(path).copied().unwrap_or_default()),
+        directories.get(path).copied().unwrap_or_default(),
+    )
 }
 
 fn append_directory(
@@ -406,6 +466,7 @@ fn append_directory(
     depth: i32,
     expanded: &HashSet<PathBuf>,
     statuses: &HashMap<PathBuf, GitStatus>,
+    directory_statuses: &HashMap<PathBuf, GitStatus>,
     output: &mut Vec<FlatNode>,
 ) -> Result<()> {
     let mut entries = fs::read_dir(directory)?
@@ -437,13 +498,46 @@ fn append_directory(
             depth,
             is_directory,
             is_expanded,
-            git_status: statuses.get(&linux_path).copied().unwrap_or_default(),
+            git_status: if is_directory {
+                directory_git_status(&linux_path, statuses, directory_statuses)
+            } else {
+                statuses.get(&linux_path).copied().unwrap_or_default()
+            },
         });
         if is_expanded {
-            let _ = append_directory(workspace, &host_path, depth + 1, expanded, statuses, output);
+            let _ = append_directory(
+                workspace,
+                &host_path,
+                depth + 1,
+                expanded,
+                statuses,
+                directory_statuses,
+                output,
+            );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod folder_status_tests {
+    use super::*;
+
+    #[test]
+    fn aggregates_nested_git_paths_on_the_host_platform() {
+        let root = PathBuf::from("/workspace");
+        let statuses = HashMap::from([
+            (root.join("changed/file.rs"), GitStatus::Modified),
+            (root.join("mixed/changed.rs"), GitStatus::Deleted),
+            (root.join("mixed/nested/new.rs"), GitStatus::Untracked),
+        ]);
+        let directories = directory_git_statuses(&statuses);
+
+        assert_eq!(directories[&root.join("changed")], GitStatus::Modified);
+        assert_eq!(directories[&root.join("mixed")], GitStatus::Added);
+        assert_eq!(directories[&root.join("mixed/nested")], GitStatus::Added);
+        assert!(!directories.contains_key(&root.join("clean")));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -499,8 +593,8 @@ mod tests {
         let primary = Workspace::new("Ubuntu", primary_root).unwrap();
         let added = Workspace::new("Ubuntu", added_root.clone()).unwrap();
         let expanded = HashSet::from([added_root.clone(), added_root.join("src")]);
-        let nodes =
-            build_tree_with_folders(&primary, &[added], &expanded, &HashMap::new()).unwrap();
+        let statuses = HashMap::from([(added_root.join("src/main.rs"), GitStatus::Untracked)]);
+        let nodes = build_tree_with_folders(&primary, &[added], &expanded, &statuses).unwrap();
         assert_eq!(
             nodes
                 .iter()
@@ -508,6 +602,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("elsewhere", 0), ("src", 1), ("main.rs", 2)]
         );
+        assert_eq!(nodes[0].git_status, GitStatus::Added);
+        assert_eq!(nodes[1].git_status, GitStatus::Added);
+        assert_eq!(nodes[2].git_status, GitStatus::Untracked);
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -534,6 +631,43 @@ mod tests {
         assert_eq!(status("modified.rs"), GitStatus::Modified);
         assert_eq!(status("untracked.rs"), GitStatus::Untracked);
         assert_eq!(status("clean.rs"), GitStatus::Clean);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collapsed_folders_inherit_descendant_changes_with_additions_first() {
+        let root = temporary_directory("folder-status");
+        fs::create_dir_all(root.join("modified/nested")).unwrap();
+        fs::create_dir_all(root.join("mixed/nested")).unwrap();
+        fs::create_dir_all(root.join("clean")).unwrap();
+        fs::write(root.join("modified/nested/changed.rs"), "changed").unwrap();
+        fs::write(root.join("mixed/changed.rs"), "changed").unwrap();
+        fs::write(root.join("mixed/nested/added.rs"), "added").unwrap();
+
+        let workspace = Workspace::new("Ubuntu", root.clone()).unwrap();
+        let statuses = HashMap::from([
+            (root.join("modified/nested/changed.rs"), GitStatus::Modified),
+            (root.join("modified/removed.rs"), GitStatus::Deleted),
+            (root.join("mixed/changed.rs"), GitStatus::Modified),
+            (root.join("mixed/nested/added.rs"), GitStatus::Added),
+        ]);
+        let collapsed = build_tree(&workspace, &HashSet::new(), &statuses).unwrap();
+        let status = |tree: &[FlatNode], name: &str| {
+            tree.iter()
+                .find(|node| node.name == name)
+                .unwrap()
+                .git_status
+        };
+        assert_eq!(status(&collapsed, "modified"), GitStatus::Modified);
+        assert_eq!(status(&collapsed, "mixed"), GitStatus::Added);
+        assert_eq!(status(&collapsed, "clean"), GitStatus::Clean);
+
+        let expanded = HashSet::from([root.join("mixed"), root.join("mixed/nested")]);
+        let visible = build_tree(&workspace, &expanded, &statuses).unwrap();
+        assert_eq!(status(&visible, "nested"), GitStatus::Added);
+        assert_eq!(status(&visible, "changed.rs"), GitStatus::Modified);
+        assert_eq!(status(&visible, "added.rs"), GitStatus::Added);
 
         fs::remove_dir_all(root).unwrap();
     }
