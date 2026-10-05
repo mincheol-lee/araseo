@@ -106,6 +106,57 @@ mod tests {
     }
 
     #[test]
+    fn wsl_process_stop_requires_confirmation_and_blocks_duplicate_requests() {
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        window.set_size(PhysicalSize::new(1200, 800));
+        slint::platform::set_platform(Box::new(TestPlatform {
+            window: window.clone(), clipboard: Rc::new(RefCell::new(String::new())),
+        })).unwrap();
+        let ui = AppWindow::new().unwrap();
+        ui.set_wsl_checks(ModelRc::new(VecModel::from(vec![WslCheckEntry {
+            title: "test worker · PID 42".into(), detail: "10 MiB memory".into(),
+            level: "info".into(), kind: "process".into(), can_stop: true,
+        }])));
+        ui.set_wsl_diagnostics_visible(true);
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let captured = requests.clone();
+        ui.on_wsl_process_termination_requested(move |index, force| captured.borrow_mut().push((index, force)));
+        render(&window);
+        dispatch_click(&ui, 815.0, 228.0);
+        render(&window);
+        assert_eq!(ui.get_wsl_process_selected(), 0);
+        assert!(requests.borrow().is_empty(), "Stop only opens confirmation");
+        write_snapshot_if_requested("wsl-process-confirmation.png", &render(&window));
+        dispatch_click(&ui, 383.0, 594.0);
+        render(&window);
+        assert_eq!(ui.get_wsl_process_selected(), -1);
+        assert!(requests.borrow().is_empty(), "Cancel sends no signal");
+        dispatch_click(&ui, 815.0, 228.0);
+        render(&window);
+        // Confirmation buttons sit directly above the persistent footer.
+        dispatch_click(&ui, 470.0, 594.0);
+        render(&window);
+        assert_eq!(&*requests.borrow(), &[(0, false)]);
+        ui.set_wsl_process_running(true);
+        dispatch_click(&ui, 565.0, 594.0);
+        render(&window);
+        assert_eq!(requests.borrow().len(), 1, "busy buttons cannot issue another signal");
+        ui.set_wsl_process_running(false);
+        dispatch_click(&ui, 565.0, 594.0);
+        render(&window);
+        assert_eq!(&*requests.borrow(), &[(0, false), (0, true)]);
+        dispatch_click(&ui, 815.0, 143.0);
+        render(&window);
+        assert!(!ui.get_wsl_diagnostics_visible());
+        assert_eq!(ui.get_wsl_process_selected(), -1);
+        ui.set_wsl_diagnostics_visible(true);
+        ui.set_wsl_diagnostics_running(true);
+        render(&window);
+        dispatch_click(&ui, 815.0, 228.0);
+        assert_eq!(ui.get_wsl_process_selected(), -1, "refresh disables stale rows");
+    }
+
+    #[test]
     fn mouse_selection_is_visible_to_the_editor_and_control_c_copies_it() {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         window.set_size(PhysicalSize::new(1200, 800));

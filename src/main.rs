@@ -106,7 +106,10 @@ struct AppState {
     git_action_loader: Background<Result<PathBuf>>,
     tree_action_loader: Background<Result<TreeActionResult>>,
     tree_action_pending: bool,
-    wsl_diagnostics_loader: Background<wsl_diagnostics::Report>,
+    wsl_diagnostics_loader: Background<(Workspace, wsl_diagnostics::Report)>,
+    wsl_report: Option<(Workspace, wsl_diagnostics::Report)>,
+    wsl_process_loader: Background<std::io::Result<String>>,
+    wsl_process_pending: bool,
     wsl_docker_usage_loader: Background<std::io::Result<Vec<wsl_diagnostics::DockerUsage>>>,
     editor_views: RefCell<[editor_view::EditorView; 2]>,
     extra_editor_views: RefCell<HashMap<usize, editor_view::EditorView>>,
@@ -309,6 +312,9 @@ fn run() -> Result<()> {
         tree_action_loader: Background::default(),
         tree_action_pending: false,
         wsl_diagnostics_loader: Background::default(),
+        wsl_report: None,
+        wsl_process_loader: Background::default(),
+        wsl_process_pending: false,
         wsl_docker_usage_loader: Background::default(),
         editor_views: RefCell::new(Default::default()),
         extra_editor_views: RefCell::new(HashMap::new()),
@@ -347,12 +353,19 @@ fn run() -> Result<()> {
         let weak = ui.as_weak();
         ui.on_wsl_diagnostics_requested(move || {
             let mut state = state.borrow_mut();
+            if state.wsl_process_pending { return; }
+            state.wsl_report = None;
             state.wsl_docker_usage_loader.cancel();
             let workspace = state.workspace.clone();
             state
                 .wsl_diagnostics_loader
-                .request(move || wsl_diagnostics::collect(&workspace));
+                .request(move || {
+                    let report = wsl_diagnostics::collect(&workspace);
+                    (workspace, report)
+                });
             if let Some(ui) = weak.upgrade() {
+                ui.set_wsl_process_selected(-1);
+                ui.set_wsl_process_message("".into());
                 ui.set_wsl_diagnostics_running(true);
                 ui.set_wsl_docker_usage_visible(false);
                 ui.set_wsl_docker_usage_available(false);
@@ -379,6 +392,27 @@ fn run() -> Result<()> {
                 .request(move || wsl_diagnostics::collect_docker_usage(&workspace));
             ui.set_wsl_docker_usage_running(true);
             ui.set_wsl_docker_usage_error("".into());
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = ui.as_weak();
+        ui.on_wsl_process_termination_requested(move |index, force| {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut state = state.borrow_mut();
+            if state.wsl_process_pending || ui.get_wsl_diagnostics_running() { return; }
+            let Some((workspace, report)) = &state.wsl_report else { return };
+            let Some(target) = usize::try_from(index).ok()
+                .and_then(|index| report.checks.get(index))
+                .and_then(|check| check.process.clone()) else { return };
+            let workspace = workspace.clone();
+            state.wsl_process_pending = true;
+            state.wsl_process_loader.request(move || {
+                wsl_diagnostics::terminate_process(&workspace, &target, force)
+            });
+            ui.set_wsl_process_running(true);
+            ui.set_wsl_process_selected(-1);
+            ui.set_wsl_process_message("Stopping process...".into());
         });
     }
     let window_activity = Rc::new(WindowActivity::default());
@@ -1391,7 +1425,7 @@ fn run() -> Result<()> {
             let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
             poll_io(&ui, &mut state);
-            if let Some(report) = state.wsl_diagnostics_loader.poll() {
+            if let Some((workspace, report)) = state.wsl_diagnostics_loader.poll() {
                 let entries = report
                     .checks
                     .iter()
@@ -1400,12 +1434,31 @@ fn run() -> Result<()> {
                         level: check.level.as_str().into(),
                         detail: check.detail.clone().into(),
                         kind: check.kind.into(),
+                        can_stop: check.process.is_some(),
                     })
                     .collect::<Vec<_>>();
                 ui.set_wsl_checks(ModelRc::new(VecModel::from(entries)));
                 ui.set_wsl_report_text(report.copy_text().into());
                 ui.set_wsl_docker_usage_available(report.docker_usage_available);
                 ui.set_wsl_diagnostics_running(false);
+                state.wsl_report = Some((workspace, report));
+            }
+            if let Some(result) = state.wsl_process_loader.poll() {
+                state.wsl_process_pending = false;
+                ui.set_wsl_process_running(false);
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) => format!("Could not stop process: {error}"),
+                };
+                diagnostics_log::event(&format!("WSL process termination: {message}"));
+                ui.set_wsl_process_message(message.into());
+                state.wsl_report = None;
+                let workspace = state.workspace.clone();
+                state.wsl_diagnostics_loader.request(move || {
+                    let report = wsl_diagnostics::collect(&workspace);
+                    (workspace, report)
+                });
+                ui.set_wsl_diagnostics_running(true);
             }
             if let Some(result) = state.wsl_docker_usage_loader.poll() {
                 ui.set_wsl_docker_usage_running(false);
@@ -3199,6 +3252,11 @@ fn poll_io(ui: &AppWindow, state: &mut AppState) {
         ui.set_wsl_diagnostics_running(false);
         state.status = error;
         changed = true;
+    }
+    if let Some(error) = state.wsl_process_loader.take_error() {
+        state.wsl_process_pending = false;
+        ui.set_wsl_process_running(false);
+        ui.set_wsl_process_message(error.into());
     }
     if let Some(error) = state.wsl_docker_usage_loader.take_error() {
         ui.set_wsl_docker_usage_running(false);
