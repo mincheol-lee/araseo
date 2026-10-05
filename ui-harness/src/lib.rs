@@ -26,6 +26,10 @@ mod editor_view;
 mod shortcuts;
 
 #[cfg(test)]
+#[path = "../../src/window_resize.rs"]
+mod window_resize;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use i_slint_core::input::{InternalKeyEvent, KeyEvent as InternalKeyEventData, KeyEventType};
@@ -103,6 +107,108 @@ mod tests {
         fn clipboard_text(&self, clipboard: Clipboard) -> Option<String> {
             (clipboard == Clipboard::DefaultClipboard).then(|| self.clipboard.borrow().clone())
         }
+    }
+
+    #[test]
+    fn final_resize_repaint_is_coalesced_and_stops_when_idle_or_minimized() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        struct ClockPlatform {
+            window: Rc<MinimalSoftwareWindow>,
+            clock: Rc<Cell<Duration>>,
+        }
+        impl Platform for ClockPlatform {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> { Ok(self.window.clone()) }
+            fn duration_since_start(&self) -> Duration { self.clock.get() }
+        }
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        slint::platform::set_platform(Box::new(ClockPlatform {
+            window: MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer), clock: clock.clone(),
+        })).unwrap();
+        let refresh = window_resize::ResizeRefresh::default();
+        let paints = Rc::new(Cell::new(0));
+        let captured = paints.clone();
+        refresh.request(move || captured.set(captured.get() + 1));
+        assert_eq!(paints.get(), 1);
+        clock.set(Duration::from_millis(30));
+        slint::platform::update_timers_and_animations();
+        let captured = paints.clone();
+        refresh.request(move || captured.set(captured.get() + 1));
+        assert_eq!(paints.get(), 2);
+        clock.set(Duration::from_millis(60));
+        slint::platform::update_timers_and_animations();
+        assert_eq!(paints.get(), 2, "intermediate completion must be cancelled");
+        clock.set(Duration::from_millis(81));
+        slint::platform::update_timers_and_animations();
+        assert_eq!(paints.get(), 3, "one final repaint after sizing settles");
+        clock.set(Duration::from_millis(1000));
+        slint::platform::update_timers_and_animations();
+        assert_eq!(paints.get(), 3, "no idle repaint loop");
+        let captured = paints.clone();
+        refresh.request(move || captured.set(captured.get() + 1));
+        refresh.cancel();
+        clock.set(Duration::from_millis(2000));
+        slint::platform::update_timers_and_animations();
+        assert_eq!(paints.get(), 4, "minimized windows cancel the delayed frame");
+    }
+
+    #[test]
+    fn resizing_reused_surfaces_repaints_without_input_or_model_changes() {
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+        window.set_size(PhysicalSize::new(1200, 800));
+        slint::platform::set_platform(Box::new(TestPlatform {
+            window: window.clone(), clipboard: Rc::new(RefCell::new(String::new())),
+        })).unwrap();
+        let ui = AppWindow::new().unwrap();
+        ui.set_primary_active_kind("terminal".into());
+        let poison = TestPixel { red: 255, green: 0, blue: 255 };
+        for mode in [RepaintBufferType::ReusedBuffer, RepaintBufferType::SwappedBuffers] {
+            window.request_redraw();
+            window.draw_if_needed(|renderer| renderer.set_repaint_buffer_type(mode));
+            let mut initial = vec![poison; 1200 * 800];
+            window.request_redraw();
+            window.draw_if_needed(|renderer| { renderer.render(&mut initial, 1200); });
+            let large_columns = ui.get_terminal_columns();
+            let large_rows = ui.get_terminal_rows();
+            window.set_size(PhysicalSize::new(800, 560));
+            let mut small = vec![poison; 800 * 560];
+            assert!(window.draw_if_needed(|renderer| { renderer.render(&mut small, 800); }));
+            assert!(ui.get_terminal_columns() < large_columns);
+            assert!(ui.get_terminal_rows() < large_rows);
+            // Back to the old size, with a surface whose previous pixels were lost.
+            window.set_size(PhysicalSize::new(1200, 800));
+            let mut buffers = [vec![poison; 1200 * 800], vec![poison; 1200 * 800]];
+            for buffer in &mut buffers {
+                window.request_redraw();
+                window.draw_if_needed(|renderer| { renderer.render(buffer, 1200); });
+                // ReusedBuffer retains one buffer, SwappedBuffers retains two.
+                if mode == RepaintBufferType::ReusedBuffer { break; }
+            }
+            assert_eq!(ui.get_terminal_columns(), large_columns);
+            assert_eq!(ui.get_terminal_rows(), large_rows);
+            window.request_redraw();
+            window.draw_if_needed(|renderer| {
+                let region = renderer.render(&mut buffers[0], 1200);
+                assert_eq!(region.bounding_box_size(), PhysicalSize::new(0, 0), "settled frames must retain partial rendering");
+            });
+            window.request_redraw();
+            window.draw_if_needed(|renderer| renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer));
+            let expected = render(&window);
+            assert!(buffers[0] == expected, "resized surface must match a fresh full repaint: {mode:?}");
+            if mode == RepaintBufferType::SwappedBuffers {
+                assert!(buffers[1] == expected, "both swapped buffers must be repaired");
+            }
+            // A-B-A before any frame must still invalidate the old surface.
+            window.request_redraw();
+            window.draw_if_needed(|renderer| renderer.set_repaint_buffer_type(mode));
+            render(&window);
+            window.set_size(PhysicalSize::new(800, 560));
+            window.set_size(PhysicalSize::new(1200, 800));
+            let mut restored = vec![poison; 1200 * 800];
+            assert!(window.draw_if_needed(|renderer| { renderer.render(&mut restored, 1200); }), "resize must request its own redraw");
+            assert!(restored == expected, "coalesced resize must repaint at the final size");
+        }
+        drop(ui);
     }
 
     #[test]

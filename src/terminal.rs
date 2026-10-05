@@ -47,44 +47,53 @@ fn agent_shell_command(status_path: &str) -> String {
 struct ResizeDebouncer {
     requested: Option<(u16, u16)>,
     stable_polls: u8,
+    waiting_polls: u8,
 }
 
 #[cfg(any(target_os = "windows", test))]
 impl ResizeDebouncer {
     fn observe(&mut self, rows: u16, columns: u16) -> bool {
         let requested = (rows, columns);
+        self.waiting_polls = self.waiting_polls.saturating_add(1);
         if self.requested != Some(requested) {
             self.requested = Some(requested);
             self.stable_polls = 0;
-            return false;
+            return self.waiting_polls >= 4;
         }
         self.stable_polls = self.stable_polls.saturating_add(1);
-        self.stable_polls >= 2
+        self.stable_polls >= 2 || self.waiting_polls >= 4
     }
 
     fn retry_later(&mut self) {
         self.stable_polls = 0;
+        self.waiting_polls = 0;
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 struct WindowsPtyResize {
     request_sender: mpsc::SyncSender<(u16, u16)>,
     result_receiver: mpsc::Receiver<((u16, u16), bool)>,
     in_flight: Option<(u16, u16)>,
+    applied: (u16, u16),
     debouncer: ResizeDebouncer,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 impl WindowsPtyResize {
+    #[cfg(target_os = "windows")]
     fn new(distro: String, tty_path_file: String) -> std::io::Result<Self> {
+        Self::start(move |rows, columns| resize_windows_pty(&distro, &tty_path_file, rows, columns))
+    }
+
+    fn start(mut resize: impl FnMut(u16, u16) -> bool + Send + 'static) -> std::io::Result<Self> {
         let (request_sender, request_receiver) = mpsc::sync_channel(1);
         let (result_sender, result_receiver) = mpsc::channel();
         thread::Builder::new()
             .name("araseo-resize".into())
             .spawn(move || {
                 while let Ok(size @ (rows, columns)) = request_receiver.recv() {
-                    let resized = resize_windows_pty(&distro, &tty_path_file, rows, columns);
+                    let resized = resize(rows, columns);
                     if result_sender.send((size, resized)).is_err() {
                         break;
                     }
@@ -95,30 +104,38 @@ impl WindowsPtyResize {
             request_sender,
             result_receiver,
             in_flight: None,
+            applied: (24, 80),
             debouncer: ResizeDebouncer::default(),
         })
     }
 
-    fn apply(&mut self, rows: u16, columns: u16) -> Option<(u16, u16)> {
+    fn apply(&mut self, rows: u16, columns: u16) {
+        // Always drain completions, including when the local grid has already
+        // returned to its original size during an in-flight WSL request.
         if let Ok((completed, resized)) = self.result_receiver.try_recv() {
             self.in_flight = None;
             if resized {
-                return Some(completed);
+                self.applied = completed;
+            } else {
+                self.debouncer.retry_later();
             }
-            self.debouncer.retry_later();
         }
-
-        if self.in_flight.is_some() || !self.debouncer.observe(rows, columns) {
-            return None;
+        let ready = self.debouncer.observe(rows, columns);
+        if self.in_flight.is_some() {
+            return;
         }
-
         let requested = (rows, columns);
+        if self.applied == requested {
+            self.debouncer = ResizeDebouncer::default();
+            return;
+        }
+        if !ready {
+            return;
+        }
         if self.request_sender.try_send(requested).is_ok() {
             self.in_flight = Some(requested);
-        } else {
-            self.debouncer.retry_later();
         }
-        None
+        self.debouncer.retry_later();
     }
 }
 
@@ -590,15 +607,12 @@ impl TerminalSession {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
+        #[cfg(target_os = "windows")]
+        self.windows_resize.apply(rows, cols);
+
         if self.parser.screen().size() == (rows, cols) {
             return false;
         }
-
-        #[cfg(target_os = "windows")]
-        let Some((rows, cols)) = self.windows_resize.apply(rows, cols) else {
-            return false;
-        };
-
         #[cfg(not(target_os = "windows"))]
         let _ = self.master.resize(PtySize {
             rows,
@@ -606,6 +620,8 @@ impl TerminalSession {
             pixel_width: 0,
             pixel_height: 0,
         });
+        // The view uses the new grid immediately; the background WSL resize
+        // independently notifies the foreground TUI to redraw at that size.
         self.parser.screen_mut().set_size(rows, cols);
         true
     }
@@ -1445,12 +1461,119 @@ mod tests {
     }
 
     #[test]
+    fn continuous_resize_has_a_bounded_wait() {
+        let mut debouncer = ResizeDebouncer::default();
+        assert!(!debouncer.observe(25, 90));
+        assert!(!debouncer.observe(26, 100));
+        assert!(!debouncer.observe(27, 110));
+        assert!(
+            debouncer.observe(28, 120),
+            "continuous dragging must not postpone SIGWINCH indefinitely"
+        );
+    }
+
+    #[test]
+    fn in_flight_resize_returns_to_original_size_and_coalesces_intermediate_sizes() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let mut resize = WindowsPtyResize::start(move |rows, columns| {
+            seen_tx.send((rows, columns)).unwrap();
+            finish_rx.recv().unwrap()
+        })
+        .unwrap();
+        for _ in 0..3 {
+            resize.apply(40, 120);
+        }
+        assert_eq!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            (40, 120)
+        );
+        resize.apply(50, 140);
+        for _ in 0..3 {
+            resize.apply(24, 80);
+        }
+        assert!(
+            seen_rx.try_recv().is_err(),
+            "only one WSL request may be in flight"
+        );
+        finish_tx.send(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            resize.apply(24, 80);
+            if let Ok(size) = seen_rx.try_recv() {
+                assert_eq!(size, (24, 80));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "original size was never restored"
+            );
+            thread::yield_now();
+        }
+        finish_tx.send(true).unwrap();
+        while resize.in_flight.is_some() {
+            resize.apply(24, 80);
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        for _ in 0..10 {
+            resize.apply(24, 80);
+        }
+        assert!(
+            seen_rx.try_recv().is_err(),
+            "an unchanged terminal must not spawn more WSL work"
+        );
+        assert_eq!(resize.applied, (24, 80));
+    }
+
+    #[test]
+    fn failed_resize_retries_the_latest_size() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let mut resize = WindowsPtyResize::start(move |rows, columns| {
+            seen_tx.send((rows, columns)).unwrap();
+            finish_rx.recv().unwrap()
+        })
+        .unwrap();
+        for _ in 0..3 {
+            resize.apply(40, 120);
+        }
+        assert_eq!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            (40, 120)
+        );
+        finish_tx.send(false).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            resize.apply(50, 140);
+            if let Ok(size) = seen_rx.try_recv() {
+                assert_eq!(size, (50, 140));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        finish_tx.send(true).unwrap();
+        while resize.in_flight.is_some() {
+            resize.apply(50, 140);
+            thread::yield_now();
+            assert!(std::time::Instant::now() < deadline);
+        }
+        assert_eq!(resize.applied, (50, 140));
+    }
+
+    #[test]
     fn waits_for_a_stable_terminal_size_before_resizing() {
         let mut debouncer = ResizeDebouncer::default();
 
         assert!(!debouncer.observe(40, 120));
         assert!(!debouncer.observe(40, 120));
         assert!(debouncer.observe(40, 120));
+        debouncer.retry_later(); // The ready size has been dispatched.
 
         assert!(!debouncer.observe(50, 160));
         assert!(!debouncer.observe(50, 160));
