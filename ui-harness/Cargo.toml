@@ -10,6 +10,9 @@ i-slint-core = "1.17"
 slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "renderer-software"] }
 swash = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+slint = { version = "1.17", default-features = false, features = ["backend-winit", "unstable-winit-030"] }
+
 [build-dependencies]
 slint-build = "1.17"
 
@@ -19,3 +22,6 @@ slint-build = "1.17"
 # fully offline in the WSL development environment.
 i-slint-backend-testing = { path = "vendor/i-slint-backend-testing" }
 i-slint-renderer-software = { path = "../vendor/i-slint-renderer-software" }
+
+# Keep Windows resize presentation consistent with the native client surface.
+i-slint-backend-winit = { path = "../vendor/i-slint-backend-winit" }

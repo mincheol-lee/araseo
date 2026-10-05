@@ -21,6 +21,7 @@ mod terminal;
 mod terminal_input;
 mod tree;
 mod window_activity;
+mod window_resize;
 mod workspace;
 mod workspace_history;
 mod wsl_diagnostics;
@@ -2274,6 +2275,7 @@ fn install_window_events(
     let weak = ui.as_weak();
     let mut modifiers = winit::keyboard::ModifiersState::default();
     let mut last_input = Instant::now();
+    let resize_refresh = window_resize::ResizeRefresh::default();
     ui.window().on_winit_window_event(move |window, event| {
         let input = matches!(
             event,
@@ -2297,6 +2299,15 @@ fn install_window_events(
             last_input = now;
         }
         match event {
+            winit::event::WindowEvent::Resized(size) if size.width == 0 || size.height == 0 => {
+                resize_refresh.cancel();
+            }
+            winit::event::WindowEvent::Resized(_) | winit::event::WindowEvent::ScaleFactorChanged { .. } => {
+                let weak = weak.clone();
+                resize_refresh.request(move || {
+                    if let Some(ui) = weak.upgrade() { ui.window().request_redraw(); }
+                });
+            }
             winit::event::WindowEvent::ModifiersChanged(changed) => {
                 modifiers = changed.state();
             }

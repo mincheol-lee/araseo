@@ -160,6 +160,19 @@ for the Windows target. From WSL, this requires the
 ./scripts/verify --windows
 ```
 
+For native Windows resize verification, build the production UI fixture:
+
+```bash
+cargo build --locked --manifest-path ui-harness/Cargo.toml --example windows_resize --target x86_64-pc-windows-gnu
+```
+
+Run `scripts/test-windows-resize.ps1` in Windows PowerShell with `-Executable`
+pointing to that fixture and `-OutputDirectory` for its PNG captures. Copy the
+fixture to a Windows local folder first when building from WSL. The test uses
+its own disposable window and compares native client pixels after resizing,
+maximizing, minimizing and a native surface-loss repaint. Blank captures fail.
+It never closes an existing Araseo window.
+
 Pushing a `v`-prefixed tag matching the version in `Cargo.toml` runs the
 release workflow: it verifies Linux and Windows targets, builds the Windows
 executable, and publishes the GitHub Release assets. A suffix such as

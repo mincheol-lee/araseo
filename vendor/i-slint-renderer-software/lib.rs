@@ -437,6 +437,7 @@ impl<'a, T: TargetPixel> target_pixel_buffer::TargetPixelBuffer for TargetPixelS
 ///     in one single buffer
 pub struct SoftwareRenderer {
     repaint_buffer_type: Cell<RepaintBufferType>,
+    last_surface_size: Cell<Option<i_slint_core::api::PhysicalSize>>,
     /// This is the area which was dirty on the previous frame.
     /// Only used if repaint_buffer_type == RepaintBufferType::SwappedBuffers
     prev_frame_dirty: Cell<DirtyRegion>,
@@ -457,6 +458,7 @@ impl Default for SoftwareRenderer {
             rotation: Default::default(),
             rendering_metrics_collector: RenderingMetricsCollector::new("software"),
             repaint_buffer_type: Default::default(),
+            last_surface_size: Default::default(),
             #[cfg(feature = "systemfonts")]
             text_layout_cache: Default::default(),
         }
@@ -1168,6 +1170,24 @@ impl RendererSealed for SoftwareRenderer {
         #[cfg(feature = "systemfonts")]
         self.text_layout_cache.component_destroyed(_component);
         self.partial_rendering_state.free_graphics_resources(items);
+        Ok(())
+    }
+
+    fn resize(&self, size: i_slint_core::api::PhysicalSize) -> Result<(), PlatformError> {
+        if size.width == 0 || size.height == 0 {
+            self.last_surface_size.set(None);
+            return Ok(());
+        }
+        if self.last_surface_size.replace(Some(size)) != Some(size) {
+            // A native resized surface can lose pixels while reporting a reused
+            // buffer. Invalidate on the event, including A-B-A before a frame.
+            self.partial_rendering_state.clear_cache();
+            self.partial_rendering_state.force_screen_refresh();
+            self.prev_frame_dirty.set(Default::default());
+            if let Some(window) = self.window_adapter() {
+                window.request_redraw();
+            }
+        }
         Ok(())
     }
 
