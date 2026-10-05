@@ -30,7 +30,7 @@ impl Dock {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Axis {
     Horizontal,
     Vertical,
@@ -58,7 +58,7 @@ pub struct Divider {
     pub parent: Rect,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Node {
     Leaf(GroupId),
     Split {
@@ -194,7 +194,7 @@ impl Node {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TabGroups {
     placements: Vec<(TabId, GroupId)>,
     active: Vec<Option<TabId>>,
@@ -218,6 +218,73 @@ impl Default for TabGroups {
 }
 
 impl TabGroups {
+    /// Reject malformed saved layouts before any indexing or pruning occurs.
+    pub fn restore(
+        mut saved: Self,
+        saved_ids: &[TabId],
+        available: &std::collections::HashSet<TabId>,
+    ) -> Option<Self> {
+        let mut leaves = std::collections::HashSet::new();
+        let mut splits = std::collections::HashSet::new();
+        fn visit(
+            node: &Node,
+            leaves: &mut std::collections::HashSet<GroupId>,
+            splits: &mut std::collections::HashSet<usize>,
+        ) -> bool {
+            match node {
+                Node::Leaf(group) => leaves.insert(*group),
+                Node::Split {
+                    id,
+                    ratio,
+                    first,
+                    second,
+                    ..
+                } => {
+                    (100..=900).contains(ratio)
+                        && splits.insert(*id)
+                        && visit(first, leaves, splits)
+                        && visit(second, leaves, splits)
+                }
+            }
+        }
+        if saved.placements.len() > 128
+            || saved.active.len() > 4096
+            || !visit(&saved.root, &mut leaves, &mut splits)
+            || leaves.len() > 128
+            || !leaves.contains(&saved.focused_group)
+            || leaves.iter().any(|group| *group >= saved.active.len())
+            || leaves.iter().any(|group| *group >= saved.next_group)
+            || splits.iter().any(|split| *split >= saved.next_split)
+            || saved.next_group > saved.active.len()
+            || saved.placements.len() != saved_ids.len()
+        {
+            return None;
+        }
+        let mut ids = std::collections::HashSet::new();
+        if saved
+            .placements
+            .iter()
+            .any(|(id, group)| !ids.insert(*id) || !leaves.contains(group))
+            || ids != saved_ids.iter().copied().collect()
+            || leaves.iter().any(|group| {
+                let group_ids = saved.group_ids(*group);
+                group_ids.is_empty()
+                    || !saved.active[*group].is_some_and(|id| group_ids.contains(&id))
+            })
+        {
+            return None;
+        }
+        for id in saved_ids {
+            if !available.contains(id) {
+                saved.remove(*id);
+            }
+        }
+        if saved.placements.is_empty() {
+            return None;
+        }
+        Some(saved)
+    }
+
     pub fn add(&mut self, id: TabId, group: GroupId) {
         let group = if self.root.has(group) {
             group
@@ -480,5 +547,41 @@ mod tests {
         );
         let right_top = panes.iter().find(|(group, _)| *group == 1).unwrap().1;
         assert!((right_top.height - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn restores_nested_layout_and_prunes_missing_tabs() {
+        let mut tabs = TabGroups::default();
+        tabs.add(1, 0);
+        tabs.add(2, 0);
+        tabs.add(3, 0);
+        assert!(tabs.dock_into(2, 0, Dock::Right));
+        assert!(tabs.dock_into(3, 1, Dock::Bottom));
+        let vertical = tabs
+            .layout()
+            .1
+            .into_iter()
+            .find(|d| d.axis == Axis::Vertical)
+            .unwrap();
+        tabs.set_split_ratio(vertical.id, 700);
+        let restored = TabGroups::restore(tabs.clone(), &[1, 2, 3], &[1, 2, 3].into()).unwrap();
+        assert_eq!(restored, tabs);
+        let pruned = TabGroups::restore(tabs, &[1, 2, 3], &[1, 3].into()).unwrap();
+        assert_eq!(pruned.group_of(2), None);
+        assert_eq!(pruned.groups().len(), 2);
+        assert_eq!(pruned.active(pruned.focused_group()), Some(3));
+    }
+
+    #[test]
+    fn rejects_invalid_saved_layout() {
+        let mut tabs = TabGroups::default();
+        tabs.add(1, 0);
+        tabs.active[0] = Some(99);
+        assert!(TabGroups::restore(tabs, &[1], &[1].into()).is_none());
+
+        let mut tabs = TabGroups::default();
+        tabs.add(1, 0);
+        tabs.next_group = 0;
+        assert!(TabGroups::restore(tabs, &[1], &[1].into()).is_none());
     }
 }

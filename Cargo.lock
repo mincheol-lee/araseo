@@ -150,6 +150,8 @@ dependencies = [
  "hayro",
  "portable-pty",
  "pulldown-cmark",
+ "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "swash",

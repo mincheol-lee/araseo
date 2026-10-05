@@ -33,3 +33,5 @@ pub mod window_activity;
 pub mod appearance;
 #[path = "../../src/workspace_history.rs"]
 pub mod workspace_history;
+#[path = "../../src/session.rs"]
+pub mod session;
