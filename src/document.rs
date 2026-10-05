@@ -26,6 +26,7 @@ pub struct Document {
     pub line_ending: LineEnding,
     pub dirty: bool,
     pub disk_revision: DiskRevision,
+    edit_version: u64,
     undo_stack: Vec<TextChange>,
     redo_stack: Vec<TextChange>,
 }
@@ -70,6 +71,7 @@ impl Document {
             line_ending,
             dirty: false,
             disk_revision: revision_from(&metadata),
+            edit_version: 0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         })
@@ -77,6 +79,7 @@ impl Document {
 
     pub fn set_text(&mut self, text: String) {
         if self.text != text {
+            self.edit_version = self.edit_version.wrapping_add(1);
             self.undo_stack.push(text_change(&self.text, &text));
             if self.undo_stack.len() > 1_000 {
                 self.undo_stack.remove(0);
@@ -92,9 +95,13 @@ impl Document {
             return None;
         };
         let end = change.start + change.inserted.len();
-        if end > self.text.len() || !self.text.is_char_boundary(change.start) || !self.text.is_char_boundary(end) {
+        if end > self.text.len()
+            || !self.text.is_char_boundary(change.start)
+            || !self.text.is_char_boundary(end)
+        {
             return None;
         }
+        self.edit_version = self.edit_version.wrapping_add(1);
         self.text.replace_range(change.start..end, &change.removed);
         self.dirty = self.text != self.saved_text;
         let cursor = change.start + change.removed.len();
@@ -107,14 +114,51 @@ impl Document {
             return None;
         };
         let end = change.start + change.removed.len();
-        if end > self.text.len() || !self.text.is_char_boundary(change.start) || !self.text.is_char_boundary(end) {
+        if end > self.text.len()
+            || !self.text.is_char_boundary(change.start)
+            || !self.text.is_char_boundary(end)
+        {
             return None;
         }
+        self.edit_version = self.edit_version.wrapping_add(1);
         self.text.replace_range(change.start..end, &change.inserted);
         self.dirty = self.text != self.saved_text;
         let cursor = change.start + change.inserted.len();
         self.undo_stack.push(change);
         Some(cursor)
+    }
+
+    pub fn edit_version(&self) -> u64 {
+        self.edit_version
+    }
+
+    /// Copy only the state needed by a save, without duplicating undo history.
+    pub fn save_snapshot(&self) -> Self {
+        Self {
+            linux_path: self.linux_path.clone(),
+            host_path: self.host_path.clone(),
+            text: self.text.clone(),
+            saved_text: self.saved_text.clone(),
+            line_ending: self.line_ending,
+            dirty: self.dirty,
+            disk_revision: self.disk_revision.clone(),
+            edit_version: self.edit_version,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
+    }
+
+    /// Replacing the buffer must invalidate every outstanding UI/worker version.
+    pub fn accept_reloaded(&mut self, mut loaded: Self) {
+        loaded.edit_version = self.edit_version.wrapping_add(1);
+        *self = loaded;
+    }
+
+    /// A save can complete after more typing. Keep those edits and their undo history.
+    pub fn accept_saved(&mut self, saved: &Self) {
+        self.saved_text.clone_from(&saved.saved_text);
+        self.disk_revision = saved.disk_revision.clone();
+        self.dirty = self.text != self.saved_text;
     }
 
     pub fn changed_on_disk(&self) -> bool {
@@ -295,10 +339,16 @@ mod tests {
         let mut document = Document::open(PathBuf::from("/sample.txt"), path.clone()).unwrap();
         fs::write(&path, "after external edit").unwrap();
 
-        assert_eq!(document.refresh_from_disk().unwrap(), ExternalRefresh::Reloaded);
+        assert_eq!(
+            document.refresh_from_disk().unwrap(),
+            ExternalRefresh::Reloaded
+        );
         assert_eq!(document.text, "after external edit");
         assert!(!document.dirty);
-        assert_eq!(document.refresh_from_disk().unwrap(), ExternalRefresh::Unchanged);
+        assert_eq!(
+            document.refresh_from_disk().unwrap(),
+            ExternalRefresh::Unchanged
+        );
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -317,7 +367,10 @@ mod tests {
         document.set_text("unsaved editor text".into());
         fs::write(&path, "external edit").unwrap();
 
-        assert_eq!(document.refresh_from_disk().unwrap(), ExternalRefresh::Conflict);
+        assert_eq!(
+            document.refresh_from_disk().unwrap(),
+            ExternalRefresh::Conflict
+        );
         assert_eq!(document.text, "unsaved editor text");
         assert!(document.dirty);
         fs::remove_dir_all(&directory).unwrap();
@@ -382,10 +435,8 @@ mod tests {
 
     #[test]
     fn separate_documents_never_share_undo_history() {
-        let directory = std::env::temp_dir().join(format!(
-            "araseo-document-tabs-test-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("araseo-document-tabs-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir(&directory).unwrap();
         let first_path = directory.join("first.txt");

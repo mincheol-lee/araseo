@@ -54,6 +54,10 @@ jobs:
           Copy-Item dist/araseo.exe, scripts/araseo, scripts/install.sh, README.md, INSTALL.md, LICENSE -Destination $archive
           Copy-Item dist/araseo.exe, scripts/araseo, scripts/install.sh -Destination $stage
           Compress-Archive -Path "$archive/*" -DestinationPath "$stage/araseo-windows-x86_64.zip"
+          $symbols = Join-Path $PWD "release-symbols"
+          New-Item -ItemType Directory -Force -Path $symbols | Out-Null
+          Copy-Item dist/araseo.pdb, dist/build-info.txt -Destination $symbols
+          Compress-Archive -Path "$symbols/*" -DestinationPath "$stage/araseo-windows-symbols.zip"
           Push-Location $stage
           $hashLines = Get-ChildItem -File | Where-Object Name -ne SHA256SUMS | ForEach-Object {
             $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()

@@ -4,6 +4,7 @@ mod appearance;
 mod background;
 mod diagnostics_log;
 mod document;
+mod document_io;
 mod editor_view;
 mod emoji;
 #[cfg(windows)]
@@ -12,10 +13,12 @@ mod git;
 mod highlight;
 mod markdown_preview;
 mod preview;
+mod process_job;
 mod session;
 mod shortcuts;
 mod tabs;
 mod terminal;
+mod terminal_input;
 mod tree;
 mod window_activity;
 mod workspace;
@@ -24,13 +27,14 @@ mod wsl_diagnostics;
 
 use anyhow::{Context, Result, bail};
 use background::Background;
-use document::{Document, ExternalRefresh};
+use document::Document;
+use document_io::{Operation as DocumentOperation, Outcome as DocumentOutcome};
 use preview::{LoadedPreview, PdfTextPage, PreviewKind, RenderedPage};
 use session::{SavedKind, SavedTab, Session};
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -51,9 +55,14 @@ struct AppState {
     session_path: Option<PathBuf>,
     saved_session: Option<Session>,
     session_loader: Background<Vec<(SavedTab, Result<RestoredContent>)>>,
-    startup_loaded: bool,
+    manifest_loader: Background<Option<Session>>,
+    session_manifest_pending: bool,
+    restore_pending: VecDeque<SavedTab>,
+    restoring_files: HashMap<PathBuf, TabId>,
+    restore_in_flight: bool,
+    closing: bool,
+    initial_file: Option<PathBuf>,
     session_restore_incomplete: bool,
-    session_restore_interacted: bool,
     expanded: HashSet<PathBuf>,
     expanded_git_repositories: HashSet<PathBuf>,
     statuses: HashMap<PathBuf, GitStatus>,
@@ -61,6 +70,18 @@ struct AppState {
     tree: Vec<FlatNode>,
     tabs: Vec<WorkspaceTab>,
     tab_groups: TabGroups,
+    doc_io_loader: Background<DocumentOutcome>,
+    doc_io_in_flight: bool,
+    pending_doc_io: VecDeque<(TabId, DocumentOperation, u64)>,
+    refresh_loader: Background<Vec<(document_io::Probe, Result<Option<Document>, String>)>>,
+    refresh_in_flight: bool,
+    refresh_requested: bool,
+    terminal_loader: Background<(usize, PathBuf, Result<TerminalSession>)>,
+    terminal_in_flight: bool,
+    pending_terminals: VecDeque<(usize, PathBuf)>,
+    git_status_loader: Background<HashMap<PathBuf, GitStatus>>,
+    terminal_dirty: HashSet<TabId>,
+    diff_cache: RefCell<HashMap<TabId, (i32, ModelRc<DiffRow>)>>,
     next_tab_id: TabId,
     next_terminal_number: u32,
     git_monitor: Option<git::StatusMonitor>,
@@ -76,7 +97,11 @@ struct AppState {
     file_loader: Background<Result<(OpenedFile, usize)>>,
     page_loader: Background<Result<(TabId, usize, i32, f32, RenderedPage)>>,
     markdown_source_tabs: HashSet<TabId>,
-    markdown_preview_cache: RefCell<HashMap<TabId, (String, ModelRc<PreviewBlock>)>>,
+    markdown_preview_cache: RefCell<HashMap<TabId, (u64, ModelRc<PreviewBlock>)>>,
+    markdown_pending: RefCell<HashMap<TabId, (u64, String)>>,
+    markdown_requested: RefCell<HashMap<TabId, u64>>,
+    markdown_loader: Background<Vec<(TabId, u64, Vec<markdown_preview::Block>)>>,
+    markdown_in_flight: bool,
     diff_loader: Background<Result<(git::FileDiff, usize)>>,
     git_action_loader: Background<Result<PathBuf>>,
     tree_action_loader: Background<Result<TreeActionResult>>,
@@ -132,7 +157,23 @@ enum TabContent {
 
 enum OpenedFile {
     Text(Document),
-    Preview(LoadedPreview),
+    Preview(PreparedPreview),
+}
+
+// SharedPixelBuffer is transferable; allocate/copy full-resolution pixels on
+// the worker. Construct the UI-only Image after ownership reaches the event loop.
+struct PreparedPreview {
+    loaded: LoadedPreview,
+    pixels: Option<(slint::SharedPixelBuffer<slint::Rgba8Pixel>, bool)>,
+}
+fn prepare_preview(mut loaded: LoadedPreview) -> PreparedPreview {
+    let pixels = loaded.pixels.take().map(|pixels| {
+        (
+            slint::SharedPixelBuffer::clone_from_slice(&pixels.rgba, pixels.width, pixels.height),
+            pixels.premultiplied,
+        )
+    });
+    PreparedPreview { loaded, pixels }
 }
 
 enum RestoredContent {
@@ -185,9 +226,18 @@ fn run() -> Result<()> {
     let workspace_history_path =
         workspace_history::settings_path(&workspace.distro, &workspace.linux_root);
     let session_path = session::settings_path(&workspace.distro, &workspace.linux_root);
-    let saved_session = session_path
-        .as_deref()
-        .and_then(|path| Session::load(path, &workspace.distro, &workspace.linux_root));
+    let mut manifest_loader = Background::default();
+    let manifest_path = session_path.clone();
+    let manifest_workspace = workspace.clone();
+    manifest_loader.request(move || {
+        manifest_path.as_deref().and_then(|path| {
+            Session::load(
+                path,
+                &manifest_workspace.distro,
+                &manifest_workspace.linux_root,
+            )
+        })
+    });
     let remembered_folders = workspace_history_path
         .as_deref()
         .map(|path| workspace_history::load(path, &workspace.distro, &workspace.linux_root))
@@ -198,10 +248,7 @@ fn run() -> Result<()> {
     let startup_workspace = workspace.clone();
     startup_loader.request(move || -> Result<_> {
         let workspace = Workspace::new(startup_workspace.distro, startup_workspace.linux_root)?;
-        Ok((
-            git::StatusMonitor::spawn(&workspace),
-            TerminalSession::spawn(&workspace.distro, &workspace.linux_root),
-        ))
+        Ok(git::StatusMonitor::spawn(&workspace))
     });
     let state = Rc::new(RefCell::new(AppState {
         workspace,
@@ -209,11 +256,16 @@ fn run() -> Result<()> {
         remembered_folders: remembered_folders.clone(),
         workspace_history_path,
         session_path,
-        saved_session,
+        saved_session: None,
+        manifest_loader,
+        session_manifest_pending: true,
+        restore_pending: VecDeque::new(),
+        restoring_files: HashMap::new(),
+        restore_in_flight: false,
+        closing: false,
+        initial_file,
         session_loader: Background::default(),
-        startup_loaded: false,
         session_restore_incomplete: false,
-        session_restore_interacted: false,
         expanded: HashSet::new(),
         expanded_git_repositories: HashSet::new(),
         statuses,
@@ -221,6 +273,18 @@ fn run() -> Result<()> {
         tree,
         tabs: Vec::new(),
         tab_groups: TabGroups::default(),
+        doc_io_loader: Background::default(),
+        doc_io_in_flight: false,
+        pending_doc_io: VecDeque::new(),
+        refresh_loader: Background::default(),
+        refresh_in_flight: false,
+        refresh_requested: false,
+        terminal_loader: Background::default(),
+        terminal_in_flight: false,
+        pending_terminals: VecDeque::new(),
+        git_status_loader: Background::default(),
+        terminal_dirty: HashSet::new(),
+        diff_cache: RefCell::new(HashMap::new()),
         next_tab_id: 0,
         next_terminal_number: 1,
         git_monitor: None,
@@ -236,6 +300,10 @@ fn run() -> Result<()> {
         page_loader: Background::default(),
         markdown_source_tabs: HashSet::new(),
         markdown_preview_cache: RefCell::new(HashMap::new()),
+        markdown_pending: RefCell::new(HashMap::new()),
+        markdown_requested: RefCell::new(HashMap::new()),
+        markdown_loader: Background::default(),
+        markdown_in_flight: false,
         diff_loader: Background::default(),
         git_action_loader: Background::default(),
         tree_action_loader: Background::default(),
@@ -262,34 +330,11 @@ fn run() -> Result<()> {
         });
     }
 
-    let saved_tabs = state
-        .borrow()
-        .saved_session
-        .as_ref()
-        .map(|saved| saved.tabs.clone());
-    if let Some(tabs) = saved_tabs {
-        let workspace = state.borrow().workspace.clone();
-        let folders = state.borrow().remembered_folders.clone();
-        state
-            .borrow_mut()
-            .session_loader
-            .request(move || restore_contents(tabs, workspace, folders));
-    }
-
     refresh_tree(&mut state.borrow_mut());
     let mut icon_loader = Background::default();
     icon_loader.request(emoji::EmojiIcons::load_pixels);
 
     let ui = AppWindow::new()?;
-    if let Some(saved) = state.borrow().saved_session.as_ref() {
-        ui.set_sidebar_width(saved.sidebar_width.clamp(170.0, 800.0));
-        ui.set_sidebar_view(saved.sidebar_view.clamp(0, 1));
-        ui.window().set_size(slint::PhysicalSize::new(
-            saved.window_width.clamp(640, 3840),
-            saved.window_height.clamp(400, 2160),
-        ));
-        ui.window().set_maximized(saved.maximized);
-    }
     ui.set_folder_browser_available(cfg!(windows));
     ui.set_dynamic_panes(true);
     ui.set_extra_panes(ModelRc::new(VecModel::from(Vec::<PaneEntry>::new())));
@@ -406,20 +451,17 @@ fn run() -> Result<()> {
             let Ok(tab_id) = TabId::try_from(tab_id) else {
                 return;
             };
-            let Some(ui) = weak.upgrade() else { return };
+            let Some(_ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
             let visible_group = state
                 .tab_groups
                 .group_of(tab_id)
                 .filter(|group| state.tab_groups.active(*group) == Some(tab_id));
             let changed = terminal_mut(&mut state, tab_id).is_some_and(TerminalSession::poll);
-            if changed && let Some(group) = visible_group {
-                sync_group(&ui, &state, group);
+            if changed && visible_group.is_some() {
+                state.terminal_dirty.insert(tab_id);
             }
         });
-    }
-    if let Some(path) = initial_file {
-        let _ = open_document(&mut state.borrow_mut(), path);
     }
     sync_ui(&ui, &state.borrow());
 
@@ -1104,13 +1146,7 @@ fn run() -> Result<()> {
             let mut state = state.borrow_mut();
             let group = usize::try_from(group).unwrap_or(0);
             match open_terminal(&mut state, group) {
-                Ok(tab_id) => {
-                    if let Some(ui) = weak.upgrade()
-                        && let Some(session) = terminal_ref(&state, tab_id)
-                    {
-                        connect_terminal_output(&ui, tab_id, session);
-                    }
-                }
+                Ok(()) => {}
                 Err(error) => state.status = format!("Terminal unavailable: {error}"),
             }
             if let Some(ui) = weak.upgrade() {
@@ -1130,13 +1166,7 @@ fn run() -> Result<()> {
             if let Some(path) = target {
                 let group = state.tab_groups.focused_group();
                 match open_terminal_at(&mut state, group, path) {
-                    Ok(tab_id) => {
-                        if let Some(ui) = weak.upgrade()
-                            && let Some(session) = terminal_ref(&state, tab_id)
-                        {
-                            connect_terminal_output(&ui, tab_id, session);
-                        }
-                    }
+                    Ok(()) => {}
                     Err(error) => state.status = format!("Terminal unavailable: {error}"),
                 }
             } else {
@@ -1360,6 +1390,7 @@ fn run() -> Result<()> {
         loading_timer.start(TimerMode::Repeated, Duration::from_millis(16), move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
+            poll_io(&ui, &mut state);
             if let Some(report) = state.wsl_diagnostics_loader.poll() {
                 let entries = report
                     .checks
@@ -1405,57 +1436,146 @@ fn run() -> Result<()> {
                 }
             }
             if let Some(result) = startup_loader.poll() {
-                let mut focus_startup_terminal = false;
                 match result {
-                    Ok((monitor, terminal)) => {
+                    Ok(Ok(monitor)) => {
+                        state.git_monitor = Some(monitor);
                         if state.status == "Starting workspace..." {
                             state.status = "Ready".into();
                         }
-                        match monitor {
-                            Ok(monitor) => state.git_monitor = Some(monitor),
-                            Err(error) => {
-                                state.status = format!("Git auto-refresh unavailable: {error}")
-                            }
-                        }
-                        match terminal {
-                            Ok(session) => {
-                                let tab_id = take_next_tab_id(&mut state);
-                                connect_terminal_output(&ui, tab_id, &session);
-                                let start_path = state.workspace.linux_root.clone();
-                                let number = state.next_terminal_number;
-                                state.next_terminal_number += 1;
-                                state.tabs.push(WorkspaceTab {
-                                    id: tab_id,
-                                    content: TabContent::Terminal {
-                                        session,
-                                        start_path,
-                                        number,
-                                    },
-                                });
-                                focus_startup_terminal = state.tab_groups.add_background(tab_id, 0);
-                            }
-                            Err(error) => state.status = format!("Terminal unavailable: {error}"),
-                        }
+                    }
+                    Ok(Err(error)) => {
+                        state.status = format!("Git auto-refresh unavailable: {error}")
                     }
                     Err(error) => state.status = error.to_string(),
                 }
+                ui.set_status_text(state.status.clone().into());
+            }
+            if let Some(error) = startup_loader.take_error() {
+                state.status = error;
+                diagnostics_log::event(&state.status);
+            }
+            if let Some(saved) = state.manifest_loader.poll() {
+                state.session_manifest_pending = false;
+                if !state.tabs.is_empty() && saved.is_some() {
+                    // Keep deliberate new work if it finished before the manifest.
+                    state.session_restore_incomplete = true;
+                    state.status =
+                        "Previous workspace restore deferred after opening a new tab".into();
+                } else if let Some(mut saved) = saved {
+                    let ids = saved.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+                    let available = ids.iter().copied().collect();
+                    if let Some(groups) = TabGroups::restore(saved.groups.clone(), &ids, &available)
+                    {
+                        ui.set_sidebar_width(saved.sidebar_width.clamp(170.0, 800.0));
+                        ui.set_sidebar_view(saved.sidebar_view.clamp(0, 1));
+                        ui.window().set_size(slint::PhysicalSize::new(
+                            saved.window_width.clamp(640, 3840),
+                            saved.window_height.clamp(400, 2160),
+                        ));
+                        ui.window().set_maximized(saved.maximized);
+                        let selected = groups
+                            .groups()
+                            .iter()
+                            .filter_map(|group| groups.active(*group))
+                            .collect::<HashSet<_>>();
+                        let focused = groups.active(groups.focused_group());
+                        state.next_tab_id =
+                            ids.iter().copied().max().unwrap_or(0).saturating_add(1);
+                        state.next_terminal_number = saved
+                            .tabs
+                            .iter()
+                            .filter_map(|tab| {
+                                if let SavedKind::Terminal { number } = tab.kind {
+                                    Some(number.saturating_add(1))
+                                } else {
+                                    None
+                                }
+                            })
+                            .max()
+                            .unwrap_or(1);
+                        state.tab_groups = groups;
+                        state.maximized_group = saved.maximized_group;
+                        state.restoring_files = saved
+                            .tabs
+                            .iter()
+                            .filter(|tab| {
+                                matches!(tab.kind, SavedKind::File { .. } | SavedKind::Preview)
+                            })
+                            .map(|tab| (tab.path.clone(), tab.id))
+                            .collect();
+                        state.restore_pending = session::restore_order(
+                            std::mem::take(&mut saved.tabs),
+                            focused,
+                            &selected,
+                        )
+                        .into();
+                        state.saved_session = Some(saved);
+                        state.status = "Restoring workspace...".into();
+                    } else {
+                        state.session_restore_incomplete = true;
+                    }
+                } else if state.tabs.is_empty()
+                    && state.pending_terminals.is_empty()
+                    && !state.terminal_in_flight
+                {
+                    let path = state.workspace.linux_root.clone();
+                    let _ = open_terminal_at(&mut state, 0, path);
+                }
                 sync_ui(&ui, &state);
-                state.startup_loaded = true;
-                if focus_startup_terminal {
-                    ui.invoke_focus_terminal();
+            }
+            if let Some(error) = state.manifest_loader.take_error() {
+                state.session_manifest_pending = false;
+                state.session_restore_incomplete = true;
+                state.status = error;
+                diagnostics_log::event(&state.status);
+            }
+            if let Some(restored) = state.session_loader.poll() {
+                state.restore_in_flight = false;
+                append_restored_tabs(&ui, &mut state, restored);
+            }
+            if let Some(error) = state.session_loader.take_error() {
+                state.restore_in_flight = false;
+                state.session_restore_incomplete = true;
+                state.status = error;
+                diagnostics_log::event(&state.status);
+            }
+            if !state.session_manifest_pending && !state.restore_in_flight {
+                while state
+                    .restore_pending
+                    .front()
+                    .is_some_and(|tab| state.tab_groups.group_of(tab.id).is_none())
+                {
+                    state.restore_pending.pop_front();
+                }
+                if let Some(tab) = state.restore_pending.pop_front() {
+                    let workspace = state.workspace.clone();
+                    let folders = state.remembered_folders.clone();
+                    state
+                        .session_loader
+                        .request(move || restore_contents(vec![tab], workspace, folders));
+                    state.restore_in_flight = true;
+                } else if state.saved_session.take().is_some() {
+                    state.restoring_files.clear();
+                    state.status = if state.session_restore_incomplete {
+                        "Workspace restored; some tabs unavailable"
+                    } else {
+                        "Previous workspace restored"
+                    }
+                    .into();
+                    sync_ui(&ui, &state);
                 }
             }
-            if state.startup_loaded
-                && let Some(restored) = state.session_loader.poll()
-                && let Some(saved) = state.saved_session.take()
+            if !state.session_manifest_pending
+                && state.saved_session.is_none()
+                && let Some(path) = state.initial_file.take()
             {
-                if state.session_restore_interacted {
-                    state.session_restore_incomplete = true;
-                    state.status = "Workspace restore deferred after user input".into();
-                    ui.set_status_text(state.status.clone().into());
-                } else {
-                    apply_restored_session(&ui, &mut state, saved, restored);
-                }
+                let _ = open_document(&mut state, path);
+            }
+            if let Some(error) = icon_loader.take_error() {
+                diagnostics_log::event(&format!("Icon loading failed: {error}"));
+            }
+            if state.closing && !state.doc_io_in_flight && state.pending_doc_io.is_empty() {
+                let _ = slint::quit_event_loop();
             }
             if let Some(results) = state.restore_folder_loader.poll() {
                 let mut restored = 0usize;
@@ -1740,6 +1860,11 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            for id in std::mem::take(&mut state.terminal_dirty) {
+                if let Some(group) = active.get(&id) {
+                    changed_groups.insert(*group);
+                }
+            }
             for group in changed_groups {
                 sync_group(&ui, &state, group);
             }
@@ -1784,12 +1909,9 @@ fn run() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             if !probes.is_empty() {
-                state.agent_probe_loader.request(move || {
-                    probes
-                        .into_iter()
-                        .map(|(id, probe)| (id, probe.detect()))
-                        .collect()
-                });
+                state
+                    .agent_probe_loader
+                    .request(move || terminal::AgentProbe::detect_many(&probes));
                 state.agent_probe_in_flight = true;
             }
         });
@@ -1874,6 +1996,20 @@ fn run() -> Result<()> {
     }
 
     diagnostics_log::event("event loop started");
+    {
+        let state = state.clone();
+        ui.window().on_close_requested(move || {
+            let mut state = state.borrow_mut();
+            if state.doc_io_in_flight || !state.pending_doc_io.is_empty() {
+                state.closing = true;
+                slint::CloseRequestResponse::KeepWindowShown
+            } else {
+                slint::CloseRequestResponse::HideWindow
+            }
+        });
+    }
+    ui.show()?;
+    diagnostics_log::capture_modules();
     ui.run()?;
     if let Err(error) = save_current_session(&ui, &state.borrow()) {
         diagnostics_log::event(&format!("could not save workspace session: {error}"));
@@ -1901,20 +2037,18 @@ fn restore_contents(
                 let owner = workspace::for_path(&workspaces, &tab.path)
                     .context("saved path is outside the workspace")?;
                 let host = owner.host_path(&tab.path)?;
-            match &tab.kind {
-                SavedKind::File { .. } => {
-                    let mut document = Document::open(tab.path.clone(), host)?;
-                    tab.kind.restore_file(&mut document);
-                    Ok(RestoredContent::File(OpenedFile::Text(document)))
-                }
+                match &tab.kind {
+                    SavedKind::File { .. } => {
+                        let mut document = Document::open(tab.path.clone(), host)?;
+                        tab.kind.restore_file(&mut document);
+                        Ok(RestoredContent::File(OpenedFile::Text(document)))
+                    }
                     SavedKind::Preview => {
                         let kind =
                             preview::kind_for(&tab.path).context("preview type is unavailable")?;
-                        Ok(RestoredContent::File(OpenedFile::Preview(preview::open(
-                            tab.path.clone(),
-                            host,
-                            kind,
-                        )?)))
+                        Ok(RestoredContent::File(OpenedFile::Preview(prepare_preview(
+                            preview::open(tab.path.clone(), host, kind)?,
+                        ))))
                     }
                     SavedKind::Terminal { .. } => {
                         if !host.is_dir() {
@@ -1933,16 +2067,21 @@ fn restore_contents(
         .collect()
 }
 
-fn apply_restored_session(
+fn append_restored_tabs(
     ui: &AppWindow,
     state: &mut AppState,
-    saved: Session,
     restored: Vec<(SavedTab, Result<RestoredContent>)>,
 ) {
-    let mut tabs = Vec::new();
-    let mut unavailable = 0;
-    let mut next_terminal_number = 1;
     for (entry, result) in restored {
+        // A tab closed during restoration must stay closed.
+        if !state
+            .tab_groups
+            .groups()
+            .iter()
+            .any(|group| state.tab_groups.group_ids(*group).contains(&entry.id))
+        {
+            continue;
+        }
         let content = match result {
             Ok(RestoredContent::File(OpenedFile::Text(document))) => {
                 Some(TabContent::File(document))
@@ -1951,62 +2090,42 @@ fn apply_restored_session(
                 preview_tab(loaded).ok().map(TabContent::Preview)
             }
             Ok(RestoredContent::Terminal(session)) => {
-                let SavedKind::Terminal { number } = &entry.kind else {
-                    continue;
-                };
-                next_terminal_number = next_terminal_number.max(number.saturating_add(1));
-                connect_terminal_output(ui, entry.id, &session);
-                Some(TabContent::Terminal {
-                    session,
-                    start_path: entry.path,
-                    number: *number,
-                })
+                if let SavedKind::Terminal { number } = entry.kind {
+                    connect_terminal_output(ui, entry.id, &session);
+                    Some(TabContent::Terminal {
+                        session,
+                        start_path: entry.path,
+                        number,
+                    })
+                } else {
+                    None
+                }
             }
-            Err(_) => None,
+            Err(error) => {
+                diagnostics_log::event(&format!("Session tab {} unavailable: {error}", entry.id));
+                None
+            }
         };
         if let Some(content) = content {
-            tabs.push(WorkspaceTab {
+            state.tabs.push(WorkspaceTab {
                 id: entry.id,
                 content,
             });
-        } else if !matches!(entry.kind, SavedKind::Diff) {
-            unavailable += 1;
+        } else {
+            state.tab_groups.remove(entry.id);
+            if !matches!(entry.kind, SavedKind::Diff) {
+                state.session_restore_incomplete = true;
+            }
         }
     }
-    let available = tabs.iter().map(|tab| tab.id).collect();
-    let saved_ids = saved.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
-    if tabs.is_empty() && unavailable == 0 {
-        state.tabs.clear();
-        state.tab_groups = TabGroups::default();
-        state.next_tab_id = saved_ids.into_iter().max().unwrap_or(0).saturating_add(1);
-        state.next_terminal_number = 1;
-        state.maximized_group = None;
-        state.status = "Previous workspace restored".into();
-        sync_ui(ui, state);
-        return;
-    }
-    let Some(groups) = TabGroups::restore(saved.groups, &saved_ids, &available) else {
-        state.session_restore_incomplete = true;
-        return;
-    };
-    state.session_restore_incomplete = unavailable > 0;
-    state.tabs = tabs;
-    state.tab_groups = groups;
-    state.next_tab_id = saved_ids.into_iter().max().unwrap_or(0).saturating_add(1);
-    state.next_terminal_number = next_terminal_number;
-    state.maximized_group = saved
-        .maximized_group
-        .filter(|group| state.tab_groups.groups().contains(group));
-    state.status = if unavailable == 0 {
-        "Previous workspace restored".into()
-    } else {
-        format!("Workspace restored; {unavailable} tabs unavailable")
-    };
     sync_ui(ui, state);
 }
 
 fn save_current_session(ui: &AppWindow, state: &AppState) -> std::io::Result<()> {
-    if state.saved_session.is_some() || state.session_restore_incomplete {
+    if state.session_manifest_pending
+        || state.saved_session.is_some()
+        || state.session_restore_incomplete
+    {
         return Ok(());
     }
     let Some(path) = state.session_path.as_deref() else {
@@ -2017,7 +2136,9 @@ fn save_current_session(ui: &AppWindow, state: &AppState) -> std::io::Result<()>
         .iter()
         .map(|tab| {
             let (path, kind) = match &tab.content {
-            TabContent::File(document) => (document.linux_path.clone(), SavedKind::file(document)),
+                TabContent::File(document) => {
+                    (document.linux_path.clone(), SavedKind::file(document))
+                }
                 TabContent::Preview(preview) => (preview.linux_path.clone(), SavedKind::Preview),
                 TabContent::Diff(diff) => (diff.path.clone(), SavedKind::Diff),
                 TabContent::Terminal {
@@ -2068,22 +2189,27 @@ fn install_windows_folder_browser(ui: &AppWindow, workspace: &Workspace) {
         let Some(owner) = owner else { return };
         let workspace = workspace.clone();
         let weak = weak.clone();
-        std::thread::spawn(move || {
-            let result = folder_picker::pick_folder(owner, &workspace);
-            let _ = weak.upgrade_in_event_loop(move |ui| match result {
-                Ok(Some(path)) => {
-                    let path = path.to_string_lossy().to_string();
-                    ui.set_add_folder_path(path.clone().into());
-                    ui.set_add_folder_visible(false);
-                    ui.invoke_add_folder_requested(path.into());
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    ui.set_add_folder_visible(false);
-                    ui.set_status_text(format!("Could not select folder: {error}").into());
-                }
+        let result = std::thread::Builder::new()
+            .name("araseo-folder-picker".into())
+            .spawn(move || {
+                let result = folder_picker::pick_folder(owner, &workspace);
+                let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                    Ok(Some(path)) => {
+                        let path = path.to_string_lossy().to_string();
+                        ui.set_add_folder_path(path.clone().into());
+                        ui.set_add_folder_visible(false);
+                        ui.invoke_add_folder_requested(path.into());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        ui.set_add_folder_visible(false);
+                        ui.set_status_text(format!("Could not select folder: {error}").into());
+                    }
+                });
             });
-        });
+        if let Err(error) = result {
+            diagnostics_log::event(&format!("Could not start folder picker: {error}"));
+        }
     });
 }
 
@@ -2110,11 +2236,6 @@ fn install_window_events(
             } | winit::event::WindowEvent::MouseWheel { .. }
         );
         if input {
-            let mut state = _state.borrow_mut();
-            if state.saved_session.is_some() {
-                state.session_restore_interacted = true;
-            }
-            drop(state);
             let now = Instant::now();
             let gap = now.duration_since(last_input);
             if gap >= Duration::from_secs(30) {
@@ -2407,6 +2528,19 @@ fn cancel_file_open(state: &mut AppState) {
 }
 
 fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
+    if let Some(id) = state
+        .restoring_files
+        .get(&linux_path)
+        .copied()
+        .filter(|id| state.tab_groups.group_of(*id).is_some())
+    {
+        state.tab_groups.activate(id);
+        if let Some(index) = state.restore_pending.iter().position(|tab| tab.id == id) {
+            let tab = state.restore_pending.remove(index).unwrap();
+            state.restore_pending.push_front(tab);
+        }
+        return Ok(());
+    }
     cancel_file_open(state);
     if let Some(tab_id) = state.tabs.iter().find_map(|tab| match &tab.content {
         TabContent::File(document) if document.linux_path == linux_path => Some(tab.id),
@@ -2423,7 +2557,9 @@ fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
     state.file_loader.request(move || {
         let host_path = workspace.host_path(&linux_path)?;
         let opened = match preview::kind_for(&linux_path) {
-            Some(kind) => OpenedFile::Preview(preview::open(linux_path, host_path, kind)?),
+            Some(kind) => {
+                OpenedFile::Preview(prepare_preview(preview::open(linux_path, host_path, kind)?))
+            }
             None => OpenedFile::Text(Document::open(linux_path, host_path)?),
         };
         Ok((opened, group))
@@ -2467,19 +2603,20 @@ fn request_pdf_render(
     });
 }
 
-fn preview_tab(loaded: LoadedPreview) -> Result<PreviewTab> {
+fn preview_tab(prepared: PreparedPreview) -> Result<PreviewTab> {
+    let loaded = prepared.loaded;
     let (image, natural_width, natural_height, text) = match loaded.kind {
-        PreviewKind::Image => slint::Image::load_from_path(&loaded.host_path)
-            .with_context(|| format!("cannot display {}", loaded.linux_path.display()))
-            .map(|image| {
-                let size = image.size();
-                (
-                    image,
-                    size.width as f32,
-                    size.height as f32,
-                    PdfTextPage::default(),
-                )
-            })?,
+        PreviewKind::Image => {
+            let (buffer, premultiplied) = prepared.pixels.context("Image pixels are missing")?;
+            let width = buffer.width();
+            let height = buffer.height();
+            let image = if premultiplied {
+                slint::Image::from_rgba8_premultiplied(buffer)
+            } else {
+                slint::Image::from_rgba8(buffer)
+            };
+            (image, width as f32, height as f32, PdfTextPage::default())
+        }
         PreviewKind::Pdf => {
             let page = loaded.first_page.context("PDF page is missing")?;
             let natural_width = page.page_width;
@@ -2534,32 +2671,14 @@ fn open_git_diff(state: &mut AppState, path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn open_terminal(state: &mut AppState, group: usize) -> Result<TabId> {
-    let path = state.workspace.linux_root.clone();
-    open_terminal_at(state, group, path)
+fn open_terminal(state: &mut AppState, group: usize) -> Result<()> {
+    open_terminal_at(state, group, state.workspace.linux_root.clone())
 }
-
-fn open_terminal_at(state: &mut AppState, group: usize, path: PathBuf) -> Result<TabId> {
-    cancel_file_open(state);
-    let workspace = workspace_for_path(state, &path)?;
-    if !workspace.host_path(&path)?.is_dir() {
-        bail!("folder is not accessible: {}", path.display());
-    }
-    let session = TerminalSession::spawn(&workspace.distro, &path)?;
-    let tab_id = take_next_tab_id(state);
-    let number = state.next_terminal_number;
-    state.next_terminal_number = state.next_terminal_number.saturating_add(1);
-    state.tabs.push(WorkspaceTab {
-        id: tab_id,
-        content: TabContent::Terminal {
-            session,
-            start_path: path,
-            number,
-        },
-    });
-    state.tab_groups.add(tab_id, group);
-    state.status = "Terminal opened".into();
-    Ok(tab_id)
+fn open_terminal_at(state: &mut AppState, group: usize, path: PathBuf) -> Result<()> {
+    workspace_for_path(state, &path)?;
+    state.pending_terminals.push_back((group, path));
+    state.status = "Opening terminal...".into();
+    Ok(())
 }
 
 fn close_tab(state: &mut AppState, tab_id: TabId) {
@@ -2575,6 +2694,8 @@ fn close_tab(state: &mut AppState, tab_id: TabId) {
     state.tab_groups.remove(tab_id);
     state.markdown_source_tabs.remove(&tab_id);
     state.markdown_preview_cache.borrow_mut().remove(&tab_id);
+    state.markdown_requested.borrow_mut().remove(&tab_id);
+    state.markdown_pending.borrow_mut().remove(&tab_id);
     state.tabs.remove(index);
     if state.save_conflict == Some(tab_id) {
         state.save_conflict = None;
@@ -2699,8 +2820,10 @@ fn refresh_git_for_path(state: &mut AppState, path: &std::path::Path) {
         if let Some(monitor) = state.git_monitor.as_mut() {
             let _ = monitor.force_refresh();
         } else {
-            state.statuses = git::read_status(&state.workspace);
-            refresh_tree(state);
+            let workspace = state.workspace.clone();
+            state
+                .git_status_loader
+                .request(move || git::read_status(&workspace));
         }
     }
 }
@@ -2792,105 +2915,27 @@ fn close_file_tabs_at_or_below(state: &mut AppState, path: &std::path::Path) {
     }
 }
 
-fn save_tab(state: &mut AppState, tab_id: TabId, overwrite_external: bool) {
-    let Some(document) = document_mut(state, tab_id) else {
-        return;
-    };
-    match document.save(overwrite_external) {
-        Ok(()) => {
-            state.status = "Saved".into();
-            state.save_conflict = None;
-            let path = document_ref(state, tab_id).map(|document| document.linux_path.clone());
-            if let Some(path) = path {
-                refresh_git_for_path(state, &path);
-            }
-            refresh_tree(state);
-        }
-        Err(error) => {
-            state.save_conflict = document_ref(state, tab_id)
-                .is_some_and(Document::changed_on_disk)
-                .then_some(tab_id);
-            state.status = error.to_string();
-        }
+fn save_tab(state: &mut AppState, id: TabId, overwrite: bool) {
+    if let Some(document) = document_ref(state, id) {
+        let version = document.edit_version();
+        state
+            .pending_doc_io
+            .push_back((id, DocumentOperation::Save(overwrite), version));
+        state.status = "Saving...".into();
     }
 }
-
-fn reload_tab(state: &mut AppState, tab_id: TabId) {
-    let Some(document) = document_ref(state, tab_id) else {
-        return;
-    };
-    let linux_path = document.linux_path.clone();
-    let host_path = document.host_path.clone();
-    match Document::open(linux_path, host_path) {
-        Ok(document) => {
-            if let Some(target) = document_mut(state, tab_id) {
-                *target = document;
-            }
-            state.save_conflict = None;
-            state.status = "Reloaded from disk".into();
-        }
-        Err(error) => state.status = error.to_string(),
+fn reload_tab(state: &mut AppState, id: TabId) {
+    if let Some(document) = document_ref(state, id) {
+        let version = document.edit_version();
+        state
+            .pending_doc_io
+            .push_back((id, DocumentOperation::Reload, version));
+        state.status = "Reloading...".into();
     }
 }
-
 fn refresh_external_documents(state: &mut AppState) -> HashSet<usize> {
-    let active = state
-        .tab_groups
-        .groups()
-        .into_iter()
-        .filter_map(|group| state.tab_groups.active(group).map(|id| (id, group)))
-        .collect::<HashMap<_, _>>();
-    let mut refreshed_groups = HashSet::new();
-    let mut reloaded = 0usize;
-    let mut conflict = None;
-    let mut refresh_error = None;
-    let mut resolved_conflict = false;
-
-    for tab in &mut state.tabs {
-        let TabContent::File(document) = &mut tab.content else {
-            continue;
-        };
-        let path = document.linux_path.clone();
-        match document.refresh_from_disk() {
-            Ok(ExternalRefresh::Unchanged) => {}
-            Ok(ExternalRefresh::Reloaded) => {
-                reloaded += 1;
-                resolved_conflict |= state.save_conflict == Some(tab.id);
-                if let Some(group) = active.get(&tab.id) {
-                    refreshed_groups.insert(*group);
-                }
-            }
-            Ok(ExternalRefresh::Conflict) => {
-                if conflict.is_none() {
-                    conflict = Some((tab.id, path));
-                }
-            }
-            Err(error) => {
-                if refresh_error.is_none() {
-                    refresh_error = Some(format!("Cannot refresh {}: {error}", path.display()));
-                }
-            }
-        }
-    }
-
-    if resolved_conflict {
-        state.save_conflict = None;
-    }
-    if let Some((tab_id, path)) = conflict {
-        state.save_conflict = Some(tab_id);
-        state.status = format!(
-            "{} changed outside Araseo; reload or overwrite",
-            path.display()
-        );
-    } else if let Some(error) = refresh_error {
-        state.status = error;
-    } else if reloaded == 1 {
-        state.status = "Updated open file from disk".into();
-    } else if reloaded > 1 {
-        state.status = format!("Updated {reloaded} open files from disk");
-    }
-
-    refreshed_groups
+    state.refresh_requested = true;
+    HashSet::new()
 }
 
 fn take_next_tab_id(state: &mut AppState) -> TabId {
@@ -2909,6 +2954,262 @@ fn repository_for(repositories: &HashSet<PathBuf>, path: &std::path::Path) -> Op
         .filter(|repository| path.starts_with(repository))
         .max_by_key(|repository| repository.components().count())
         .cloned()
+}
+
+fn poll_io(ui: &AppWindow, state: &mut AppState) {
+    let mut changed = false;
+    let mut focus_terminal = false;
+    if let Some(results) = state.markdown_loader.poll() {
+        state.markdown_in_flight = false;
+        for (id, version, blocks) in results {
+            if document_ref(state, id).is_some_and(|doc| doc.edit_version() == version) {
+                let rows = blocks
+                    .into_iter()
+                    .map(|block| PreviewBlock {
+                        text: if block.kind == "code" {
+                            slint::StyledText::from_plain_text(&block.markup)
+                        } else {
+                            slint::StyledText::from_markdown(&block.markup).unwrap_or_else(|_| {
+                                slint::StyledText::from_plain_text(&block.markup)
+                            })
+                        },
+                        kind: block.kind.into(),
+                    })
+                    .collect::<Vec<_>>();
+                state
+                    .markdown_preview_cache
+                    .borrow_mut()
+                    .insert(id, (version, ModelRc::new(VecModel::from(rows))));
+                changed = true;
+            }
+        }
+    }
+    if let Some(error) = state.markdown_loader.take_error() {
+        state.markdown_in_flight = false;
+        state.markdown_requested.borrow_mut().clear();
+        diagnostics_log::event(&format!("Markdown parsing failed: {error}"));
+    }
+    if !state.markdown_in_flight && !state.markdown_pending.borrow().is_empty() {
+        let pending = std::mem::take(&mut *state.markdown_pending.borrow_mut());
+        state.markdown_loader.request(move || {
+            pending
+                .into_iter()
+                .map(|(id, (version, text))| (id, version, markdown_preview::parse(&text)))
+                .collect()
+        });
+        state.markdown_in_flight = true;
+    }
+    if let Some(outcome) = state.doc_io_loader.poll() {
+        state.doc_io_in_flight = false;
+        let path = document_ref(state, outcome.id).map(|doc| doc.linux_path.clone());
+        if let Some(live) =
+            document_mut(state, outcome.id).filter(|doc| doc.host_path == outcome.host)
+        {
+            match outcome.result {
+                Ok(saved) => match outcome.operation {
+                    DocumentOperation::Save(_) => {
+                        live.accept_saved(&saved);
+                        state.status = "Saved".into();
+                        state.save_conflict = None;
+                    }
+                    DocumentOperation::Reload if live.edit_version() == outcome.version => {
+                        live.accept_reloaded(saved);
+                        state.status = "Reloaded".into();
+                        state.save_conflict = None;
+                    }
+                    DocumentOperation::Reload => {
+                        state.status = "Reload skipped: document edited while loading".into()
+                    }
+                },
+                Err(error) => {
+                    state.status = error;
+                    if outcome.conflict {
+                        state.save_conflict = Some(outcome.id);
+                    }
+                }
+            }
+            changed = true;
+        }
+        if let Some(path) = path {
+            refresh_git_for_path(state, &path);
+        }
+    }
+    if let Some(error) = state.doc_io_loader.take_error() {
+        state.doc_io_in_flight = false;
+        state.status = format!("File operation failed: {error}");
+        diagnostics_log::event(&state.status);
+        changed = true;
+    }
+    if !state.doc_io_in_flight {
+        while let Some((id, operation, requested_version)) = state.pending_doc_io.pop_front() {
+            if let Some(document) = document_ref(state, id) {
+                let Some(snapshot) = operation.prepare(document, requested_version) else {
+                    state.status = "Reload skipped: document edited while waiting".into();
+                    changed = true;
+                    continue;
+                };
+                state
+                    .doc_io_loader
+                    .request(move || document_io::run(id, snapshot, operation));
+                state.doc_io_in_flight = true;
+                break;
+            }
+        }
+    }
+    if let Some(results) = state.refresh_loader.poll() {
+        state.refresh_in_flight = false;
+        for (probe, result) in results {
+            if let Some(live) = document_mut(state, probe.id).filter(|doc| probe.is_current(doc)) {
+                match result {
+                    Ok(Some(document)) => {
+                        live.accept_reloaded(document);
+                        changed = true;
+                    }
+                    Err(error) => {
+                        state.status = error;
+                        state.save_conflict = Some(probe.id);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(error) = state.refresh_loader.take_error() {
+        state.refresh_in_flight = false;
+        diagnostics_log::event(&format!("File refresh failed: {error}"));
+    }
+    if state.refresh_requested
+        && !state.refresh_in_flight
+        && !state.doc_io_in_flight
+        && state.pending_doc_io.is_empty()
+    {
+        state.refresh_requested = false;
+        let probes = state
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                TabContent::File(doc) => Some(document_io::Probe::new(tab.id, doc)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !probes.is_empty() {
+            state
+                .refresh_loader
+                .request(move || probes.into_iter().map(document_io::Probe::check).collect());
+            state.refresh_in_flight = true;
+        }
+    }
+    if let Some((group, path, result)) = state.terminal_loader.poll() {
+        state.terminal_in_flight = false;
+        match result {
+            Ok(session) => {
+                let id = take_next_tab_id(state);
+                connect_terminal_output(ui, id, &session);
+                let number = state.next_terminal_number;
+                state.next_terminal_number += 1;
+                state.tabs.push(WorkspaceTab {
+                    id,
+                    content: TabContent::Terminal {
+                        session,
+                        start_path: path,
+                        number,
+                    },
+                });
+                let group = if state.tab_groups.groups().contains(&group) {
+                    group
+                } else {
+                    state.tab_groups.focused_group()
+                };
+                state.tab_groups.add(id, group);
+                state.status = "Terminal ready".into();
+                focus_terminal = true;
+            }
+            Err(error) => state.status = format!("Terminal unavailable: {error}"),
+        }
+        changed = true;
+    }
+    if let Some(error) = state.terminal_loader.take_error() {
+        state.terminal_in_flight = false;
+        state.status = format!("Terminal failed: {error}");
+        diagnostics_log::event(&state.status);
+        changed = true;
+    }
+    if !state.terminal_in_flight
+        && let Some((group, path)) = state.pending_terminals.pop_front()
+    {
+        match workspace_for_path(state, &path) {
+            Ok(workspace) => {
+                let workspace = workspace.clone();
+                state.terminal_loader.request(move || {
+                    let result = (|| {
+                        if !workspace.host_path(&path)?.is_dir() {
+                            bail!("Terminal directory is unavailable");
+                        }
+                        TerminalSession::spawn(&workspace.distro, &path)
+                    })();
+                    (group, path, result)
+                });
+                state.terminal_in_flight = true;
+            }
+            Err(error) => {
+                state.status = error.to_string();
+                changed = true;
+            }
+        }
+    }
+    if let Some(statuses) = state.git_status_loader.poll() {
+        state
+            .statuses
+            .retain(|path, _| !path.starts_with(&state.workspace.linux_root));
+        state.statuses.extend(statuses);
+        refresh_tree(state);
+        changed = true;
+    }
+    for tab in &mut state.tabs {
+        if let TabContent::Terminal { session, .. } = &mut tab.content
+            && let Some(error) = session.take_input_error()
+        {
+            state.status = format!("Terminal input failed: {error}");
+            diagnostics_log::event(&state.status);
+            changed = true;
+        }
+    }
+    macro_rules! worker_errors { ($($field:ident),*) => { $(if let Some(error) = state.$field.take_error() { state.status = format!("{} failed: {error}", stringify!($field)); diagnostics_log::event(&state.status); changed = true; })* }; }
+    worker_errors!(
+        git_status_loader,
+        tree_loader,
+        file_loader,
+        page_loader,
+        diff_loader,
+        git_action_loader,
+        add_folder_loader,
+        restore_folder_loader
+    );
+    if let Some(error) = state.tree_action_loader.take_error() {
+        state.tree_action_pending = false;
+        state.status = error;
+        changed = true;
+    }
+    if let Some(error) = state.agent_probe_loader.take_error() {
+        state.agent_probe_in_flight = false;
+        diagnostics_log::event(&format!("Agent probe failed: {error}"));
+    }
+    if let Some(error) = state.wsl_diagnostics_loader.take_error() {
+        ui.set_wsl_diagnostics_running(false);
+        state.status = error;
+        changed = true;
+    }
+    if let Some(error) = state.wsl_docker_usage_loader.take_error() {
+        ui.set_wsl_docker_usage_running(false);
+        ui.set_wsl_docker_usage_error(error.into());
+    }
+    if changed {
+        sync_ui(ui, state);
+        if focus_terminal {
+            ui.invoke_focus_terminal();
+        }
+    }
 }
 
 fn document_ref(state: &AppState, tab_id: TabId) -> Option<&Document> {
@@ -3127,6 +3428,29 @@ fn sync_layout(ui: &AppWindow, state: &AppState) {
 }
 
 fn sync_ui(ui: &AppWindow, state: &AppState) {
+    let live_ids = state.tabs.iter().map(|tab| tab.id).collect::<HashSet<_>>();
+    let active_ids = state
+        .tab_groups
+        .groups()
+        .iter()
+        .filter_map(|group| state.tab_groups.active(*group))
+        .collect::<HashSet<_>>();
+    state
+        .diff_cache
+        .borrow_mut()
+        .retain(|id, _| active_ids.contains(id));
+    state
+        .markdown_preview_cache
+        .borrow_mut()
+        .retain(|id, _| live_ids.contains(id));
+    state
+        .markdown_requested
+        .borrow_mut()
+        .retain(|id, _| live_ids.contains(id));
+    state
+        .markdown_pending
+        .borrow_mut()
+        .retain(|id, _| live_ids.contains(id));
     ui.set_workspace_name(
         state
             .workspace
@@ -3195,7 +3519,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                     ui.set_primary_active_kind("diff".into());
                     ui.set_syntax_highlight_enabled(false);
                     ui.set_highlighted_text(slint::StyledText::default());
-                    sync_diff(ui, diff, 0);
+                    sync_diff(ui, state, tab.id, diff, 0);
                     clear_terminal_group(ui, 0);
                 }
                 TabContent::Terminal { session, .. } => {
@@ -3238,7 +3562,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                     ui.set_secondary_active_kind("diff".into());
                     ui.set_secondary_syntax_highlight_enabled(false);
                     ui.set_secondary_highlighted_text(slint::StyledText::default());
-                    sync_diff(ui, diff, 1);
+                    sync_diff(ui, state, tab.id, diff, 1);
                     clear_terminal_group(ui, 1);
                 }
                 TabContent::Terminal { session, .. } => {
@@ -3308,35 +3632,20 @@ fn sync_preview_properties(
             id,
             content: TabContent::File(document),
         }) if is_markdown(&document.linux_path) && !state.markdown_source_tabs.contains(id) => {
-            let cached = state
+            let version = document.edit_version();
+            if state.markdown_requested.borrow().get(id) != Some(&version) {
+                state.markdown_requested.borrow_mut().insert(*id, version);
+                state
+                    .markdown_pending
+                    .borrow_mut()
+                    .insert(*id, (version, document.text.clone()));
+            }
+            state
                 .markdown_preview_cache
                 .borrow()
                 .get(id)
-                .filter(|(cached_text, _)| cached_text == &document.text)
-                .map(|(_, blocks)| blocks.clone());
-            if let Some(blocks) = cached {
-                blocks
-            } else {
-                let blocks = markdown_preview::parse(&document.text)
-                    .into_iter()
-                    .map(|block| PreviewBlock {
-                        text: if block.kind == "code" {
-                            slint::StyledText::from_plain_text(&block.markup)
-                        } else {
-                            slint::StyledText::from_markdown(&block.markup).unwrap_or_else(|_| {
-                                slint::StyledText::from_plain_text(&block.markup)
-                            })
-                        },
-                        kind: block.kind.into(),
-                    })
-                    .collect::<Vec<_>>();
-                let model = ModelRc::new(VecModel::from(blocks));
-                state
-                    .markdown_preview_cache
-                    .borrow_mut()
-                    .insert(*id, (document.text.clone(), model.clone()));
-                model
-            }
+                .map(|(_, blocks)| blocks.clone())
+                .unwrap_or_default()
         }
         _ => ModelRc::new(VecModel::from(Vec::<PreviewBlock>::new())),
     };
@@ -3478,7 +3787,7 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
                 pane.syntax_highlight_enabled = false;
                 pane.highlighted_text = slint::StyledText::default();
             });
-            sync_diff(ui, diff, group);
+            sync_diff(ui, state, tab.id, diff, group);
             clear_terminal_group(ui, group);
         }
         TabContent::Terminal { session, .. } => {
@@ -3547,55 +3856,70 @@ fn sync_editor_view(
     }
 }
 
-fn sync_diff(ui: &AppWindow, diff: &git::FileDiff, group: usize) {
-    let old_lines = diff
-        .lines
-        .iter()
-        .map(|line| line.old_number.map(|_| line.old_text.as_str()))
-        .collect::<Vec<_>>();
-    let new_lines = diff
-        .lines
-        .iter()
-        .map(|line| line.new_number.map(|_| line.new_text.as_str()))
-        .collect::<Vec<_>>();
+fn sync_diff(ui: &AppWindow, state: &AppState, id: TabId, diff: &git::FileDiff, group: usize) {
     let brightness = ui.get_editor_font_brightness();
-    let old_markup = highlight::line_markup_with_brightness(&diff.path, &old_lines, brightness);
-    let new_markup = highlight::line_markup_with_brightness(&diff.path, &new_lines, brightness);
-    let rows = diff
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let old_highlighted = old_markup
-                .as_ref()
-                .and_then(|lines| lines[index].as_ref())
-                .and_then(|markup| slint::StyledText::from_markdown(markup).ok());
-            let new_highlighted = new_markup
-                .as_ref()
-                .and_then(|lines| lines[index].as_ref())
-                .and_then(|markup| slint::StyledText::from_markdown(markup).ok());
-            DiffRow {
-                old_line: line
-                    .old_number
-                    .map(|number| number.to_string())
-                    .unwrap_or_default()
-                    .into(),
-                new_line: line
-                    .new_number
-                    .map(|number| number.to_string())
-                    .unwrap_or_default()
-                    .into(),
-                old_text: line.old_text.clone().into(),
-                new_text: line.new_text.clone().into(),
-                old_highlighted_enabled: old_highlighted.is_some(),
-                new_highlighted_enabled: new_highlighted.is_some(),
-                old_highlighted: old_highlighted.unwrap_or_default(),
-                new_highlighted: new_highlighted.unwrap_or_default(),
-                old_kind: diff_kind_name(line.old_kind).into(),
-                new_kind: diff_kind_name(line.new_kind).into(),
-            }
-        })
-        .collect::<Vec<_>>();
+    let cached = state
+        .diff_cache
+        .borrow()
+        .get(&id)
+        .filter(|(value, _)| *value == brightness)
+        .map(|(_, rows)| rows.clone());
+    let rows = cached.unwrap_or_else(|| {
+        let old_lines = diff
+            .lines
+            .iter()
+            .map(|line| line.old_number.map(|_| line.old_text.as_str()))
+            .collect::<Vec<_>>();
+        let new_lines = diff
+            .lines
+            .iter()
+            .map(|line| line.new_number.map(|_| line.new_text.as_str()))
+            .collect::<Vec<_>>();
+        let brightness = ui.get_editor_font_brightness();
+        let old_markup = highlight::line_markup_with_brightness(&diff.path, &old_lines, brightness);
+        let new_markup = highlight::line_markup_with_brightness(&diff.path, &new_lines, brightness);
+        let rows = diff
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let old_highlighted = old_markup
+                    .as_ref()
+                    .and_then(|lines| lines[index].as_ref())
+                    .and_then(|markup| slint::StyledText::from_markdown(markup).ok());
+                let new_highlighted = new_markup
+                    .as_ref()
+                    .and_then(|lines| lines[index].as_ref())
+                    .and_then(|markup| slint::StyledText::from_markdown(markup).ok());
+                DiffRow {
+                    old_line: line
+                        .old_number
+                        .map(|number| number.to_string())
+                        .unwrap_or_default()
+                        .into(),
+                    new_line: line
+                        .new_number
+                        .map(|number| number.to_string())
+                        .unwrap_or_default()
+                        .into(),
+                    old_text: line.old_text.clone().into(),
+                    new_text: line.new_text.clone().into(),
+                    old_highlighted_enabled: old_highlighted.is_some(),
+                    new_highlighted_enabled: new_highlighted.is_some(),
+                    old_highlighted: old_highlighted.unwrap_or_default(),
+                    new_highlighted: new_highlighted.unwrap_or_default(),
+                    old_kind: diff_kind_name(line.old_kind).into(),
+                    new_kind: diff_kind_name(line.new_kind).into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let rows = ModelRc::new(VecModel::from(rows));
+        state
+            .diff_cache
+            .borrow_mut()
+            .insert(id, (brightness, rows.clone()));
+        rows
+    });
     let relative = diff
         .path
         .strip_prefix(&diff.repository)
@@ -3607,16 +3931,16 @@ fn sync_diff(ui: &AppWindow, diff: &git::FileDiff, group: usize) {
         _ => format!("{relative} (Working Tree)"),
     };
     if group == 0 {
-        ui.set_diff_rows(ModelRc::new(VecModel::from(rows)));
+        ui.set_diff_rows(rows);
         ui.set_diff_old_title(old_title.into());
         ui.set_diff_new_title(new_title.into());
     } else if group == 1 {
-        ui.set_secondary_diff_rows(ModelRc::new(VecModel::from(rows)));
+        ui.set_secondary_diff_rows(rows);
         ui.set_secondary_diff_old_title(old_title.into());
         ui.set_secondary_diff_new_title(new_title.into());
     } else {
         edit_extra_pane(ui, group, |pane| {
-            pane.diff_rows = ModelRc::new(VecModel::from(rows));
+            pane.diff_rows = rows;
             pane.diff_old_title = old_title.into();
             pane.diff_new_title = new_title.into();
         });
@@ -3966,11 +4290,17 @@ fn sync_git_changes(ui: &AppWindow, state: &AppState) {
 }
 
 fn sync_tabs(ui: &AppWindow, state: &AppState) {
+    let tabs_by_id = state
+        .tabs
+        .iter()
+        .map(|tab| (tab.id, tab))
+        .collect::<HashMap<_, _>>();
     let tabs_for_group = |group| {
         state
-            .tabs
-            .iter()
-            .filter(|tab| state.tab_groups.group_of(tab.id) == Some(group))
+            .tab_groups
+            .group_ids(group)
+            .into_iter()
+            .filter_map(|id| tabs_by_id.get(&id).copied())
             .map(|tab| TabEntry {
                 id: tab.id as i32,
                 title: tab_title(tab).into(),

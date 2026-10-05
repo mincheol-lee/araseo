@@ -40,7 +40,9 @@ pub enum SavedKind {
         revision: Option<SavedRevision>,
     },
     Preview,
-    Terminal { number: u32 },
+    Terminal {
+        number: u32,
+    },
     Diff,
 }
 
@@ -56,7 +58,9 @@ impl SavedKind {
             unsaved_text: document.dirty.then(|| document.text.clone()),
             revision: document.dirty.then(|| SavedRevision {
                 len: document.disk_revision.len,
-                modified_nanos: document.disk_revision.modified
+                modified_nanos: document
+                    .disk_revision
+                    .modified
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map(|duration| duration.as_nanos()),
             }),
@@ -64,7 +68,13 @@ impl SavedKind {
     }
 
     pub fn restore_file(&self, document: &mut Document) {
-        let Self::File { unsaved_text: Some(text), revision } = self else { return };
+        let Self::File {
+            unsaved_text: Some(text),
+            revision,
+        } = self
+        else {
+            return;
+        };
         document.set_text(text.clone());
         if let Some(revision) = revision {
             document.disk_revision = DiskRevision {
@@ -119,7 +129,10 @@ impl Session {
         let temporary = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec(self)?;
         if bytes.len() > MAX_SESSION_BYTES {
-            return Err(io::Error::new(io::ErrorKind::FileTooLarge, "workspace session is too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "workspace session is too large",
+            ));
         }
         fs::write(&temporary, bytes)?;
         fs::rename(temporary, path)
@@ -153,7 +166,10 @@ mod tests {
             vec![SavedTab {
                 id: 7,
                 path: "/projects/a/src/main.rs".into(),
-            kind: SavedKind::File { unsaved_text: None, revision: None },
+                kind: SavedKind::File {
+                    unsaved_text: None,
+                    revision: None,
+                },
             }],
             groups,
         );
@@ -167,7 +183,8 @@ mod tests {
 
     #[test]
     fn unsaved_text_restores_with_original_disk_revision() {
-        let path = std::env::temp_dir().join(format!("araseo-session-document-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("araseo-session-document-{}", std::process::id()));
         fs::write(&path, "original").unwrap();
         let mut original = Document::open("/project/file.txt".into(), path.clone()).unwrap();
         original.set_text("unsaved edit".into());
@@ -178,9 +195,15 @@ mod tests {
         Session::new(
             "Ubuntu".into(),
             "/project".into(),
-            vec![SavedTab { id: 1, path: "/project/file.txt".into(), kind }],
+            vec![SavedTab {
+                id: 1,
+                path: "/project/file.txt".into(),
+                kind,
+            }],
             groups,
-        ).save(&session_path).unwrap();
+        )
+        .save(&session_path)
+        .unwrap();
         fs::write(&path, "changed on disk after exit").unwrap();
         let mut reopened = Document::open("/project/file.txt".into(), path.clone()).unwrap();
         let restored = Session::load(&session_path, "Ubuntu", Path::new("/project")).unwrap();
@@ -190,5 +213,44 @@ mod tests {
         assert!(reopened.changed_on_disk());
         fs::remove_file(path).unwrap();
         fs::remove_file(session_path).unwrap();
+    }
+}
+
+/// Load the focused tab first, then other selected panes, then background tabs.
+pub fn restore_order(
+    mut tabs: Vec<SavedTab>,
+    focused: Option<TabId>,
+    selected: &std::collections::HashSet<TabId>,
+) -> Vec<SavedTab> {
+    tabs.sort_by_key(|tab| {
+        if Some(tab.id) == focused {
+            0
+        } else if selected.contains(&tab.id) {
+            1
+        } else {
+            2
+        }
+    });
+    tabs
+}
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    #[test]
+    fn prioritizes_visible_tabs_and_keeps_background_order() {
+        let tabs = (0..5)
+            .map(|id| SavedTab {
+                id,
+                path: PathBuf::from("file"),
+                kind: SavedKind::Preview,
+            })
+            .collect();
+        assert_eq!(
+            restore_order(tabs, Some(3), &[1, 3].into())
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 0, 2, 4]
+        );
     }
 }
