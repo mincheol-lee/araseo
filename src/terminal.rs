@@ -42,31 +42,30 @@ fn agent_shell_command(status_path: &str) -> String {
     )
 }
 
+// Deliver the first change immediately; cap subsequent requests to roughly
+// 15 Hz on the 33 ms terminal timer without waiting for dragging to stop.
 #[cfg(any(target_os = "windows", test))]
-#[derive(Default)]
-struct ResizeDebouncer {
-    requested: Option<(u16, u16)>,
-    stable_polls: u8,
-    waiting_polls: u8,
+struct ResizeThrottle {
+    polls_since_dispatch: u8,
 }
 
 #[cfg(any(target_os = "windows", test))]
-impl ResizeDebouncer {
-    fn observe(&mut self, rows: u16, columns: u16) -> bool {
-        let requested = (rows, columns);
-        self.waiting_polls = self.waiting_polls.saturating_add(1);
-        if self.requested != Some(requested) {
-            self.requested = Some(requested);
-            self.stable_polls = 0;
-            return self.waiting_polls >= 4;
+impl Default for ResizeThrottle {
+    fn default() -> Self {
+        Self {
+            polls_since_dispatch: 2,
         }
-        self.stable_polls = self.stable_polls.saturating_add(1);
-        self.stable_polls >= 2 || self.waiting_polls >= 4
     }
+}
 
+#[cfg(any(target_os = "windows", test))]
+impl ResizeThrottle {
+    fn observe(&mut self) -> bool {
+        self.polls_since_dispatch = self.polls_since_dispatch.saturating_add(1);
+        self.polls_since_dispatch >= 2
+    }
     fn retry_later(&mut self) {
-        self.stable_polls = 0;
-        self.waiting_polls = 0;
+        self.polls_since_dispatch = 0;
     }
 }
 
@@ -76,22 +75,35 @@ struct WindowsPtyResize {
     result_receiver: mpsc::Receiver<((u16, u16), bool)>,
     in_flight: Option<(u16, u16)>,
     applied: (u16, u16),
-    debouncer: ResizeDebouncer,
+    throttle: ResizeThrottle,
 }
 
 #[cfg(any(target_os = "windows", test))]
 impl WindowsPtyResize {
     #[cfg(target_os = "windows")]
     fn new(distro: String, tty_path_file: String) -> std::io::Result<Self> {
-        Self::start(move |rows, columns| resize_windows_pty(&distro, &tty_path_file, rows, columns))
+        Self::start_with(move || {
+            // Start the private pipe off the UI thread when the terminal opens.
+            let mut transport = crate::terminal_resize::WslResize::new(distro, tty_path_file);
+            transport.prepare();
+            move |rows, columns| transport.resize(rows, columns)
+        })
     }
 
-    fn start(mut resize: impl FnMut(u16, u16) -> bool + Send + 'static) -> std::io::Result<Self> {
+    #[cfg(test)]
+    fn start(resize: impl FnMut(u16, u16) -> bool + Send + 'static) -> std::io::Result<Self> {
+        Self::start_with(move || resize)
+    }
+
+    fn start_with<F: FnMut(u16, u16) -> bool + Send + 'static>(
+        initialize: impl FnOnce() -> F + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (request_sender, request_receiver) = mpsc::sync_channel(1);
         let (result_sender, result_receiver) = mpsc::channel();
         thread::Builder::new()
             .name("araseo-resize".into())
             .spawn(move || {
+                let mut resize = initialize();
                 while let Ok(size @ (rows, columns)) = request_receiver.recv() {
                     let resized = resize(rows, columns);
                     if result_sender.send((size, resized)).is_err() {
@@ -105,7 +117,7 @@ impl WindowsPtyResize {
             result_receiver,
             in_flight: None,
             applied: (24, 80),
-            debouncer: ResizeDebouncer::default(),
+            throttle: ResizeThrottle::default(),
         })
     }
 
@@ -117,16 +129,16 @@ impl WindowsPtyResize {
             if resized {
                 self.applied = completed;
             } else {
-                self.debouncer.retry_later();
+                self.throttle.retry_later();
             }
         }
-        let ready = self.debouncer.observe(rows, columns);
+        let ready = self.throttle.observe();
         if self.in_flight.is_some() {
             return;
         }
         let requested = (rows, columns);
         if self.applied == requested {
-            self.debouncer = ResizeDebouncer::default();
+            self.throttle = ResizeThrottle::default();
             return;
         }
         if !ready {
@@ -135,33 +147,8 @@ impl WindowsPtyResize {
         if self.request_sender.try_send(requested).is_ok() {
             self.in_flight = Some(requested);
         }
-        self.debouncer.retry_later();
+        self.throttle.retry_later();
     }
-}
-
-#[cfg(target_os = "windows")]
-fn resize_windows_pty(distro: &str, tty_path_file: &str, rows: u16, columns: u16) -> bool {
-    let mut command = std::process::Command::new(r"C:\Windows\System32\wsl.exe");
-    command.creation_flags(CREATE_NO_WINDOW);
-    command.args([
-        "-d",
-        distro,
-        "--exec",
-        "/bin/sh",
-        "-c",
-        "araseo_tty=$(cat \"$1\") && exec /usr/bin/stty -F \"$araseo_tty\" rows \"$2\" cols \"$3\"",
-        "araseo-resize",
-    ]);
-    command
-        .arg(tty_path_file)
-        .arg(rows.to_string())
-        .arg(columns.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    crate::process_job::output(&mut command, std::time::Duration::from_secs(3))
-        .is_ok_and(|output| output.status.success())
 }
 
 const DEFAULT_FOREGROUND: [u8; 3] = [0xff, 0xff, 0xff];
@@ -1461,15 +1448,21 @@ mod tests {
     }
 
     #[test]
-    fn continuous_resize_has_a_bounded_wait() {
-        let mut debouncer = ResizeDebouncer::default();
-        assert!(!debouncer.observe(25, 90));
-        assert!(!debouncer.observe(26, 100));
-        assert!(!debouncer.observe(27, 110));
+    fn first_resize_is_immediate_and_continuous_resizes_are_rate_limited() {
+        let mut throttle = ResizeThrottle::default();
         assert!(
-            debouncer.observe(28, 120),
-            "continuous dragging must not postpone SIGWINCH indefinitely"
+            throttle.observe(),
+            "first change must not wait for stable polls"
         );
+        throttle.retry_later();
+        assert!(!throttle.observe());
+        assert!(
+            throttle.observe(),
+            "continuous dragging must still deliver sizes"
+        );
+        throttle.retry_later();
+        assert!(!throttle.observe());
+        assert!(throttle.observe());
     }
 
     #[test]
@@ -1567,18 +1560,21 @@ mod tests {
     }
 
     #[test]
-    fn waits_for_a_stable_terminal_size_before_resizing() {
-        let mut debouncer = ResizeDebouncer::default();
-
-        assert!(!debouncer.observe(40, 120));
-        assert!(!debouncer.observe(40, 120));
-        assert!(debouncer.observe(40, 120));
-        debouncer.retry_later(); // The ready size has been dispatched.
-
-        assert!(!debouncer.observe(50, 160));
-        assert!(!debouncer.observe(50, 160));
-        debouncer.retry_later();
-        assert!(!debouncer.observe(50, 160));
-        assert!(debouncer.observe(50, 160));
+    fn idle_resize_dispatches_immediately_without_extra_work() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let mut resize = WindowsPtyResize::start(move |rows, columns| {
+            seen_tx.send((rows, columns)).unwrap();
+            true
+        })
+        .unwrap();
+        resize.apply(24, 80);
+        assert!(seen_rx.try_recv().is_err());
+        resize.apply(40, 120);
+        assert_eq!(
+            seen_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            (40, 120)
+        );
     }
 }
