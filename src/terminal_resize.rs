@@ -203,8 +203,10 @@ mod tests {
         let mut pipe = ResizePipe::spawn(&mut command).unwrap();
         let pid = pipe.child.id();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !path.exists() {
-            assert!(Instant::now() < deadline);
+        // Shell redirection creates an empty file before tty writes its name.
+        // Wait for the complete line, not just the directory entry.
+        while !fs::read(&path).is_ok_and(|bytes| bytes.last() == Some(&b'\n')) {
+            assert!(Instant::now() < deadline, "PTY startup did not finish");
             std::thread::sleep(Duration::from_millis(5));
         }
         for (rows, cols) in [(40, 120), (30, 90), (24, 80)] {
