@@ -19,6 +19,8 @@ mod shortcuts;
 mod tabs;
 mod terminal;
 mod terminal_input;
+#[cfg(any(windows, test))]
+mod terminal_resize;
 mod tree;
 mod window_activity;
 mod window_resize;

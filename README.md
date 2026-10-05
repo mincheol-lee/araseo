@@ -173,6 +173,15 @@ its own disposable window and compares native client pixels after resizing,
 maximizing, minimizing and a native surface-loss repaint. Blank captures fail.
 It never closes an existing Araseo window.
 
+For Windows-to-WSL resize latency verification, build the headless fixture
+`harness/examples/windows_resize_latency.rs` with the Windows target, then run
+it on Windows with the WSL distribution name as its argument. It uses a private
+Python 3 PTY, verifies the foreground resize signal and final size, and compares
+fresh WSL commands with the persistent resize pipe. It does not start Codex or
+access an existing terminal. The persistent pipe sleeps while idle and closes
+when its terminal is dropped; failures use the previous command path and retry
+connecting after a five-second cooldown.
+
 Pushing a `v`-prefixed tag matching the version in `Cargo.toml` runs the
 release workflow: it verifies Linux and Windows targets, builds the Windows
 executable, and publishes the GitHub Release assets. A suffix such as

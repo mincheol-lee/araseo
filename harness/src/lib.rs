@@ -44,3 +44,7 @@ pub mod process_job;
 
 #[path = "../../src/document_io.rs"]
 pub mod document_io;
+
+#[cfg(any(windows, test))]
+#[path = "../../src/terminal_resize.rs"]
+pub mod terminal_resize;
