@@ -184,6 +184,12 @@ conflict resolution before saving. Terminal tabs start new shells in their
 original folders; running commands and terminal history cannot resume. Git
 diff tabs are temporary and are not reopened.
 
+In **WSL environment**, each process owned by your WSL user has a **Stop**
+button. Confirm with **Terminate** for a normal exit request, or **Force kill**
+for immediate termination. The snapshot refreshes after the action. No admin
+privileges are needed. This feature requires Python 3.9+ and pidfd support in
+that WSL distribution; diagnostics still work without them.
+
 For crash investigation, Araseo writes a small local log to
 `%LOCALAPPDATA%\araseo\logs\araseo.log` on Windows (or
 `$XDG_STATE_HOME/araseo/logs/araseo.log` on Linux, defaulting to

@@ -1,4 +1,4 @@
-//! Read-only, on-demand checks for the WSL workspace used by the desktop UI.
+//! On-demand WSL diagnostics and explicitly requested process termination.
 use crate::workspace::Workspace;
 use std::io;
 use std::path::Path;
@@ -12,7 +12,17 @@ if [ -d "$1" ]; then echo 'WORKSPACE=ok'; else echo 'WORKSPACE=missing'; fi
 printf 'MEM_KIB='; awk '/^MemAvailable:/ { print $2 }' /proc/meminfo
 printf 'GIT='; if command -v git >/dev/null 2>&1; then echo yes; else echo no; fi
 printf 'DOCKER_DAEMON='; if ps -eo comm= 2>/dev/null | grep -qx dockerd; then echo yes; else echo no; fi
-ps -eo pid=,rss=,etime=,comm= --sort=-rss 2>/dev/null | head -n 8 | sed 's/^/PROCESS=/'
+printf 'BOOT_ID='; cat /proc/sys/kernel/random/boot_id
+printf 'CURRENT_UID='; id -u
+ps -eo pid=,rss=,etime=,comm= --sort=-rss 2>/dev/null | head -n 8 |
+while read -r pid rss elapsed name; do
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || continue
+    fields=${stat##*) }
+    start=$(printf '%s\n' "$fields" | awk '{print $20}')
+    uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+    printf 'PROCESS=%s %s %s %s\n' "$pid" "$rss" "$elapsed" "$name"
+    printf 'PROCESS_ID=%s %s %s\n' "$pid" "$start" "$uid"
+done
 "#;
 
 const HOST_DISK_PROBE: &str = r#"
@@ -41,6 +51,14 @@ pub struct ProcessInfo {
     pub rss_kib: u64,
     pub elapsed: String,
     pub name: String,
+    pub target: Option<ProcessTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessTarget {
+    pid: u32,
+    start_ticks: u64,
+    boot_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +100,7 @@ pub struct Check {
     pub level: Level,
     pub detail: String,
     pub kind: &'static str,
+    pub process: Option<ProcessTarget>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -97,6 +116,7 @@ impl Report {
             level,
             detail: detail.into(),
             kind: "check",
+            process: None,
         });
     }
 
@@ -110,6 +130,7 @@ impl Report {
                 process.elapsed
             ),
             kind: "process",
+            process: process.target.clone(),
         });
     }
 
@@ -287,14 +308,139 @@ fn parse_processes(output: &str) -> Vec<ProcessInfo> {
         .lines()
         .filter_map(|line| {
             let mut fields = line.strip_prefix("PROCESS=")?.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let rss_kib = fields.next()?.parse().ok()?;
+            let elapsed = fields.next()?.to_owned();
+            let name = fields.collect::<Vec<_>>().join(" ");
+            if name.is_empty() {
+                return None;
+            }
             Some(ProcessInfo {
-                pid: fields.next()?.parse().ok()?,
-                rss_kib: fields.next()?.parse().ok()?,
-                elapsed: fields.next()?.to_owned(),
-                name: fields.next()?.to_owned(),
+                pid,
+                rss_kib,
+                elapsed,
+                name,
+                target: process_target(output, pid),
             })
         })
         .collect()
+}
+
+fn process_target(output: &str, pid: u32) -> Option<ProcessTarget> {
+    if pid <= 1 {
+        return None;
+    }
+    let current_uid: u32 = value(output, "CURRENT_UID=")?.parse().ok()?;
+    let boot_id = value(output, "BOOT_ID=")?;
+    if boot_id.len() != 36 || !boot_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return None;
+    }
+    for line in output
+        .lines()
+        .filter_map(|line| line.strip_prefix("PROCESS_ID="))
+    {
+        let mut fields = line.split_whitespace();
+        if fields.next()?.parse::<u32>().ok()? != pid {
+            continue;
+        }
+        let start_ticks = fields.next()?.parse::<u64>().ok()?;
+        let uid = fields.next()?.parse::<u32>().ok()?;
+        if uid != current_uid || start_ticks == 0 {
+            return None;
+        }
+        return Some(ProcessTarget {
+            pid,
+            start_ticks,
+            boot_id: boot_id.into(),
+        });
+    }
+    None
+}
+
+// Open a pidfd before rechecking identity, then signal through that handle.
+// There is deliberately no numeric-PID fallback on unsupported systems.
+const TERMINATE_PROCESS: &str = r#"
+import os, sys, signal, select
+try:
+    pid, expected_start, boot, force = sys.argv[1:]
+    pid = int(pid)
+    if pid <= 1:
+        raise ValueError('System init cannot be stopped.')
+    if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+        raise ValueError('Process termination requires Python 3.9+ and a WSL2 kernel supporting pidfd.')
+    with open('/proc/sys/kernel/random/boot_id') as f:
+        if f.read().strip() != boot:
+            raise ValueError('WSL restarted since this snapshot. Run again before stopping a process.')
+    fd = os.pidfd_open(pid)
+    try:
+        with open('/proc/%d/stat' % pid) as f:
+            stat = f.read().rsplit(') ', 1)[1].split()
+        if stat[19] != expected_start:
+            raise ValueError('This PID now belongs to a different process. Run again to refresh the list.')
+        with open('/proc/%d/status' % pid) as f:
+            uid = next(line.split()[1] for line in f if line.startswith('Uid:'))
+        if int(uid) != os.getuid():
+            raise PermissionError('Only processes owned by the current WSL user can be stopped.')
+        signal.pidfd_send_signal(fd, signal.SIGKILL if force == '1' else signal.SIGTERM)
+        if select.select([fd], [], [], 2.0)[0]:
+            print('STOPPED')
+        else:
+            print('SIGNAL_SENT')
+    finally:
+        os.close(fd)
+except (ProcessLookupError, FileNotFoundError):
+    print('ERROR=The process has already exited or is no longer accessible. Run again to refresh the list.')
+except PermissionError:
+    print('ERROR=Permission denied. Only processes owned by the current WSL user can be stopped.')
+except Exception as error:
+    print('ERROR=' + str(error))
+"#;
+
+/// Called only after explicit confirmation, off the UI thread, in the snapshot's distribution.
+pub fn terminate_process(
+    workspace: &Workspace,
+    target: &ProcessTarget,
+    force: bool,
+) -> io::Result<String> {
+    if target.pid <= 1 || target.start_ticks == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid process identity",
+        ));
+    }
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new(r"C:\Windows\System32\wsl.exe");
+        command.args(["--distribution", &workspace.distro, "--exec", "sh"]);
+        command
+    } else {
+        Command::new("sh")
+    };
+    command.args(["-c", "if command -v python3 >/dev/null 2>&1; then exec python3 -c \"$1\" \"$2\" \"$3\" \"$4\" \"$5\"; else echo 'ERROR=Process termination requires Python 3.9+ in this WSL distribution.'; fi", "sh", TERMINATE_PROCESS]);
+    command
+        .arg(target.pid.to_string())
+        .arg(target.start_ticks.to_string())
+        .arg(&target.boot_id)
+        .arg(if force { "1" } else { "0" });
+    hide_window(&mut command);
+    let output = run_command(command)?;
+    match output.trim() {
+        "STOPPED" => Ok(format!(
+            "PID {} stopped. Refreshing snapshot...",
+            target.pid
+        )),
+        "SIGNAL_SENT" if force => Ok(format!(
+            "Kill signal sent to PID {}. It has not exited yet.",
+            target.pid
+        )),
+        "SIGNAL_SENT" => Ok(format!(
+            "Signal sent to PID {}. It is still running; use Force kill if needed.",
+            target.pid
+        )),
+        message if message.starts_with("ERROR=") => Err(io::Error::other(&message[6..])),
+        _ => Err(io::Error::other(
+            "Process termination returned an unexpected response",
+        )),
+    }
 }
 
 fn run_docker_command(workspace: &Workspace, args: &[&str]) -> io::Result<String> {
@@ -711,6 +857,153 @@ mod tests {
         let report = evaluate(&workspace("/home/me/project"), true, None, None, &active);
         assert!(report.docker_usage_available);
         assert!(report.copy_text().contains("2 containers: web, database"));
+    }
+
+    #[test]
+    fn process_actions_require_owned_snapshot_identity_and_keep_names_with_spaces() {
+        let output = "BOOT_ID=12345678-1234-1234-1234-123456789abc\nCURRENT_UID=1000\nPROCESS=42 2048 00:20 app worker\nPROCESS_ID=42 200 1000\nPROCESS=43 4096 00:10 root-task\nPROCESS_ID=43 300 0\nPROCESS=1 100 01:00 init\nPROCESS_ID=1 100 1000\nPROCESS=44 10 00:01 vanished\n";
+        let processes = parse_processes(output);
+        assert_eq!(processes[0].name, "app worker");
+        assert_eq!(processes[0].target.as_ref().unwrap().start_ticks, 200);
+        assert!(
+            processes[1..]
+                .iter()
+                .all(|process| process.target.is_none())
+        );
+        let report = evaluate(
+            &workspace("/home/me/project"),
+            true,
+            None,
+            None,
+            &Activity {
+                processes,
+                ..Activity::default()
+            },
+        );
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .filter(|check| check.process.is_some())
+                .count(),
+            1
+        );
+        assert!(
+            parse_processes("PROCESS=42 10 00:01 old snapshot\n")[0]
+                .target
+                .is_none()
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn termination_rejects_stale_identity_then_gracefully_stops_owned_child() {
+        let mut child = TestChild(Command::new("sleep").arg("30").spawn().unwrap());
+        let target = child.target();
+        let mut stale = target.clone();
+        stale.start_ticks += 1;
+        let workspace = workspace("/tmp");
+        assert!(
+            terminate_process(&workspace, &stale, false)
+                .unwrap_err()
+                .to_string()
+                .contains("different process")
+        );
+        stale = target.clone();
+        stale.boot_id = "00000000-0000-0000-0000-000000000000".into();
+        assert!(
+            terminate_process(&workspace, &stale, true)
+                .unwrap_err()
+                .to_string()
+                .contains("restarted")
+        );
+        stale.pid = 1;
+        assert_eq!(
+            terminate_process(&workspace, &stale, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(
+            terminate_process(&workspace, &target, false)
+                .unwrap()
+                .contains("stopped")
+        );
+        assert!(!child.0.wait().unwrap().success());
+        assert!(
+            terminate_process(&workspace, &target, true)
+                .unwrap_err()
+                .to_string()
+                .contains("already exited")
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn ignored_termination_requires_explicit_force_kill() {
+        use std::io::Read;
+        let mut child = TestChild(
+            Command::new("sh")
+                .args(["-c", "trap '' TERM; printf READY; exec sleep 30"])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = [0; 5];
+        child
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"READY");
+        let target = child.target();
+        assert!(
+            terminate_process(&workspace("/tmp"), &target, false)
+                .unwrap()
+                .contains("still running")
+        );
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(
+            terminate_process(&workspace("/tmp"), &target, true)
+                .unwrap()
+                .contains("stopped")
+        );
+        assert!(!child.0.wait().unwrap().success());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    struct TestChild(std::process::Child);
+    #[cfg(not(target_os = "windows"))]
+    impl TestChild {
+        fn target(&self) -> ProcessTarget {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.0.id())).unwrap();
+            ProcessTarget {
+                pid: self.0.id(),
+                start_ticks: stat
+                    .rsplit_once(") ")
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .nth(19)
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+                boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .unwrap()
+                    .trim()
+                    .into(),
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[cfg(not(target_os = "windows"))]

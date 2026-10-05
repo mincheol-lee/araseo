@@ -113,6 +113,7 @@ export struct GitEntry {
 }
 
 export struct WslCheckEntry {
+    can-stop: bool,
     title: string,
     level: string,
     detail: string,
@@ -1429,6 +1430,10 @@ export component AppWindow inherits Window {
     in-out property <bool> wsl-diagnostics-visible: false;
     in property <bool> wsl-diagnostics-running: false;
     in property <[WslCheckEntry]> wsl-checks;
+    in property <bool> wsl-process-running: false;
+    in property <string> wsl-process-message: "";
+    in-out property <int> wsl-process-selected: -1;
+    private property <string> wsl-process-title;
     in property <string> wsl-report-text: "";
     in property <bool> wsl-docker-usage-available: false;
     in-out property <bool> wsl-docker-usage-visible: false;
@@ -1721,7 +1726,13 @@ export component AppWindow inherits Window {
     callback focused-group-changed(int);
     callback window-drag-requested();
     callback wsl-diagnostics-requested();
+    callback wsl-process-termination-requested(int, bool);
     callback wsl-docker-usage-requested();
+
+    public function close-wsl-diagnostics() {
+        root.wsl-diagnostics-visible = false;
+        root.wsl-process-selected = -1;
+    }
 
     public function focus-terminal() {
         if (root.dynamic-panes) {
@@ -2842,12 +2853,13 @@ export component AppWindow inherits Window {
                     vertical-alignment: center;
                 }
                 Button { text: "WSL"; width: 46px; clicked => {
+                    root.wsl-process-selected = -1;
                     root.wsl-diagnostics-visible = !root.wsl-diagnostics-visible;
                     root.font-menu-visible = false;
                     if (root.wsl-diagnostics-visible) { root.wsl-diagnostics-requested(); }
                 } }
                 Button { text: "Aa"; width: 38px; clicked => {
-                    root.wsl-diagnostics-visible = false;
+                    root.close-wsl-diagnostics();
                     root.font-menu-visible = !root.font-menu-visible;
                 } }
                 Text { text: root.status-text; color: Chrome.muted; font-size: 11px; vertical-alignment: center; }
@@ -3275,7 +3287,7 @@ export component AppWindow inherits Window {
             height: parent.height - 24px;
             background: #070c13;
             opacity: 0.6;
-            TouchArea { clicked => { root.wsl-diagnostics-visible = false; } }
+            TouchArea { clicked => { root.close-wsl-diagnostics(); } }
         }
         if root.wsl-diagnostics-visible: Rectangle {
             x: (parent.width - self.width) / 2;
@@ -3293,11 +3305,11 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     height: 26px;
                     Text { text: "WSL environment"; color: Chrome.text; font-size: 16px; font-weight: 600; horizontal-stretch: 1; }
-                    ActionButton { label: "Close"; clicked => { root.wsl-diagnostics-visible = false; } }
+                    ActionButton { label: "Close"; clicked => { root.close-wsl-diagnostics(); } }
                 }
                 Text {
                     height: 34px;
-                    text: root.wsl-diagnostics-running ? "Checking this workspace..." : "Read-only snapshot; no processes or services are stopped";
+                    text: root.wsl-diagnostics-running ? "Checking this workspace..." : "Snapshot of this distribution. Stop a process using its row button.";
                     color: Chrome.muted;
                     font-size: 12px;
                     vertical-alignment: center;
@@ -3306,14 +3318,22 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     VerticalLayout {
                         spacing: 5px;
-                        for check in root.wsl-checks: Rectangle {
+                        for check[index] in root.wsl-checks: Rectangle {
                             height: check.kind == "process" ? 46px : 65px;
                             background: Chrome.surface;
                             border-radius: 6px;
+                            if check.can-stop: ActionButton {
+                                x: parent.width - self.width - 8px;
+                                y: 9px;
+                                label: "Stop";
+                                intent: "danger";
+                                available: !root.wsl-diagnostics-running && !root.wsl-process-running;
+                                clicked => { root.wsl-process-selected = index; root.wsl-process-title = check.title; }
+                            }
                             Text {
                                 x: 10px;
                                 y: 8px;
-                                width: parent.width - 20px;
+                                width: parent.width - (check.can-stop ? 94px : 20px);
                                 height: 20px;
                                 text: (check.level == "good" ? "✓  " : check.level == "warning" ? "!  " : check.level == "error" ? "×  " : "·  ") + check.title;
                                 color: check.level == "good" ? #80d8a3 : check.level == "warning" ? #f0c57e : check.level == "error" ? Chrome.danger : Chrome.muted;
@@ -3322,7 +3342,7 @@ export component AppWindow inherits Window {
                             Text {
                                 x: 10px;
                                 y: check.kind == "process" ? 25px : 29px;
-                                width: parent.width - 20px;
+                                width: parent.width - (check.can-stop ? 94px : 20px);
                                 height: check.kind == "process" ? 18px : 32px;
                                 text: check.detail;
                                 color: Chrome.text;
@@ -3355,10 +3375,27 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                if root.wsl-process-selected >= 0: VerticalLayout {
+                    spacing: 6px;
+                    Text { text: "Stop " + root.wsl-process-title + "?"; color: Chrome.text; wrap: word-wrap; }
+                    Text { text: "Terminate requests a clean exit. Force kill stops immediately and may lose unsaved work."; color: Chrome.muted; font-size: 11px; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton { label: "Cancel"; clicked => { root.wsl-process-selected = -1; } }
+                        ActionButton { label: "Terminate"; available: !root.wsl-process-running && !root.wsl-diagnostics-running; clicked => { root.wsl-process-termination-requested(root.wsl-process-selected, false); } }
+                        ActionButton { label: "Force kill"; intent: "danger"; available: !root.wsl-process-running && !root.wsl-diagnostics-running; clicked => { root.wsl-process-termination-requested(root.wsl-process-selected, true); } }
+                    }
+                }
+                if root.wsl-process-message != "": Text {
+                    text: root.wsl-process-message;
+                    color: Chrome.muted;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
                 HorizontalLayout {
                     height: 30px;
                     spacing: 8px;
-                    ActionButton { label: "Run again"; available: !root.wsl-diagnostics-running; clicked => { root.wsl-diagnostics-requested(); } }
+                    ActionButton { label: "Run again"; available: !root.wsl-diagnostics-running && !root.wsl-process-running; clicked => { root.wsl-diagnostics-requested(); } }
                     if root.wsl-docker-usage-available: ActionButton {
                         label: root.wsl-docker-usage-visible ? "Hide containers" : "Container usage";
                         clicked => {
