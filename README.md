@@ -176,6 +176,14 @@ Font settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or
 `~/.config/araseo/fonts.conf`). The original MVP specification is in
 [docs/PRD.md](docs/PRD.md); it predates several features described here.
 
+On normal exit, Araseo saves each workspace's open file and terminal tabs,
+tab selection and split layout, sidebar width, and window size under
+`%LOCALAPPDATA%/araseo/sessions` (or `$XDG_CONFIG_HOME/araseo/sessions` on Linux).
+Unsaved editor text is restored, and changes to the disk copy still require
+conflict resolution before saving. Terminal tabs start new shells in their
+original folders; running commands and terminal history cannot resume. Git
+diff tabs are temporary and are not reopened.
+
 For crash investigation, Araseo writes a small local log to
 `%LOCALAPPDATA%\araseo\logs\araseo.log` on Windows (or
 `$XDG_STATE_HOME/araseo/logs/araseo.log` on Linux, defaulting to

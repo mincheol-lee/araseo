@@ -12,19 +12,21 @@ mod git;
 mod highlight;
 mod markdown_preview;
 mod preview;
+mod session;
 mod shortcuts;
 mod tabs;
 mod terminal;
 mod tree;
+mod window_activity;
 mod workspace;
 mod workspace_history;
-mod window_activity;
 mod wsl_diagnostics;
 
 use anyhow::{Context, Result, bail};
 use background::Background;
 use document::{Document, ExternalRefresh};
 use preview::{LoadedPreview, PdfTextPage, PreviewKind, RenderedPage};
+use session::{SavedKind, SavedTab, Session};
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::{Cell, RefCell};
@@ -36,8 +38,8 @@ use std::time::{Duration, Instant};
 use tabs::{Axis, Dock, Rect, TabGroups, TabId};
 use terminal::{AgentKind, AgentStatus, TerminalSession};
 use tree::{FlatNode, GitStatus};
-use workspace::Workspace;
 use window_activity::WindowActivity;
+use workspace::Workspace;
 
 slint::include_modules!();
 
@@ -46,6 +48,12 @@ struct AppState {
     added_workspaces: Vec<Workspace>,
     remembered_folders: Vec<PathBuf>,
     workspace_history_path: Option<PathBuf>,
+    session_path: Option<PathBuf>,
+    saved_session: Option<Session>,
+    session_loader: Background<Vec<(SavedTab, Result<RestoredContent>)>>,
+    startup_loaded: bool,
+    session_restore_incomplete: bool,
+    session_restore_interacted: bool,
     expanded: HashSet<PathBuf>,
     expanded_git_repositories: HashSet<PathBuf>,
     statuses: HashMap<PathBuf, GitStatus>,
@@ -127,6 +135,11 @@ enum OpenedFile {
     Preview(LoadedPreview),
 }
 
+enum RestoredContent {
+    File(OpenedFile),
+    Terminal(TerminalSession),
+}
+
 struct PreviewTab {
     linux_path: PathBuf,
     kind: PreviewKind,
@@ -171,6 +184,10 @@ fn run() -> Result<()> {
     let workspace = Workspace::prepare(distro, root)?;
     let workspace_history_path =
         workspace_history::settings_path(&workspace.distro, &workspace.linux_root);
+    let session_path = session::settings_path(&workspace.distro, &workspace.linux_root);
+    let saved_session = session_path
+        .as_deref()
+        .and_then(|path| Session::load(path, &workspace.distro, &workspace.linux_root));
     let remembered_folders = workspace_history_path
         .as_deref()
         .map(|path| workspace_history::load(path, &workspace.distro, &workspace.linux_root))
@@ -191,6 +208,12 @@ fn run() -> Result<()> {
         added_workspaces: Vec::new(),
         remembered_folders: remembered_folders.clone(),
         workspace_history_path,
+        session_path,
+        saved_session,
+        session_loader: Background::default(),
+        startup_loaded: false,
+        session_restore_incomplete: false,
+        session_restore_interacted: false,
         expanded: HashSet::new(),
         expanded_git_repositories: HashSet::new(),
         statuses,
@@ -239,11 +262,34 @@ fn run() -> Result<()> {
         });
     }
 
+    let saved_tabs = state
+        .borrow()
+        .saved_session
+        .as_ref()
+        .map(|saved| saved.tabs.clone());
+    if let Some(tabs) = saved_tabs {
+        let workspace = state.borrow().workspace.clone();
+        let folders = state.borrow().remembered_folders.clone();
+        state
+            .borrow_mut()
+            .session_loader
+            .request(move || restore_contents(tabs, workspace, folders));
+    }
+
     refresh_tree(&mut state.borrow_mut());
     let mut icon_loader = Background::default();
     icon_loader.request(emoji::EmojiIcons::load_pixels);
 
     let ui = AppWindow::new()?;
+    if let Some(saved) = state.borrow().saved_session.as_ref() {
+        ui.set_sidebar_width(saved.sidebar_width.clamp(170.0, 800.0));
+        ui.set_sidebar_view(saved.sidebar_view.clamp(0, 1));
+        ui.window().set_size(slint::PhysicalSize::new(
+            saved.window_width.clamp(640, 3840),
+            saved.window_height.clamp(400, 2160),
+        ));
+        ui.window().set_maximized(saved.maximized);
+    }
     ui.set_folder_browser_available(cfg!(windows));
     ui.set_dynamic_panes(true);
     ui.set_extra_panes(ModelRc::new(VecModel::from(Vec::<PaneEntry>::new())));
@@ -650,7 +696,8 @@ fn run() -> Result<()> {
                         (Ok(source_workspace), Ok(target_workspace)) => {
                             let result_parent = parent.clone();
                             state.tree_action_pending = true;
-                            state.status = format!("Moving {} to {}...", from.display(), parent.display());
+                            state.status =
+                                format!("Moving {} to {}...", from.display(), parent.display());
                             state.tree_action_loader.request(move || {
                                 let from_host = source_workspace.host_path(&from)?;
                                 let to = tree::move_file(
@@ -1393,8 +1440,21 @@ fn run() -> Result<()> {
                     Err(error) => state.status = error.to_string(),
                 }
                 sync_ui(&ui, &state);
+                state.startup_loaded = true;
                 if focus_startup_terminal {
                     ui.invoke_focus_terminal();
+                }
+            }
+            if state.startup_loaded
+                && let Some(restored) = state.session_loader.poll()
+                && let Some(saved) = state.saved_session.take()
+            {
+                if state.session_restore_interacted {
+                    state.session_restore_incomplete = true;
+                    state.status = "Workspace restore deferred after user input".into();
+                    ui.set_status_text(state.status.clone().into());
+                } else {
+                    apply_restored_session(&ui, &mut state, saved, restored);
                 }
             }
             if let Some(results) = state.restore_folder_loader.poll() {
@@ -1691,54 +1751,48 @@ fn run() -> Result<()> {
         let weak = ui.as_weak();
         let state = state.clone();
         let window_activity = window_activity.clone();
-        agent_timer.start(
-            TimerMode::Repeated,
-            Duration::from_millis(500),
-            move || {
-                let Some(ui) = weak.upgrade() else { return };
-                let mut state = state.borrow_mut();
-                if state.agent_probe_in_flight {
-                    let Some(detected) = state.agent_probe_loader.poll() else {
-                        return;
-                    };
-                    state.agent_probe_in_flight = false;
-                    let previous = state.agent_kinds.clone();
-                    state.agent_kinds.clear();
-                    for (tab_id, agent) in detected {
-                        if state.tabs.iter().any(|tab| tab.id == tab_id)
-                            && let Some(agent) = agent
-                        {
-                            state.agent_kinds.insert(tab_id, agent);
-                        }
-                    }
-                    if state.agent_kinds != previous {
-                        sync_tabs(&ui, &state);
-                    }
-                }
-                if !window_activity.should_probe_agents() {
+        agent_timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut state = state.borrow_mut();
+            if state.agent_probe_in_flight {
+                let Some(detected) = state.agent_probe_loader.poll() else {
                     return;
+                };
+                state.agent_probe_in_flight = false;
+                let previous = state.agent_kinds.clone();
+                state.agent_kinds.clear();
+                for (tab_id, agent) in detected {
+                    if state.tabs.iter().any(|tab| tab.id == tab_id)
+                        && let Some(agent) = agent
+                    {
+                        state.agent_kinds.insert(tab_id, agent);
+                    }
                 }
-                let probes = state
-                    .tabs
-                    .iter()
-                    .filter_map(|tab| match &tab.content {
-                        TabContent::Terminal { session, .. } => {
-                            Some((tab.id, session.agent_probe()))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                if !probes.is_empty() {
-                    state.agent_probe_loader.request(move || {
-                        probes
-                            .into_iter()
-                            .map(|(id, probe)| (id, probe.detect()))
-                            .collect()
-                    });
-                    state.agent_probe_in_flight = true;
+                if state.agent_kinds != previous {
+                    sync_tabs(&ui, &state);
                 }
-            },
-        );
+            }
+            if !window_activity.should_probe_agents() {
+                return;
+            }
+            let probes = state
+                .tabs
+                .iter()
+                .filter_map(|tab| match &tab.content {
+                    TabContent::Terminal { session, .. } => Some((tab.id, session.agent_probe())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !probes.is_empty() {
+                state.agent_probe_loader.request(move || {
+                    probes
+                        .into_iter()
+                        .map(|(id, probe)| (id, probe.detect()))
+                        .collect()
+                });
+                state.agent_probe_in_flight = true;
+            }
+        });
     }
 
     let workspace_timer = Timer::default();
@@ -1821,10 +1875,176 @@ fn run() -> Result<()> {
 
     diagnostics_log::event("event loop started");
     ui.run()?;
+    if let Err(error) = save_current_session(&ui, &state.borrow()) {
+        diagnostics_log::event(&format!("could not save workspace session: {error}"));
+    }
     drop(timer);
     drop(agent_timer);
     drop(workspace_timer);
     Ok(())
+}
+
+fn restore_contents(
+    tabs: Vec<SavedTab>,
+    workspace: Workspace,
+    folders: Vec<PathBuf>,
+) -> Vec<(SavedTab, Result<RestoredContent>)> {
+    let mut workspaces = vec![workspace.clone()];
+    workspaces.extend(
+        folders
+            .into_iter()
+            .filter_map(|root| Workspace::prepare(workspace.distro.clone(), root).ok()),
+    );
+    tabs.into_iter()
+        .map(|tab| {
+            let result = (|| {
+                let owner = workspace::for_path(&workspaces, &tab.path)
+                    .context("saved path is outside the workspace")?;
+                let host = owner.host_path(&tab.path)?;
+            match &tab.kind {
+                SavedKind::File { .. } => {
+                    let mut document = Document::open(tab.path.clone(), host)?;
+                    tab.kind.restore_file(&mut document);
+                    Ok(RestoredContent::File(OpenedFile::Text(document)))
+                }
+                    SavedKind::Preview => {
+                        let kind =
+                            preview::kind_for(&tab.path).context("preview type is unavailable")?;
+                        Ok(RestoredContent::File(OpenedFile::Preview(preview::open(
+                            tab.path.clone(),
+                            host,
+                            kind,
+                        )?)))
+                    }
+                    SavedKind::Terminal { .. } => {
+                        if !host.is_dir() {
+                            bail!("terminal folder is unavailable");
+                        }
+                        Ok(RestoredContent::Terminal(TerminalSession::spawn(
+                            &workspace.distro,
+                            &tab.path,
+                        )?))
+                    }
+                    SavedKind::Diff => bail!("Git diff tabs are transient"),
+                }
+            })();
+            (tab, result)
+        })
+        .collect()
+}
+
+fn apply_restored_session(
+    ui: &AppWindow,
+    state: &mut AppState,
+    saved: Session,
+    restored: Vec<(SavedTab, Result<RestoredContent>)>,
+) {
+    let mut tabs = Vec::new();
+    let mut unavailable = 0;
+    let mut next_terminal_number = 1;
+    for (entry, result) in restored {
+        let content = match result {
+            Ok(RestoredContent::File(OpenedFile::Text(document))) => {
+                Some(TabContent::File(document))
+            }
+            Ok(RestoredContent::File(OpenedFile::Preview(loaded))) => {
+                preview_tab(loaded).ok().map(TabContent::Preview)
+            }
+            Ok(RestoredContent::Terminal(session)) => {
+                let SavedKind::Terminal { number } = &entry.kind else {
+                    continue;
+                };
+                next_terminal_number = next_terminal_number.max(number.saturating_add(1));
+                connect_terminal_output(ui, entry.id, &session);
+                Some(TabContent::Terminal {
+                    session,
+                    start_path: entry.path,
+                    number: *number,
+                })
+            }
+            Err(_) => None,
+        };
+        if let Some(content) = content {
+            tabs.push(WorkspaceTab {
+                id: entry.id,
+                content,
+            });
+        } else if !matches!(entry.kind, SavedKind::Diff) {
+            unavailable += 1;
+        }
+    }
+    let available = tabs.iter().map(|tab| tab.id).collect();
+    let saved_ids = saved.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+    if tabs.is_empty() && unavailable == 0 {
+        state.tabs.clear();
+        state.tab_groups = TabGroups::default();
+        state.next_tab_id = saved_ids.into_iter().max().unwrap_or(0).saturating_add(1);
+        state.next_terminal_number = 1;
+        state.maximized_group = None;
+        state.status = "Previous workspace restored".into();
+        sync_ui(ui, state);
+        return;
+    }
+    let Some(groups) = TabGroups::restore(saved.groups, &saved_ids, &available) else {
+        state.session_restore_incomplete = true;
+        return;
+    };
+    state.session_restore_incomplete = unavailable > 0;
+    state.tabs = tabs;
+    state.tab_groups = groups;
+    state.next_tab_id = saved_ids.into_iter().max().unwrap_or(0).saturating_add(1);
+    state.next_terminal_number = next_terminal_number;
+    state.maximized_group = saved
+        .maximized_group
+        .filter(|group| state.tab_groups.groups().contains(group));
+    state.status = if unavailable == 0 {
+        "Previous workspace restored".into()
+    } else {
+        format!("Workspace restored; {unavailable} tabs unavailable")
+    };
+    sync_ui(ui, state);
+}
+
+fn save_current_session(ui: &AppWindow, state: &AppState) -> std::io::Result<()> {
+    if state.saved_session.is_some() || state.session_restore_incomplete {
+        return Ok(());
+    }
+    let Some(path) = state.session_path.as_deref() else {
+        return Ok(());
+    };
+    let tabs = state
+        .tabs
+        .iter()
+        .map(|tab| {
+            let (path, kind) = match &tab.content {
+            TabContent::File(document) => (document.linux_path.clone(), SavedKind::file(document)),
+                TabContent::Preview(preview) => (preview.linux_path.clone(), SavedKind::Preview),
+                TabContent::Diff(diff) => (diff.path.clone(), SavedKind::Diff),
+                TabContent::Terminal {
+                    start_path, number, ..
+                } => (start_path.clone(), SavedKind::Terminal { number: *number }),
+            };
+            SavedTab {
+                id: tab.id,
+                path,
+                kind,
+            }
+        })
+        .collect();
+    let mut saved = Session::new(
+        state.workspace.distro.clone(),
+        state.workspace.linux_root.clone(),
+        tabs,
+        state.tab_groups.clone(),
+    );
+    let size = ui.window().size();
+    saved.sidebar_width = ui.get_sidebar_width();
+    saved.sidebar_view = ui.get_sidebar_view();
+    saved.window_width = size.width;
+    saved.window_height = size.height;
+    saved.maximized = ui.window().is_maximized();
+    saved.maximized_group = state.maximized_group;
+    saved.save(path)
 }
 
 #[cfg(windows)]
@@ -1890,6 +2110,11 @@ fn install_window_events(
             } | winit::event::WindowEvent::MouseWheel { .. }
         );
         if input {
+            let mut state = _state.borrow_mut();
+            if state.saved_session.is_some() {
+                state.session_restore_interacted = true;
+            }
+            drop(state);
             let now = Instant::now();
             let gap = now.duration_since(last_input);
             if gap >= Duration::from_secs(30) {
@@ -2507,7 +2732,11 @@ fn apply_tree_relocation(
         .collect();
     for node in &mut state.tree {
         if node.linux_path == from {
-            node.name = to.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            node.name = to
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
         }
         node.linux_path = tree::rebased_path(&node.linux_path, from, to);
     }
@@ -3757,12 +3986,21 @@ fn sync_tabs(ui: &AppWindow, state: &AppState) {
                 active: state.tab_groups.active(group) == Some(tab.id),
                 dirty: matches!(&tab.content, TabContent::File(document) if document.dirty),
                 agent: match state.agent_kinds.get(&tab.id) {
-                    Some(AgentStatus { kind: AgentKind::Codex, .. }) => "codex",
-                    Some(AgentStatus { kind: AgentKind::Claude, .. }) => "claude",
+                    Some(AgentStatus {
+                        kind: AgentKind::Codex,
+                        ..
+                    }) => "codex",
+                    Some(AgentStatus {
+                        kind: AgentKind::Claude,
+                        ..
+                    }) => "claude",
                     None => "",
                 }
                 .into(),
-                agent_running: state.agent_kinds.get(&tab.id).is_some_and(|agent| agent.running),
+                agent_running: state
+                    .agent_kinds
+                    .get(&tab.id)
+                    .is_some_and(|agent| agent.running),
             })
             .collect::<Vec<_>>()
     };
