@@ -12,5 +12,11 @@ $DistDirectory = Join-Path $RepositoryRoot "dist"
 New-Item -ItemType Directory -Force -Path $DistDirectory | Out-Null
 Copy-Item -Force (Join-Path $RepositoryRoot "target\release\araseo.exe") (Join-Path $DistDirectory "araseo.exe")
 
+$Symbols = Join-Path $RepositoryRoot "target\release\araseo.pdb"
+if (Test-Path $Symbols) { Copy-Item -Force $Symbols (Join-Path $DistDirectory "araseo.pdb") }
+$Revision = (git rev-parse HEAD).Trim()
+$Hash = (Get-FileHash -Algorithm SHA256 (Join-Path $DistDirectory "araseo.exe")).Hash
+[System.IO.File]::WriteAllText((Join-Path $DistDirectory 'build-info.txt'), "revision=$Revision`nsha256=$Hash`n", [System.Text.Encoding]::ASCII)
+
 Write-Host "Built: $DistDirectory\araseo.exe"
 Write-Host "Set ARASEO_EXE in WSL to the /mnt/c/... path of this executable."

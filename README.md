@@ -189,7 +189,11 @@ For crash investigation, Araseo writes a small local log to
 `$XDG_STATE_HOME/araseo/logs/araseo.log` on Linux, defaulting to
 `~/.local/state/araseo/logs/araseo.log`). It records startup, normal exit,
 window focus, event-loop pauses, Rust panics with backtraces, and unhandled
-Windows exception codes and addresses when available. It does not
+Windows exception codes, thread IDs, module names, relative addresses (RVA),
+and the access type/target for access violations when available. Startup records
+also identify the source revision. Matching debug symbols are retained in
+`dist/` for local builds and in the separate symbols archive for GitHub releases.
+These breadcrumbs help locate a fault; they do not replace a crash dump. It does not
 record editor text or terminal output. Once the log reaches 1 MiB, the next
 launch moves it to `araseo.previous.log`. A native access violation may end the
 process without a final log entry; the last timestamp still helps narrow down

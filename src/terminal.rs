@@ -1,13 +1,14 @@
+use crate::terminal_input::TerminalInput;
 use anyhow::{Context, Result};
 #[cfg(not(target_os = "windows"))]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -35,7 +36,9 @@ fn agent_shell_command(status_path: &str) -> String {
          codex() {{ printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; command codex -c \"$ARASEO_CODEX_HOOKS\" \"$@\"; araseo_result=$?; printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
          claude() {{ printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; command claude --settings \"$ARASEO_CLAUDE_SETTINGS\" \"$@\"; araseo_result=$?; printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
          export -f codex claude; exec /bin/bash --login -i",
-        shell_quote(status_path), shell_quote(CODEX_HOOKS), shell_quote(CLAUDE_SETTINGS)
+        shell_quote(status_path),
+        shell_quote(CODEX_HOOKS),
+        shell_quote(CLAUDE_SETTINGS)
     )
 }
 
@@ -74,24 +77,26 @@ struct WindowsPtyResize {
 
 #[cfg(target_os = "windows")]
 impl WindowsPtyResize {
-    fn new(distro: String, tty_path_file: String) -> Self {
+    fn new(distro: String, tty_path_file: String) -> std::io::Result<Self> {
         let (request_sender, request_receiver) = mpsc::sync_channel(1);
         let (result_sender, result_receiver) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(size @ (rows, columns)) = request_receiver.recv() {
-                let resized = resize_windows_pty(&distro, &tty_path_file, rows, columns);
-                if result_sender.send((size, resized)).is_err() {
-                    break;
+        thread::Builder::new()
+            .name("araseo-resize".into())
+            .spawn(move || {
+                while let Ok(size @ (rows, columns)) = request_receiver.recv() {
+                    let resized = resize_windows_pty(&distro, &tty_path_file, rows, columns);
+                    if result_sender.send((size, resized)).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            })?;
 
-        Self {
+        Ok(Self {
             request_sender,
             result_receiver,
             in_flight: None,
             debouncer: ResizeDebouncer::default(),
-        }
+        })
     }
 
     fn apply(&mut self, rows: u16, columns: u16) -> Option<(u16, u16)> {
@@ -138,7 +143,8 @@ fn resize_windows_pty(distro: &str, tty_path_file: &str, rows: u16, columns: u16
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    command.status().is_ok_and(|status| status.success())
+    crate::process_job::output(&mut command, std::time::Duration::from_secs(3))
+        .is_ok_and(|output| output.status.success())
 }
 
 const DEFAULT_FOREGROUND: [u8; 3] = [0xff, 0xff, 0xff];
@@ -227,11 +233,31 @@ impl OutputSignal {
     }
 }
 
+// Thread creation can fail after the shell starts. Kill that child on every
+// early return, and transfer ownership only once construction has succeeded.
+#[derive(Default)]
+struct SpawnCleanup {
+    pipe: Option<std::process::Child>,
+    pty: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+}
+impl Drop for SpawnCleanup {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.pipe {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(child) = &mut self.pty {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub struct TerminalSession {
     agent_probe: AgentProbe,
     #[cfg(not(target_os = "windows"))]
     master: Box<dyn MasterPty + Send>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: TerminalInput,
     receiver: mpsc::Receiver<Vec<u8>>,
     output_signal: Arc<OutputSignal>,
     parser: vt100::Parser<TerminalCallbacks>,
@@ -262,34 +288,55 @@ pub struct AgentProbe {
 }
 
 impl AgentProbe {
-    pub fn detect(&self) -> Option<AgentStatus> {
+    pub fn detect_many(
+        probes: &[(crate::tabs::TabId, Self)],
+    ) -> Vec<(crate::tabs::TabId, Option<AgentStatus>)> {
+        #[cfg(not(windows))]
+        {
+            probes
+                .iter()
+                .map(|(id, probe)| (*id, probe.detect()))
+                .collect()
+        }
         #[cfg(windows)]
-        let output = {
+        {
+            if probes.is_empty() {
+                return Vec::new();
+            }
             let mut command = Command::new(r"C:\Windows\System32\wsl.exe");
             command.creation_flags(CREATE_NO_WINDOW);
-            command.args([
-                "-d",
-                &self.distro,
-                "--exec",
-                "/bin/sh",
-                "-c",
-                "tty=$(cat \"$1\") && ps -t \"$tty\" -o comm=,args=; printf '\\034'; cat \"$2\" 2>/dev/null",
-                "araseo-agent-probe",
-                &self.tty,
-                &self.status_path,
-            ]);
-            command.output().ok()?
-        };
-        #[cfg(windows)]
-        let (processes, activity) = String::from_utf8_lossy(&output.stdout)
-            .split_once('\x1c')
-            .map(|(processes, activity)| (processes.to_owned(), activity.to_owned()))?;
-        #[cfg(not(windows))]
-        let output = Command::new("ps")
-            .args(["-t", &self.tty, "-o", "comm=,args="])
-            .output()
-            .ok()?;
-        #[cfg(not(windows))]
+            command.args(["-d", &probes[0].1.distro, "--exec", "/bin/sh", "-c",
+                "while [ \"$#\" -ge 2 ]; do tty=$(cat \"$1\" 2>/dev/null); ps -t \"$tty\" -o comm=,args= 2>/dev/null; printf '\\034'; cat \"$2\" 2>/dev/null; printf '\\036'; shift 2; done", "araseo-agent-batch"]);
+            for (_, probe) in probes {
+                command.arg(&probe.tty).arg(&probe.status_path);
+            }
+            let output =
+                crate::process_job::output(&mut command, std::time::Duration::from_secs(3));
+            let records = output
+                .ok()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default();
+            let mut records = records.split('\x1e');
+            probes
+                .iter()
+                .map(|(id, _)| {
+                    let status = records
+                        .next()
+                        .and_then(|record| record.split_once('\x1c'))
+                        .and_then(|(processes, activity)| agent_status(processes, activity));
+                    (*id, status)
+                })
+                .collect()
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn detect(&self) -> Option<AgentStatus> {
+        let output = crate::process_job::output(
+            Command::new("ps").args(["-t", &self.tty, "-o", "comm=,args="]),
+            std::time::Duration::from_secs(3),
+        )
+        .ok()?;
         let (processes, activity) = (
             String::from_utf8_lossy(&output.stdout).into_owned(),
             std::fs::read_to_string(&self.status_path).unwrap_or_default(),
@@ -372,7 +419,11 @@ impl TerminalSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = command.spawn().context("failed to start WSL shell")?;
+        let mut cleanup = SpawnCleanup {
+            pipe: Some(command.spawn().context("failed to start WSL shell")?),
+            pty: None,
+        };
+        let child = cleanup.pipe.as_mut().unwrap();
         let stdout = child.stdout.take().context("WSL stdout is unavailable")?;
         let stderr = child.stderr.take().context("WSL stderr is unavailable")?;
         let stdin = child.stdin.take().context("WSL stdin is unavailable")?;
@@ -380,16 +431,18 @@ impl TerminalSession {
         // Backpressure bounds unread output to roughly 512 KiB per terminal.
         let (sender, receiver) = mpsc::sync_channel(64);
         let output_signal = Arc::new(OutputSignal::default());
-        spawn_reader(stdout, sender.clone(), output_signal.clone());
-        spawn_reader(stderr, sender, output_signal.clone());
+        spawn_reader(stdout, sender.clone(), output_signal.clone())?;
+        spawn_reader(stderr, sender, output_signal.clone())?;
 
+        let writer = TerminalInput::new(stdin)?;
+        let windows_resize = WindowsPtyResize::new(distro.to_string(), tty_path_file.clone())?;
         Ok(Self {
             agent_probe: AgentProbe {
                 tty: tty_path_file.clone(),
                 status_path,
                 distro: distro.to_string(),
             },
-            writer: Arc::new(Mutex::new(Box::new(stdin))),
+            writer,
             receiver,
             output_signal,
             // util-linux `script` allocates an 80x24 Unix PTY by default.
@@ -397,8 +450,8 @@ impl TerminalSession {
             // Codex do not wrap every row into a narrow UI-sized buffer.
             parser: vt100::Parser::new_with_callbacks(24, 80, 10_000, TerminalCallbacks::default()),
             _pty_child: None,
-            _pipe_child: Some(child),
-            windows_resize: WindowsPtyResize::new(distro.to_string(), tty_path_file),
+            _pipe_child: cleanup.pipe.take(),
+            windows_resize,
         })
     }
 
@@ -420,15 +473,19 @@ impl TerminalSession {
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
 
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .context("failed to start WSL shell")?;
+        let mut cleanup = SpawnCleanup {
+            pty: Some(
+                pair.slave
+                    .spawn_command(command)
+                    .context("failed to start WSL shell")?,
+            ),
+            pipe: None,
+        };
         let reader = pair.master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let writer = TerminalInput::new(pair.master.take_writer()?)?;
         let (sender, receiver) = mpsc::sync_channel(64);
         let output_signal = Arc::new(OutputSignal::default());
-        spawn_reader(reader, sender, output_signal.clone());
+        spawn_reader(reader, sender, output_signal.clone())?;
 
         Ok(Self {
             agent_probe: AgentProbe {
@@ -450,20 +507,22 @@ impl TerminalSession {
                 10_000,
                 TerminalCallbacks::default(),
             ),
-            _pty_child: Some(child),
+            _pty_child: cleanup.pty.take(),
             _pipe_child: None,
         })
     }
 
     pub fn poll(&mut self) -> bool {
         let changed = poll_output(&self.receiver, &self.output_signal, &mut self.parser);
-        if !self.parser.callbacks().replies.is_empty()
-            && let Ok(mut writer) = self.writer.lock()
-        {
+        if !self.parser.callbacks().replies.is_empty() {
             // Protocol replies are not user input: do not reset scrollback.
-            write_terminal_replies(&mut *writer, self.parser.callbacks_mut());
+            write_terminal_replies(&mut self.writer, self.parser.callbacks_mut());
         }
         changed
+    }
+
+    pub fn take_input_error(&mut self) -> Option<String> {
+        self.writer.take_error()
     }
 
     pub fn agent_probe(&self) -> AgentProbe {
@@ -516,10 +575,7 @@ impl TerminalSession {
 
     pub fn scroll_scrollback(&mut self, wheel: TerminalWheel) -> bool {
         if let Some(input) = mouse_scroll_input(self.parser.screen(), wheel) {
-            if let Ok(mut writer) = self.writer.lock() {
-                return report_mouse_scroll(self.parser.screen_mut(), &mut *writer, &input);
-            }
-            return false;
+            return report_mouse_scroll(self.parser.screen_mut(), &mut self.writer, &input);
         }
         // Never guess an application's scroll key bindings. Shift overrides
         // mouse capture so retained output remains accessible locally.
@@ -529,10 +585,7 @@ impl TerminalSession {
     pub fn write(&mut self, bytes: &[u8]) -> bool {
         let returned_to_bottom = self.parser.screen().scrollback() > 0;
         self.parser.screen_mut().set_scrollback(0);
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
-        }
+        let _ = self.writer.write_all(bytes);
         returned_to_bottom
     }
 
@@ -766,21 +819,24 @@ fn spawn_reader(
     mut reader: impl Read + Send + 'static,
     sender: mpsc::SyncSender<Vec<u8>>,
     output_signal: Arc<OutputSignal>,
-) {
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(count) => {
-                    if sender.send(buffer[..count].to_vec()).is_err() {
-                        break;
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("araseo-terminal-output".into())
+        .spawn(move || {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        if sender.send(buffer[..count].to_vec()).is_err() {
+                            break;
+                        }
+                        output_signal.notify();
                     }
-                    output_signal.notify();
                 }
             }
-        }
-    });
+        })?;
+    Ok(())
 }
 
 fn terminal_color(color: vt100::Color, default: [u8; 3]) -> [u8; 3] {
@@ -906,10 +962,34 @@ mod tests {
     fn agent_activity_is_tied_to_the_detected_process() {
         let codex = "codex /home/user/.cargo/bin/codex\n";
         let claude = "claude /home/user/.local/bin/claude\n";
-        assert_eq!(agent_status(codex, "codex:running"), Some(AgentStatus { kind: AgentKind::Codex, running: true }));
-        assert_eq!(agent_status(codex, "codex:waiting"), Some(AgentStatus { kind: AgentKind::Codex, running: false }));
-        assert_eq!(agent_status(claude, "claude:running"), Some(AgentStatus { kind: AgentKind::Claude, running: true }));
-        assert_eq!(agent_status(claude, "codex:running"), Some(AgentStatus { kind: AgentKind::Claude, running: false }));
+        assert_eq!(
+            agent_status(codex, "codex:running"),
+            Some(AgentStatus {
+                kind: AgentKind::Codex,
+                running: true
+            })
+        );
+        assert_eq!(
+            agent_status(codex, "codex:waiting"),
+            Some(AgentStatus {
+                kind: AgentKind::Codex,
+                running: false
+            })
+        );
+        assert_eq!(
+            agent_status(claude, "claude:running"),
+            Some(AgentStatus {
+                kind: AgentKind::Claude,
+                running: true
+            })
+        );
+        assert_eq!(
+            agent_status(claude, "codex:running"),
+            Some(AgentStatus {
+                kind: AgentKind::Claude,
+                running: false
+            })
+        );
         assert_eq!(agent_status("bash bash\n", "codex:running"), None);
     }
 
@@ -918,10 +998,8 @@ mod tests {
     fn shell_wrappers_keep_agent_commands_and_reset_activity_after_exit() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = std::env::temp_dir().join(format!(
-            "araseo-agent-shell-test-{}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("araseo-agent-shell-test-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         for name in ["codex", "claude"] {
             let path = directory.join(name);
@@ -943,14 +1021,26 @@ mod tests {
         let output = Command::new("bash")
             .arg("-c")
             .arg(script)
-            .env("PATH", format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()))
+            .env(
+                "PATH",
+                format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()),
+            )
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "codex=codex:waiting\nclaude=claude:waiting\n");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "codex=codex:waiting\nclaude=claude:waiting\n"
+        );
         let codex_args = std::fs::read_to_string(directory.join("status.codex-args")).unwrap();
         let claude_args = std::fs::read_to_string(directory.join("status.claude-args")).unwrap();
-        assert!(codex_args.contains("UserPromptSubmit") && codex_args.contains("PermissionRequest"));
+        assert!(
+            codex_args.contains("UserPromptSubmit") && codex_args.contains("PermissionRequest")
+        );
         assert!(claude_args.contains("--settings") && claude_args.contains("PostToolUse"));
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -966,7 +1056,10 @@ mod tests {
             if terminal.parser.screen().contents().contains("PTY_READY") {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "instrumented shell did not process input");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "instrumented shell did not process input"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -1093,7 +1186,8 @@ mod tests {
         terminal.write(b"stty -echo -icanon min 1 time 0; printf '\\033[?1049h\\033[?1000h\\033[?1006h'; dd bs=1 count=10 2>/dev/null | od -An -tx1; stty sane\r");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !terminal.parser.screen().alternate_screen()
-            || terminal.parser.screen().mouse_protocol_encoding() != vt100::MouseProtocolEncoding::Sgr
+            || terminal.parser.screen().mouse_protocol_encoding()
+                != vt100::MouseProtocolEncoding::Sgr
         {
             terminal.poll();
             assert!(
@@ -1108,7 +1202,12 @@ mod tests {
         });
         // If Shift had injected bytes, dd would consume them before this report.
         terminal.scroll_scrollback(wheel(1));
-        while !terminal.parser.screen().contents().contains("1b 5b 3c 36 34 3b 35 3b 32 4d") {
+        while !terminal
+            .parser
+            .screen()
+            .contents()
+            .contains("1b 5b 3c 36 34 3b 35 3b 32 4d")
+        {
             terminal.poll();
             assert!(
                 std::time::Instant::now() < deadline,

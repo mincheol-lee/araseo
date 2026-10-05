@@ -50,9 +50,10 @@ pub fn init() {
         ));
     }
     event(&format!(
-        "started pid={} version={}",
+        "started pid={} version={} build={}",
         std::process::id(),
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        option_env!("ARASEO_BUILD_REVISION").unwrap_or("unknown")
     ));
 }
 
@@ -66,22 +67,118 @@ unsafe extern "system" fn native_exception(
         && let Some(log) = LOG.get()
         && let Ok(mut file) = log.try_lock()
     {
-        let _ = write_native_exception(
+        let address = record.ExceptionAddress as usize;
+        let module = MODULES.get().and_then(|modules| {
+            modules
+                .iter()
+                .find(|module| address >= module.base && address - module.base < module.size)
+        });
+        let base = module.map(|module| module.base).unwrap_or_else(|| {
+            let mut info = unsafe {
+                std::mem::zeroed::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>()
+            };
+            if unsafe {
+                windows_sys::Win32::System::Memory::VirtualQuery(
+                    record.ExceptionAddress,
+                    &mut info,
+                    std::mem::size_of_val(&info),
+                )
+            } != 0
+            {
+                info.AllocationBase as usize
+            } else {
+                0
+            }
+        });
+        let access = if record.ExceptionCode as u32 == 0xc0000005 && record.NumberParameters >= 2 {
+            Some((
+                record.ExceptionInformation[0],
+                record.ExceptionInformation[1],
+            ))
+        } else {
+            None
+        };
+        let _ = write_native_details(
             &mut *file,
             record.ExceptionCode as u32,
-            record.ExceptionAddress as usize,
+            address,
+            module.map_or("unknown", |module| module.name.as_str()),
+            base,
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+            access,
         );
         let _ = file.flush();
     }
     windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH
 }
 
+#[cfg(windows)]
+struct Module {
+    base: usize,
+    size: usize,
+    name: String,
+}
+#[cfg(windows)]
+static MODULES: OnceLock<Vec<Module>> = OnceLock::new();
+
+/// Cache module names while the process is healthy; the exception filter only reads it.
+pub fn capture_modules() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+        let snapshot =
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, std::process::id());
+        if snapshot == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut entry: MODULEENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        let mut modules = Vec::new();
+        let mut available = Module32FirstW(snapshot, &mut entry);
+        while available != 0 {
+            let end = entry
+                .szModule
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(entry.szModule.len());
+            modules.push(Module {
+                base: entry.modBaseAddr as usize,
+                size: entry.modBaseSize as usize,
+                name: String::from_utf16_lossy(&entry.szModule[..end]),
+            });
+            available = Module32NextW(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+        let _ = MODULES.set(modules);
+    }
+}
+
 #[cfg(any(windows, test))]
-fn write_native_exception(mut output: impl Write, code: u32, address: usize) -> io::Result<()> {
-    writeln!(
+fn write_native_details(
+    mut output: impl Write,
+    code: u32,
+    address: usize,
+    module: &str,
+    base: usize,
+    thread: u32,
+    access: Option<(usize, usize)>,
+) -> io::Result<()> {
+    write!(
         output,
-        "NATIVE_EXCEPTION code=0x{code:08x} address=0x{address:016x}"
-    )
+        "NATIVE_EXCEPTION code=0x{code:08x} address=0x{address:016x} thread={thread} module={module} base=0x{base:016x} rva=0x{:x}",
+        address.saturating_sub(base)
+    )?;
+    if let Some((kind, target)) = access {
+        let kind = match kind {
+            0 => "read",
+            1 => "write",
+            8 => "execute",
+            _ => "unknown",
+        };
+        write!(output, " access={kind} target=0x{target:016x}")?;
+    }
+    writeln!(output)
 }
 
 pub fn event(message: &str) {
@@ -137,10 +234,19 @@ mod tests {
     #[test]
     fn records_native_exception_code_and_address() {
         let mut output = Vec::new();
-        write_native_exception(&mut output, 0xc000_0005, 0x1234).unwrap();
+        write_native_details(
+            &mut output,
+            0xc000_0005,
+            0x1234,
+            "araseo.exe",
+            0x1000,
+            7,
+            Some((1, 0xdead)),
+        )
+        .unwrap();
         assert_eq!(
             output,
-            b"NATIVE_EXCEPTION code=0xc0000005 address=0x0000000000001234\n"
+            b"NATIVE_EXCEPTION code=0xc0000005 address=0x0000000000001234 thread=7 module=araseo.exe base=0x0000000000001000 rva=0x234 access=write target=0x000000000000dead\n"
         );
     }
 }

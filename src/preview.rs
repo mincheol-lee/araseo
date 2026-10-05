@@ -27,11 +27,63 @@ pub fn kind_for(path: &Path) -> Option<PreviewKind> {
 
 pub struct LoadedPreview {
     pub linux_path: PathBuf,
-    pub host_path: PathBuf,
+    pub pixels: Option<ImagePixels>,
     pub kind: PreviewKind,
     pub pdf_bytes: Option<Vec<u8>>,
     pub page_count: usize,
     pub first_page: Option<RenderedPage>,
+}
+
+pub struct ImagePixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub premultiplied: bool,
+}
+fn decode_image(path: &Path) -> Result<ImagePixels> {
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("svg"))
+    {
+        let bytes = fs::read(path)?;
+        let mut options = resvg::usvg::Options {
+            resources_dir: path.parent().map(Path::to_path_buf),
+            ..Default::default()
+        };
+        static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+            std::sync::OnceLock::new();
+        options.fontdb = FONTS
+            .get_or_init(|| {
+                let mut fonts = resvg::usvg::fontdb::Database::new();
+                fonts.load_system_fonts();
+                std::sync::Arc::new(fonts)
+            })
+            .clone();
+        let tree = resvg::usvg::Tree::from_data(&bytes, &options)?;
+        let size = tree.size().to_int_size();
+        let mut pixels = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
+            .context("cannot allocate SVG pixels")?;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::identity(),
+            &mut pixels.as_mut(),
+        );
+        Ok(ImagePixels {
+            width: size.width(),
+            height: size.height(),
+            rgba: pixels.take(),
+            premultiplied: true,
+        })
+    } else {
+        let decoded = image::ImageReader::open(path)?.decode()?.into_rgba8();
+        Ok(ImagePixels {
+            width: decoded.width(),
+            height: decoded.height(),
+            rgba: decoded.into_raw(),
+            premultiplied: false,
+        })
+    }
 }
 
 pub struct RenderedPage {
@@ -60,14 +112,18 @@ pub struct PdfGlyph {
 
 impl PdfTextPage {
     pub fn nearest_glyph(&self, x: f32, y: f32) -> Option<usize> {
-        self.glyphs.iter().enumerate().min_by(|(_, a), (_, b)| {
-            let distance = |g: &PdfGlyph| {
-                let dx = (g.x - x).max(0.0).max(x - g.x - g.width);
-                let dy = (g.y - y).max(0.0).max(y - g.y - g.height);
-                dx * dx + dy * dy
-            };
-            distance(a).total_cmp(&distance(b))
-        }).map(|(index, _)| index)
+        self.glyphs
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let distance = |g: &PdfGlyph| {
+                    let dx = (g.x - x).max(0.0).max(x - g.x - g.width);
+                    let dy = (g.y - y).max(0.0).max(y - g.y - g.height);
+                    dx * dx + dy * dy
+                };
+                distance(a).total_cmp(&distance(b))
+            })
+            .map(|(index, _)| index)
     }
 
     pub fn selected_text(&self, anchor: usize, focus: usize) -> String {
@@ -91,9 +147,16 @@ impl PdfTextPage {
                     result.push('\n');
                     line_height = 0.0;
                 } else if glyph.x > last.x + last.width + text_height * 0.5
-                    && !result.ends_with(' ') && !result.ends_with('\n')
-                    && !matches!(last.text.chars().last(), Some('-' | '\u{2010}' | '\u{2011}'))
-                    && !matches!(glyph.text.chars().next(), Some('.' | ',' | ';' | ':' | '!' | '?' | '%' | ')' | ']' | '}'))
+                    && !result.ends_with(' ')
+                    && !result.ends_with('\n')
+                    && !matches!(
+                        last.text.chars().last(),
+                        Some('-' | '\u{2010}' | '\u{2011}')
+                    )
+                    && !matches!(
+                        glyph.text.chars().next(),
+                        Some('.' | ',' | ';' | ':' | '!' | '?' | '%' | ')' | ']' | '}')
+                    )
                 {
                     result.push(' ');
                 }
@@ -135,10 +198,18 @@ impl PdfTextPage {
             }
             lines.push((glyph.x, glyph.y, right, bottom, glyph.baseline_y));
         }
-        lines.into_iter().map(|(left, top, right, bottom, _)| {
-            let padding = ((bottom - top) * 0.12).clamp(1.0, 3.0);
-            (left, top - padding, right - left, bottom - top + padding * 2.0)
-        }).collect()
+        lines
+            .into_iter()
+            .map(|(left, top, right, bottom, _)| {
+                let padding = ((bottom - top) * 0.12).clamp(1.0, 3.0);
+                (
+                    left,
+                    top - padding,
+                    right - left,
+                    bottom - top + padding * 2.0,
+                )
+            })
+            .collect()
     }
 }
 
@@ -148,24 +219,55 @@ struct TextDevice(PdfTextPage);
 impl<'a> Device<'a> for TextDevice {
     fn set_soft_mask(&mut self, _: Option<hayro_interpret::SoftMask<'a>>) {}
     fn set_blend_mode(&mut self, _: hayro_interpret::BlendMode) {}
-    fn draw_path(&mut self, _: &BezPath, _: Affine, _: &hayro_interpret::Paint<'a>, _: &hayro_interpret::PathDrawMode) {}
+    fn draw_path(
+        &mut self,
+        _: &BezPath,
+        _: Affine,
+        _: &hayro_interpret::Paint<'a>,
+        _: &hayro_interpret::PathDrawMode,
+    ) {
+    }
     fn push_clip_path(&mut self, _: &hayro_interpret::ClipPath) {}
-    fn push_transparency_group(&mut self, _: f32, _: Option<hayro_interpret::SoftMask<'a>>, _: hayro_interpret::BlendMode) {}
-    fn draw_glyph(&mut self, glyph: &hayro_interpret::font::Glyph<'a>, transform: Affine, glyph_transform: Affine, _: &hayro_interpret::Paint<'a>, _: &hayro_interpret::GlyphDrawMode) {
-        let Some(unicode) = glyph.as_unicode() else { return; };
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<hayro_interpret::SoftMask<'a>>,
+        _: hayro_interpret::BlendMode,
+    ) {
+    }
+    fn draw_glyph(
+        &mut self,
+        glyph: &hayro_interpret::font::Glyph<'a>,
+        transform: Affine,
+        glyph_transform: Affine,
+        _: &hayro_interpret::Paint<'a>,
+        _: &hayro_interpret::GlyphDrawMode,
+    ) {
+        let Some(unicode) = glyph.as_unicode() else {
+            return;
+        };
         let text = match unicode {
             hayro_interpret::hayro_cmap::BfString::Char(c) => c.to_string(),
             hayro_interpret::hayro_cmap::BfString::String(s) => s,
         };
         let rect = match glyph {
-            hayro_interpret::font::Glyph::Outline(outline) => ((transform * glyph_transform) * outline.outline()).bounding_box(),
+            hayro_interpret::font::Glyph::Outline(outline) => {
+                ((transform * glyph_transform) * outline.outline()).bounding_box()
+            }
             hayro_interpret::font::Glyph::Type3(_) => return,
         };
-        if text.is_empty() || !rect.x0.is_finite() || !rect.y0.is_finite() { return; }
+        if text.is_empty() || !rect.x0.is_finite() || !rect.y0.is_finite() {
+            return;
+        }
         let baseline = (transform * glyph_transform) * Point::ZERO;
-        self.0.glyphs.push(PdfGlyph { text, x: rect.x0 as f32, y: rect.y0 as f32,
-            width: rect.width().max(2.0) as f32, height: rect.height().max(2.0) as f32,
-            baseline_y: baseline.y as f32 });
+        self.0.glyphs.push(PdfGlyph {
+            text,
+            x: rect.x0 as f32,
+            y: rect.y0 as f32,
+            width: rect.width().max(2.0) as f32,
+            height: rect.height().max(2.0) as f32,
+            baseline_y: baseline.y as f32,
+        });
     }
     fn draw_image(&mut self, _: hayro_interpret::Image<'a, '_>, _: Affine) {}
     fn pop_clip_path(&mut self) {}
@@ -174,12 +276,13 @@ impl<'a> Device<'a> for TextDevice {
 
 pub fn open(linux_path: PathBuf, host_path: PathBuf, kind: PreviewKind) -> Result<LoadedPreview> {
     if kind == PreviewKind::Image {
-        if !host_path.is_file() {
-            bail!("cannot read {}", linux_path.display());
-        }
+        let pixels = Some(
+            decode_image(&host_path)
+                .with_context(|| format!("cannot display {}", linux_path.display()))?,
+        );
         return Ok(LoadedPreview {
             linux_path,
-            host_path,
+            pixels,
             kind,
             pdf_bytes: None,
             page_count: 0,
@@ -201,7 +304,7 @@ pub fn open(linux_path: PathBuf, host_path: PathBuf, kind: PreviewKind) -> Resul
     let first_page = Some(render_pdf_page(&pdf, 0, 1.5)?);
     Ok(LoadedPreview {
         linux_path,
-        host_path,
+        pixels: None,
         kind,
         pdf_bytes: Some(bytes),
         page_count,
@@ -356,17 +459,34 @@ mod tests {
         for offset in offsets {
             pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
         }
-        pdf.extend_from_slice(format!("trailer\n<< /Root 1 0 R /Size 6 >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Root 1 0 R /Size 6 >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
 
         let page = render_page(&pdf, 0, 1.0).unwrap();
-        assert_eq!(page.text.selected_text(0, page.text.glyphs.len() - 1), "Hello PDF\nNext");
+        assert_eq!(
+            page.text.selected_text(0, page.text.glyphs.len() - 1),
+            "Hello PDF\nNext"
+        );
         assert_eq!(page.text.selected_text(6, 8), "PDF");
         let first = &page.text.glyphs[0];
-        assert_eq!(page.text.nearest_glyph(first.x + 1.0, first.y + 1.0), Some(0));
+        assert_eq!(
+            page.text.nearest_glyph(first.x + 1.0, first.y + 1.0),
+            Some(0)
+        );
         let first_line = page.text.selection_rects(0, 8);
-        assert_eq!(first_line.len(), 1, "one highlighted band should cover the first line");
+        assert_eq!(
+            first_line.len(),
+            1,
+            "one highlighted band should cover the first line"
+        );
         assert!(first_line[0].2 > page.text.glyphs[8].x - first_line[0].0);
-        assert_eq!(page.text.selection_rects(0, page.text.glyphs.len() - 1).len(), 2);
+        assert_eq!(
+            page.text
+                .selection_rects(0, page.text.glyphs.len() - 1)
+                .len(),
+            2
+        );
         let zoomed = render_page(&pdf, 0, 2.0).unwrap();
         assert_eq!(page.text.glyphs.len(), zoomed.text.glyphs.len());
         assert!((page.text.glyphs[0].x - zoomed.text.glyphs[0].x).abs() < 0.01);
@@ -375,15 +495,22 @@ mod tests {
     #[test]
     fn selection_bands_cover_word_gaps_without_joining_separate_columns() {
         let glyph = |text: &str, x, y, baseline_y| PdfGlyph {
-            text: text.into(), x, y, width: 8.0, height: 10.0, baseline_y,
+            text: text.into(),
+            x,
+            y,
+            width: 8.0,
+            height: 10.0,
+            baseline_y,
         };
-        let page = PdfTextPage { glyphs: vec![
-            glyph("A", 10.0, 10.0, 20.0),
-            glyph("b", 18.0, 12.0, 20.0),
-            glyph("C", 38.0, 10.0, 20.0),
-            glyph("D", 180.0, 10.0, 20.0),
-            glyph("E", 10.0, 35.0, 45.0),
-        ] };
+        let page = PdfTextPage {
+            glyphs: vec![
+                glyph("A", 10.0, 10.0, 20.0),
+                glyph("b", 18.0, 12.0, 20.0),
+                glyph("C", 38.0, 10.0, 20.0),
+                glyph("D", 180.0, 10.0, 20.0),
+                glyph("E", 10.0, 35.0, 45.0),
+            ],
+        };
         let bands = page.selection_rects(0, 4);
         assert_eq!(bands.len(), 3);
         assert_eq!(bands[0].0, 10.0);
@@ -396,26 +523,59 @@ mod tests {
     #[test]
     fn copied_pdf_text_keeps_low_punctuation_and_hyphens_on_their_lines() {
         let glyph = |text: &str, x, y, width, height, baseline_y| PdfGlyph {
-            text: text.into(), x, y, width, height, baseline_y,
+            text: text.into(),
+            x,
+            y,
+            width,
+            height,
+            baseline_y,
         };
-        let page = PdfTextPage { glyphs: vec![
-            glyph("role", 450.0, 189.3, 26.0, 6.0, 195.0),
-            glyph(".", 477.1, 193.7, 2.0, 2.0, 195.0),
-            glyph(" ", 0.0, 0.0, 2.0, 2.0, 195.0),
-            glyph("FDE", 482.5, 187.2, 22.0, 7.9, 195.0),
-            glyph(" ", 0.0, 0.0, 2.0, 2.0, 195.0),
-            glyph("sites", 100.0, 205.1, 25.0, 6.0, 210.9),
-            glyph(",", 125.3, 209.6, 2.0, 2.5, 210.9),
-            glyph(" ", 0.0, 0.0, 2.0, 2.0, 210.9),
-            glyph("people", 100.0, 220.9, 30.0, 6.0, 226.7),
-            glyph("-", 130.5, 222.9, 2.0, 2.0, 226.7),
-            glyph("management", 134.0, 220.9, 60.0, 6.0, 226.7),
-            glyph("-", 194.5, 222.9, 2.0, 2.0, 226.7),
-            glyph("only", 198.0, 220.9, 22.0, 6.0, 226.7),
-        ] };
+        let page = PdfTextPage {
+            glyphs: vec![
+                glyph("role", 450.0, 189.3, 26.0, 6.0, 195.0),
+                glyph(".", 477.1, 193.7, 2.0, 2.0, 195.0),
+                glyph(" ", 0.0, 0.0, 2.0, 2.0, 195.0),
+                glyph("FDE", 482.5, 187.2, 22.0, 7.9, 195.0),
+                glyph(" ", 0.0, 0.0, 2.0, 2.0, 195.0),
+                glyph("sites", 100.0, 205.1, 25.0, 6.0, 210.9),
+                glyph(",", 125.3, 209.6, 2.0, 2.5, 210.9),
+                glyph(" ", 0.0, 0.0, 2.0, 2.0, 210.9),
+                glyph("people", 100.0, 220.9, 30.0, 6.0, 226.7),
+                glyph("-", 130.5, 222.9, 2.0, 2.0, 226.7),
+                glyph("management", 134.0, 220.9, 60.0, 6.0, 226.7),
+                glyph("-", 194.5, 222.9, 2.0, 2.0, 226.7),
+                glyph("only", 198.0, 220.9, 22.0, 6.0, 226.7),
+            ],
+        };
         let expected = "role. FDE\nsites,\npeople-management-only";
         assert_eq!(page.selected_text(0, page.glyphs.len() - 1), expected);
         assert_eq!(page.selected_text(page.glyphs.len() - 1, 0), expected);
         assert_eq!(page.selected_text(0, 3), "role. FDE");
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    #[test]
+    fn worker_decode_preserves_raster_and_svg_dimensions() {
+        let path = std::env::temp_dir().join(format!("araseo-image-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(37, 19, image::Rgba([20, 40, 60, 255]))
+            .save(&path)
+            .unwrap();
+        let loaded = open(path.clone(), path.clone(), PreviewKind::Image).unwrap();
+        let pixels = loaded.pixels.unwrap();
+        assert_eq!((pixels.width, pixels.height), (37, 19));
+        assert_eq!(&pixels.rgba[..4], &[20, 40, 60, 255]);
+        fs::remove_file(&path).unwrap();
+        let path = path.with_extension("svg");
+        fs::write(&path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="41" height="23"><rect width="41" height="23" fill="red"/></svg>"#).unwrap();
+        let pixels = open(path.clone(), path.clone(), PreviewKind::Image)
+            .unwrap()
+            .pixels
+            .unwrap();
+        assert_eq!((pixels.width, pixels.height), (41, 23));
+        assert!(pixels.premultiplied);
+        fs::remove_file(path).unwrap();
     }
 }

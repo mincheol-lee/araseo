@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -157,7 +157,7 @@ while True:
 
 pub struct StatusMonitor {
     child: Child,
-    input: ChildStdin,
+    input: crate::terminal_input::TerminalInput,
     latest: Arc<Mutex<Option<MonitorUpdate>>>,
     root: PathBuf,
 }
@@ -177,7 +177,14 @@ impl StatusMonitor {
         let mut command = if cfg!(windows) {
             let mut command = Command::new(r"C:\Windows\System32\wsl.exe");
             command
-                .args(["-d", &workspace.distro, "--exec", "/usr/bin/python3", "-u", "-c"])
+                .args([
+                    "-d",
+                    &workspace.distro,
+                    "--exec",
+                    "/usr/bin/python3",
+                    "-u",
+                    "-c",
+                ])
                 .arg(INOTIFY_MONITOR)
                 .arg(wsl_path_argument(&workspace.linux_root));
             command
@@ -205,35 +212,50 @@ impl StatusMonitor {
         // while it is suspended or busy, rather than retaining every update.
         let latest = Arc::new(Mutex::new(None));
         let reader_latest = Arc::clone(&latest);
-        thread::spawn(move || {
-            let mut pending = None;
-            for line in BufReader::new(output).lines() {
-                let line = match line {
-                    Ok(line) => line,
-                    Err(error) => {
-                        store_monitor_update(&reader_latest, Err(error.to_string()));
-                        break;
-                    }
-                };
-                match decode_monitor_line(&line) {
-                    Ok(MonitorLine::Begin) => pending = Some(Vec::new()),
-                    Ok(MonitorLine::Repository(path, status)) => {
-                        if let Some(batch) = pending.as_mut() {
-                            batch.push((path, status));
+        let reader = thread::Builder::new()
+            .name("araseo-git-monitor".into())
+            .spawn(move || {
+                let mut pending = None;
+                for line in BufReader::new(output).lines() {
+                    let line = match line {
+                        Ok(line) => line,
+                        Err(error) => {
+                            store_monitor_update(&reader_latest, Err(error.to_string()));
+                            break;
                         }
-                    }
-                    Ok(MonitorLine::End) => {
-                        if let Some(batch) = pending.take() {
-                            store_monitor_update(&reader_latest, Ok(batch));
+                    };
+                    match decode_monitor_line(&line) {
+                        Ok(MonitorLine::Begin) => pending = Some(Vec::new()),
+                        Ok(MonitorLine::Repository(path, status)) => {
+                            if let Some(batch) = pending.as_mut() {
+                                batch.push((path, status));
+                            }
                         }
-                    }
-                    Err(error) => {
-                        store_monitor_update(&reader_latest, Err(error));
+                        Ok(MonitorLine::End) => {
+                            if let Some(batch) = pending.take() {
+                                store_monitor_update(&reader_latest, Ok(batch));
+                            }
+                        }
+                        Err(error) => {
+                            store_monitor_update(&reader_latest, Err(error));
+                        }
                     }
                 }
-            }
-        });
+            });
 
+        if let Err(error) = reader {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        let input = match crate::terminal_input::TerminalInput::new(input) {
+            Ok(input) => input,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         Ok(Self {
             child,
             input,
@@ -243,18 +265,24 @@ impl StatusMonitor {
     }
 
     pub fn poll_latest(&mut self) -> Option<Result<StatusSnapshot, String>> {
+        if let Some(error) = self.input.take_error() {
+            return Some(Err(error));
+        }
         take_monitor_update(&self.latest).map(|message| {
             message.map(|repositories| {
                 let mut snapshot = StatusSnapshot::default();
                 for (relative_path, bytes) in repositories {
-                    let relative_path = PathBuf::from(String::from_utf8_lossy(&relative_path).as_ref());
+                    let relative_path =
+                        PathBuf::from(String::from_utf8_lossy(&relative_path).as_ref());
                     let repository = if relative_path == PathBuf::from(".") {
                         self.root.clone()
                     } else {
                         self.root.join(relative_path)
                     };
                     snapshot.repositories.insert(repository.clone());
-                    snapshot.statuses.extend(parse_porcelain(&repository, &bytes));
+                    snapshot
+                        .statuses
+                        .extend(parse_porcelain(&repository, &bytes));
                 }
                 snapshot
             })
@@ -575,9 +603,12 @@ pub fn read_status(workspace: &Workspace) -> HashMap<PathBuf, GitStatus> {
         command
     } else {
         let mut command = Command::new("git");
-        command.arg("-C")
-            .arg(&workspace.host_root)
-            .args(["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
+        command.arg("-C").arg(&workspace.host_root).args([
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+        ]);
         command
     };
     hide_window(&mut command);
@@ -614,7 +645,10 @@ fn decode_monitor_line(line: &str) -> Result<MonitorLine, String> {
         let (path, status) = payload
             .split_once(' ')
             .ok_or_else(|| "invalid Git repository response".to_string())?;
-        return Ok(MonitorLine::Repository(decode_hex(path)?, decode_hex(status)?));
+        return Ok(MonitorLine::Repository(
+            decode_hex(path)?,
+            decode_hex(status)?,
+        ));
     }
     Err("invalid Git monitor response type".into())
 }
@@ -834,10 +868,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "araseo-git-monitor-{}-{nonce}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("araseo-git-monitor-{}-{nonce}", std::process::id()));
         let first = root.join("first-repository");
         let second = root.join("second-repository");
         fs::create_dir_all(&first).unwrap();
@@ -849,8 +881,7 @@ mod tests {
         let workspace = Workspace::new("Ubuntu", root.clone()).unwrap();
         let mut monitor = StatusMonitor::spawn(&workspace).unwrap();
         let initial = wait_for_snapshot(&mut monitor, |snapshot| {
-            snapshot.repositories.contains(&first)
-                && snapshot.repositories.contains(&second)
+            snapshot.repositories.contains(&first) && snapshot.repositories.contains(&second)
         });
         assert_eq!(initial.repositories.len(), 2);
         assert!(!initial.repositories.contains(&root.join("local-files")));
