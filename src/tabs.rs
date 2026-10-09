@@ -377,6 +377,30 @@ impl TabGroups {
         true
     }
 
+    /// Move a tab beside another tab in the same pane without changing focus
+    /// or rebuilding the split layout. Placement order is also saved in sessions.
+    pub fn reorder(&mut self, id: TabId, target: TabId, after: bool) -> bool {
+        if id == target {
+            return false;
+        }
+        let Some(source) = self.placements.iter().position(|(tab, _)| *tab == id) else {
+            return false;
+        };
+        let Some(destination) = self.placements.iter().position(|(tab, _)| *tab == target) else {
+            return false;
+        };
+        if self.placements[source].1 != self.placements[destination].1 {
+            return false;
+        }
+        let destination = destination - usize::from(source < destination) + usize::from(after);
+        if source == destination {
+            return false;
+        }
+        let placement = self.placements.remove(source);
+        self.placements.insert(destination, placement);
+        true
+    }
+
     pub fn cycle(&mut self, delta: i32) -> Option<TabId> {
         let ids = self.group_ids(self.focused_group);
         let index = self
@@ -583,5 +607,42 @@ mod tests {
         tabs.add(1, 0);
         tabs.next_group = 0;
         assert!(TabGroups::restore(tabs, &[1], &[1].into()).is_none());
+    }
+    #[test]
+    fn reorders_both_directions_without_changing_active_tabs_or_layout() {
+        let mut tabs = TabGroups::default();
+        for id in 1..=4 {
+            tabs.add(id, 0);
+        }
+        tabs.dock_into(4, 0, Dock::Right);
+        tabs.add(5, 1);
+        tabs.activate(2);
+        let layout = tabs.layout();
+        assert!(tabs.reorder(1, 3, true));
+        assert_eq!(tabs.group_ids(0), vec![2, 3, 1]);
+        assert_eq!(tabs.group_ids(1), vec![4, 5]);
+        assert_eq!(tabs.active(0), Some(2));
+        assert_eq!(tabs.focused_group(), 0);
+        assert_eq!(tabs.layout(), layout);
+        assert!(tabs.reorder(1, 2, false));
+        assert_eq!(tabs.group_ids(0), vec![1, 2, 3]);
+        assert!(tabs.reorder(5, 4, false));
+        assert_eq!(tabs.group_ids(1), vec![5, 4]);
+        assert_eq!(tabs.active(1), Some(5));
+        assert_eq!(tabs.cycle(1), Some(3));
+        let saved = serde_json::to_string(&tabs).unwrap();
+        let restored = TabGroups::restore(
+            serde_json::from_str(&saved).unwrap(),
+            &[1, 2, 3, 4, 5],
+            &[1, 2, 3, 4, 5].into(),
+        )
+        .unwrap();
+        assert_eq!(restored, tabs);
+        assert!(!tabs.reorder(1, 4, true));
+        assert!(!tabs.reorder(1, 1, false));
+        assert!(!tabs.reorder(99, 1, false));
+        assert!(!tabs.reorder(1, 99, false));
+        tabs.remove(3);
+        assert_eq!(tabs.active(0), Some(2));
     }
 }
