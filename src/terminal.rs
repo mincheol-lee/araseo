@@ -22,6 +22,8 @@ static NEXT_TERMINAL_ID: AtomicU32 = AtomicU32::new(1);
 
 // These hooks are scoped to CLIs started inside an Araseo terminal. Each writes
 // only to that terminal's private status file; no user configuration is edited.
+// Our encoder emits legacy UTF-8/VT keys, not CSI-u event types. Keep Codex
+// on that protocol rather than relying on inherited terminal detection.
 const CODEX_HOOKS: &str = r#"hooks={UserPromptSubmit=[{hooks=[{type="command",command="printf codex:running > $ARASEO_AGENT_STATE_FILE"}]}],PermissionRequest=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}],PostToolUse=[{hooks=[{type="command",command="printf codex:running > $ARASEO_AGENT_STATE_FILE"}]}],Stop=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}],Interrupt=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}]}"#;
 const CLAUDE_SETTINGS: &str = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf claude:running > $ARASEO_AGENT_STATE_FILE"}]}],"PermissionRequest":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"printf claude:running > $ARASEO_AGENT_STATE_FILE"}]}],"Stop":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"Notification":[{"matcher":"permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input","hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}]}}"#;
 
@@ -33,8 +35,8 @@ fn agent_shell_command(status_path: &str) -> String {
     format!(
         "export ARASEO_AGENT_STATE_FILE={}; export ARASEO_CODEX_HOOKS={}; export ARASEO_CLAUDE_SETTINGS={}; \
          : > \"$ARASEO_AGENT_STATE_FILE\"; \
-         codex() {{ printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; command codex -c \"$ARASEO_CODEX_HOOKS\" \"$@\"; araseo_result=$?; printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
-         claude() {{ printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; command claude --settings \"$ARASEO_CLAUDE_SETTINGS\" \"$@\"; araseo_result=$?; printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
+         codex() {{ printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT=\"${{CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT:-1}}\" command codex -c \"$ARASEO_CODEX_HOOKS\" \"$@\"; araseo_result=$?; printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
+         claude() {{ printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; CLAUDE_CODE_NATIVE_CURSOR=\"${{CLAUDE_CODE_NATIVE_CURSOR:-1}}\" command claude --settings \"$ARASEO_CLAUDE_SETTINGS\" \"$@\"; araseo_result=$?; printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
          export -f codex claude; exec /bin/bash --login -i",
         shell_quote(status_path),
         shell_quote(CODEX_HOOKS),
@@ -160,6 +162,44 @@ struct TerminalCallbacks {
 }
 
 impl vt100::Callbacks for TerminalCallbacks {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        command: char,
+    ) {
+        let [parameter] = params else {
+            return;
+        };
+        let [value] = *parameter else {
+            return;
+        };
+        match (i1, i2, command, *value) {
+            (None, None, 'n', 5) => self.replies.extend_from_slice(b"\x1b[0n"),
+            (None, None, 'n', 6) | (Some(b'?'), None, 'n', 6) => {
+                // Codex queries CPR during resize before accepting more input.
+                let (row, column) = screen.cursor_position_for_report();
+                let private = if i1 == Some(b'?') { "?" } else { "" };
+                self.replies.extend_from_slice(
+                    format!(
+                        "\x1b[{private}{};{}R",
+                        u32::from(row) + 1,
+                        u32::from(column) + 1
+                    )
+                    .as_bytes(),
+                );
+            }
+            (None, None, 't', 18) => {
+                let (rows, columns) = screen.size();
+                self.replies
+                    .extend_from_slice(format!("\x1b[8;{rows};{columns}t").as_bytes());
+            }
+            _ => {}
+        }
+    }
+
     fn unhandled_osc(&mut self, _screen: &mut vt100::Screen, params: &[&[u8]]) {
         let (slot, color) = match params {
             [b"10", b"?"] => (10, DEFAULT_FOREGROUND),
@@ -546,19 +586,11 @@ impl TerminalSession {
     }
 
     pub fn cursor_row(&self) -> i32 {
-        if self.parser.screen().hide_cursor() || self.parser.screen().scrollback() > 0 {
-            -1
-        } else {
-            self.parser.screen().cursor_position().0.into()
-        }
+        input_cursor_position(self.parser.screen()).map_or(-1, |(row, _)| row.into())
     }
 
     pub fn cursor_column(&self) -> i32 {
-        if self.parser.screen().hide_cursor() || self.parser.screen().scrollback() > 0 {
-            -1
-        } else {
-            self.parser.screen().cursor_position().1.into()
-        }
+        input_cursor_position(self.parser.screen()).map_or(-1, |(_, column)| column.into())
     }
 
     pub fn selection_text(
@@ -644,6 +676,11 @@ fn poll_output<CB: vt100::Callbacks>(
             return true;
         }
     }
+}
+
+// Cursor visibility controls painting, not where IME composition belongs.
+fn input_cursor_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
+    (screen.scrollback() == 0).then(|| screen.cursor_position())
 }
 
 fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
@@ -1009,7 +1046,7 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARASEO_AGENT_STATE_FILE.{name}-args\"\nprintf '{name}:running' > \"$ARASEO_AGENT_STATE_FILE\"\n"
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARASEO_AGENT_STATE_FILE.{name}-args\"\nprintf '%s\\n' \"${{CLAUDE_CODE_NATIVE_CURSOR-unset}}\" > \"$ARASEO_AGENT_STATE_FILE.{name}-cursor\"\nprintf '%s\\n' \"${{CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT-unset}}\" > \"$ARASEO_AGENT_STATE_FILE.{name}-keyboard\"\nprintf '{name}:running' > \"$ARASEO_AGENT_STATE_FILE\"\n"
                 ),
             )
             .unwrap();
@@ -1023,7 +1060,9 @@ mod tests {
         );
         let output = Command::new("bash")
             .arg("-c")
-            .arg(script)
+            .arg(&script)
+            .env_remove("CLAUDE_CODE_NATIVE_CURSOR")
+            .env_remove("CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT")
             .env(
                 "PATH",
                 format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()),
@@ -1045,6 +1084,54 @@ mod tests {
             codex_args.contains("UserPromptSubmit") && codex_args.contains("PermissionRequest")
         );
         assert!(claude_args.contains("--settings") && claude_args.contains("PostToolUse"));
+        assert_eq!(
+            std::fs::read_to_string(directory.join("status.claude-cursor"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("status.codex-cursor"))
+                .unwrap()
+                .trim(),
+            "unset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("status.codex-keyboard"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("status.claude-keyboard"))
+                .unwrap()
+                .trim(),
+            "unset"
+        );
+        let overridden = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("CLAUDE_CODE_NATIVE_CURSOR", "0")
+            .env("CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT", "0")
+            .env(
+                "PATH",
+                format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(overridden.status.success());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("status.codex-keyboard"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("status.claude-cursor"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1576,5 +1663,125 @@ mod tests {
                 .unwrap(),
             (40, 120)
         );
+    }
+    #[test]
+    fn hidden_cursor_keeps_ime_position_without_painting_a_cursor() {
+        let mut parser = vt100::Parser::new(24, 80, 10);
+        parser.process(b"\x1b[10;18H\x1b[?25l");
+        assert_eq!(input_cursor_position(parser.screen()), Some((9, 17)));
+        assert!(
+            display_cells(parser.screen())
+                .iter()
+                .all(|cell| !cell.cursor)
+        );
+        parser.process(b"\x1b[?25h");
+        assert_eq!(input_cursor_position(parser.screen()), Some((9, 17)));
+        assert!(
+            display_cells(parser.screen())
+                .iter()
+                .any(|cell| cell.cursor)
+        );
+        parser.process(b"\x1b[24;1H\r\n\r\n");
+        parser.screen_mut().set_scrollback(1);
+        assert_eq!(input_cursor_position(parser.screen()), None);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn docking_a_live_tui_resizes_without_input_and_accepts_the_first_key() {
+        use std::time::{Duration, Instant};
+        let mut terminal = TerminalSession::spawn_pty(Path::new("/tmp")).unwrap();
+        // This owned fixture behaves like a full-screen CLI, with a resize
+        // handler and raw input. It never starts Codex or uses user sessions.
+        let python = r#"import os,signal,sys,tty,select
+tty.setraw(0)
+def draw(*args):
+ s=os.get_terminal_size(0)
+ sys.stdout.write('\x1b[2J\x1b[HGRID %dx%d' % (s.lines,s.columns));sys.stdout.flush()
+signal.signal(signal.SIGWINCH,draw)
+draw()
+while True:
+ c=os.read(0,1)
+ if not c: break
+ sys.stdout.write('\x1b[2;1HKEY-'+c.decode()+'\x1b[6n');sys.stdout.flush()
+ reply=b''
+ while not reply.endswith(b'R'):
+  if not select.select([0],[],[],1)[0]: raise RuntimeError('cursor reply timed out')
+  reply+=os.read(0,1)
+ if reply!=b'\x1b[2;6R': raise RuntimeError('wrong cursor reply: '+repr(reply))
+ sys.stdout.write('\x1b[3;1HACK-'+c.decode());sys.stdout.flush()
+"#;
+        terminal.write(format!("python3 -u -c {}\r", shell_quote(python)).as_bytes());
+        let wait_for = |terminal: &mut TerminalSession, text: &str, timeout: Duration| {
+            let deadline = Instant::now() + timeout;
+            loop {
+                terminal.poll();
+                if terminal.parser.screen().contents().contains(text) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "TUI never produced {text}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_for(&mut terminal, "GRID 24x100", Duration::from_secs(5));
+        let full = crate::terminal_layout::grid_size(944.0, 776.0, 14).unwrap();
+        terminal.resize(full.0, full.1);
+        wait_for(&mut terminal, "GRID 46x118", Duration::from_secs(1));
+        let mut groups = crate::tabs::TabGroups::default();
+        groups.add(1, 0);
+        groups.add(2, 0);
+        assert!(groups.dock_into(2, 0, crate::tabs::Dock::Bottom));
+        let (_, rect) = groups
+            .layout()
+            .0
+            .into_iter()
+            .find(|(id, _)| *id == groups.group_of(2).unwrap())
+            .unwrap();
+        let split =
+            crate::terminal_layout::grid_size(944.0 * rect.width, 776.0 * rect.height, 14).unwrap();
+        terminal.resize(split.0, split.1);
+        wait_for(&mut terminal, "GRID 22x118", Duration::from_secs(1));
+        assert_eq!(terminal.size(), split);
+        for letter in [b'x', b'y', b'z'] {
+            terminal.write(&[letter]);
+            wait_for(
+                &mut terminal,
+                &format!("ACK-{}", char::from(letter)),
+                Duration::from_secs(2),
+            );
+        }
+    }
+    #[test]
+    fn answers_cursor_and_size_queries_at_the_current_grid_without_sending_user_input() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 10, TerminalCallbacks::default());
+        parser.process(b"\x1b[13;8H\x1b[?25l\x1b[5n\x1b[6");
+        parser.process(b"n\x1b[?6n\x1b[18t");
+        let mut replies = Vec::new();
+        write_terminal_replies(&mut replies, parser.callbacks_mut());
+        assert_eq!(replies, b"\x1b[0n\x1b[13;8R\x1b[?13;8R\x1b[8;24;80t");
+        assert_eq!(parser.screen().cursor_position(), (12, 7));
+        parser.screen_mut().set_size(8, 20);
+        parser.process(b"\x1b[6n\x1b[18t\x1b[0n\x1b[?5n\x1b[6;1n");
+        replies.clear();
+        write_terminal_replies(&mut replies, parser.callbacks_mut());
+        assert_eq!(replies, b"\x1b[8;8R\x1b[8;8;20t");
+        write_terminal_replies(&mut replies, parser.callbacks_mut());
+        assert_eq!(replies, b"\x1b[8;8R\x1b[8;8;20t");
+    }
+
+    #[test]
+    fn cursor_replies_respect_origin_mode_and_pending_wrap() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 10, TerminalCallbacks::default());
+        parser.process(b"\x1b[4;20r\x1b[?6h\x1b[2;9H\x1b[6n");
+        let mut replies = Vec::new();
+        write_terminal_replies(&mut replies, parser.callbacks_mut());
+        assert_eq!(replies, b"\x1b[2;9R");
+        parser.process(b"\x1b[?6l");
+        parser.screen_mut().set_size(2, 3);
+        parser.process(b"\x1b[Habc\x1b[6n");
+        replies.clear();
+        write_terminal_replies(&mut replies, parser.callbacks_mut());
+        assert_eq!(replies, b"\x1b[1;3R");
     }
 }

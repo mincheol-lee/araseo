@@ -103,6 +103,17 @@ impl Grid {
         self.pos
     }
 
+    pub fn pos_for_report(&self) -> Pos {
+        let mut pos = self.pos;
+        // Printing at the right margin can leave a pending-wrap column.
+        pos.col = pos.col.min(self.size.cols.saturating_sub(1));
+        pos.row = pos.row.min(self.size.rows.saturating_sub(1));
+        if self.origin_mode {
+            pos.row = pos.row.saturating_sub(self.scroll_top);
+        }
+        pos
+    }
+
     pub fn set_pos(&mut self, mut pos: Pos) {
         if self.origin_mode {
             pos.row = pos.row.saturating_add(self.scroll_top);

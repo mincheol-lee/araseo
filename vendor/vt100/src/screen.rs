@@ -493,6 +493,15 @@ impl Screen {
         (pos.row, pos.col)
     }
 
+    /// Returns zero-based cursor coordinates for a terminal position report.
+    /// Origin mode makes the row relative to the scrolling region; pending
+    /// wrap keeps the reported column at the visible right margin.
+    #[must_use]
+    pub fn cursor_position_for_report(&self) -> (u16, u16) {
+        let pos = self.grid().pos_for_report();
+        (pos.row, pos.col)
+    }
+
     /// Returns terminal escape sequences sufficient to set the current
     /// cursor state of the terminal.
     ///

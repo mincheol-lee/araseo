@@ -18,9 +18,12 @@ mod session;
 mod shortcuts;
 mod tabs;
 mod terminal;
+mod terminal_focus;
 mod terminal_input;
+mod terminal_layout;
 #[cfg(any(windows, test))]
 mod terminal_resize;
+mod terminal_view;
 mod tree;
 mod window_activity;
 mod window_resize;
@@ -44,6 +47,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tabs::{Axis, Dock, Rect, TabGroups, TabId};
 use terminal::{AgentKind, AgentStatus, TerminalSession};
+use terminal_view::{edit_extra_pane, extra_pane, update_terminal_model};
 use tree::{FlatNode, GitStatus};
 use window_activity::WindowActivity;
 use workspace::Workspace;
@@ -116,7 +120,6 @@ struct AppState {
     wsl_docker_usage_loader: Background<std::io::Result<Vec<wsl_diagnostics::DockerUsage>>>,
     editor_views: RefCell<[editor_view::EditorView; 2]>,
     extra_editor_views: RefCell<HashMap<usize, editor_view::EditorView>>,
-    extra_terminal_sizes: HashMap<usize, (u16, u16)>,
     agent_kinds: HashMap<TabId, AgentStatus>,
     agent_probe_loader: Background<Vec<(TabId, Option<AgentStatus>)>>,
     agent_probe_in_flight: bool,
@@ -321,7 +324,6 @@ fn run() -> Result<()> {
         wsl_docker_usage_loader: Background::default(),
         editor_views: RefCell::new(Default::default()),
         extra_editor_views: RefCell::new(HashMap::new()),
-        extra_terminal_sizes: HashMap::new(),
         agent_kinds: HashMap::new(),
         agent_probe_loader: Background::default(),
         agent_probe_in_flight: false,
@@ -1083,7 +1085,7 @@ fn run() -> Result<()> {
                 terminal.write(&terminal::encode_key(&text, control, alt, shift))
             });
             if returned_to_bottom && let (Some(ui), Some(group)) = (weak.upgrade(), visible_group) {
-                sync_group(&ui, &state, group);
+                sync_active_terminal(&ui, &state, group);
             }
         });
     }
@@ -1102,7 +1104,7 @@ fn run() -> Result<()> {
             let returned_to_bottom = terminal_mut(&mut state, tab_id)
                 .is_some_and(|terminal| terminal.write(text.as_bytes()));
             if returned_to_bottom && let (Some(ui), Some(group)) = (weak.upgrade(), visible_group) {
-                sync_group(&ui, &state, group);
+                sync_active_terminal(&ui, &state, group);
             }
         });
     }
@@ -1284,6 +1286,22 @@ fn run() -> Result<()> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
+        ui.on_tab_reorder_requested(move |tab_id, target, after| {
+            let (Ok(id), Ok(target)) = (TabId::try_from(tab_id), TabId::try_from(target)) else {
+                return;
+            };
+            let mut state = state.borrow_mut();
+            if state.tab_groups.reorder(id, target, after)
+                && let Some(ui) = weak.upgrade()
+            {
+                sync_ui(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        let focus_transfer = terminal_focus::TerminalFocusTransfer::default();
         ui.on_pane_dock_requested(move |tab_id, target, zone| {
             let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
@@ -1297,7 +1315,12 @@ fn run() -> Result<()> {
             cancel_file_open(&mut state);
             if state.tab_groups.dock_into(id, target, dock) {
                 state.maximized_group = None;
-                sync_ui(&ui, &state);
+                // Resize before copying the terminal into the destination pane.
+                resize_visible_terminals(&ui, &mut state);
+                sync_workspace_ui(&ui, &state);
+                if terminal_mut(&mut state, id).is_some() {
+                    focus_transfer.request(&ui);
+                }
             }
         });
     }
@@ -1384,31 +1407,6 @@ fn run() -> Result<()> {
                     .then_some(group as i32)
                 })
                 .unwrap_or(-1)
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let state = state.clone();
-        ui.on_pane_terminal_size_changed(move |group, rows, columns| {
-            let Ok(group) = usize::try_from(group) else {
-                return;
-            };
-            let mut state = state.borrow_mut();
-            let size = (
-                rows.round().clamp(2.0, u16::MAX as f32) as u16,
-                columns.round().clamp(20.0, u16::MAX as f32) as u16,
-            );
-            if state.extra_terminal_sizes.insert(group, size) == Some(size) {
-                return;
-            }
-            let Some(id) = state.tab_groups.active(group) else {
-                return;
-            };
-            if terminal_mut(&mut state, id).is_some_and(|terminal| terminal.resize(size.0, size.1))
-                && let Some(ui) = weak.upgrade()
-            {
-                sync_group(&ui, &state, group);
-            }
         });
     }
     {
@@ -1867,22 +1865,6 @@ fn run() -> Result<()> {
         let window_activity = window_activity.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = weak.upgrade() else { return };
-            let fixed_terminal_sizes = [
-                (
-                    ui.get_terminal_rows().round().clamp(2.0, u16::MAX as f32) as u16,
-                    ui.get_terminal_columns()
-                        .round()
-                        .clamp(20.0, u16::MAX as f32) as u16,
-                ),
-                (
-                    ui.get_secondary_terminal_rows()
-                        .round()
-                        .clamp(2.0, u16::MAX as f32) as u16,
-                    ui.get_secondary_terminal_columns()
-                        .round()
-                        .clamp(20.0, u16::MAX as f32) as u16,
-                ),
-            ];
             let mut state = state.borrow_mut();
             if window_activity
                 .should_animate_agents(state.agent_kinds.values().any(|agent| agent.running))
@@ -1898,31 +1880,14 @@ fn run() -> Result<()> {
                 .into_iter()
                 .filter_map(|group| state.tab_groups.active(group).map(|id| (id, group)))
                 .collect::<HashMap<_, _>>();
-            let mut changed_groups = HashSet::new();
-            let extra_sizes = state.extra_terminal_sizes.clone();
-            for tab in &mut state.tabs {
-                if let TabContent::Terminal { session, .. } = &mut tab.content {
-                    let visible_group = active.get(&tab.id).copied();
-                    let resized = visible_group.is_some_and(|group| {
-                        let (rows, columns) = if group < 2 {
-                            fixed_terminal_sizes[group]
-                        } else {
-                            extra_sizes.get(&group).copied().unwrap_or((24, 80))
-                        };
-                        session.resize(rows, columns)
-                    });
-                    if resized && let Some(group) = visible_group {
-                        changed_groups.insert(group);
-                    }
-                }
-            }
+            let mut changed_groups = resize_visible_terminals(&ui, &mut state);
             for id in std::mem::take(&mut state.terminal_dirty) {
                 if let Some(group) = active.get(&id) {
                     changed_groups.insert(*group);
                 }
             }
             for group in changed_groups {
-                sync_group(&ui, &state, group);
+                sync_active_terminal(&ui, &state, group);
             }
         });
     }
@@ -3388,27 +3353,6 @@ fn visible_panes(state: &AppState) -> Vec<(usize, Rect)> {
     state.tab_groups.layout().0
 }
 
-fn edit_extra_pane(ui: &AppWindow, group: usize, edit: impl FnOnce(&mut PaneEntry)) {
-    let panes = ui.get_extra_panes();
-    let model = panes
-        .as_any()
-        .downcast_ref::<VecModel<PaneEntry>>()
-        .expect("extra panes use a VecModel");
-    let index = group - 2;
-    while model.row_count() <= index {
-        let mut pane = PaneEntry::default();
-        pane.group = (model.row_count() + 2) as i32;
-        model.push(pane);
-    }
-    let mut pane = model.row_data(index).unwrap();
-    edit(&mut pane);
-    model.set_row_data(index, pane);
-}
-
-fn extra_pane(ui: &AppWindow, group: usize) -> Option<PaneEntry> {
-    ui.get_extra_panes().row_data(group.checked_sub(2)?)
-}
-
 fn sync_layout(ui: &AppWindow, state: &AppState) {
     let maximized = state
         .maximized_group
@@ -3498,7 +3442,51 @@ fn sync_layout(ui: &AppWindow, state: &AppState) {
     }
 }
 
+fn resize_visible_terminals(ui: &AppWindow, state: &mut AppState) -> HashSet<usize> {
+    let width = ui.get_workspace_area_width();
+    let height = ui.get_workspace_area_height();
+    let font_size = ui.get_terminal_font_size();
+    let sizes = visible_panes(state)
+        .into_iter()
+        .filter_map(|(group, rect)| {
+            let id = state.tab_groups.active(group)?;
+            let size =
+                terminal_layout::grid_size(width * rect.width, height * rect.height, font_size)?;
+            Some((id, (group, size)))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut changed = HashSet::new();
+    for tab in &mut state.tabs {
+        if let TabContent::Terminal { session, .. } = &mut tab.content
+            && let Some(&(group, (rows, columns))) = sizes.get(&tab.id)
+            && session.resize(rows, columns)
+        {
+            changed.insert(group);
+        }
+    }
+    changed
+}
+
 fn sync_ui(ui: &AppWindow, state: &AppState) {
+    ui.set_workspace_name(
+        state
+            .workspace
+            .linux_root
+            .to_string_lossy()
+            .to_string()
+            .into(),
+    );
+    ui.set_status_text(state.status.clone().into());
+    ui.set_save_conflict(state.save_conflict.is_some());
+    ui.set_tree_action_pending(state.tree_action_pending);
+    sync_tree(ui, state);
+    sync_git_changes(ui, state);
+    sync_workspace_ui(ui, state);
+}
+
+// Pane movement does not change the file tree or Git state. Avoid rebuilding
+// those models on the UI thread while a running terminal is being relocated.
+fn sync_workspace_ui(ui: &AppWindow, state: &AppState) {
     let live_ids = state.tabs.iter().map(|tab| tab.id).collect::<HashSet<_>>();
     let active_ids = state
         .tab_groups
@@ -3522,21 +3510,8 @@ fn sync_ui(ui: &AppWindow, state: &AppState) {
         .markdown_pending
         .borrow_mut()
         .retain(|id, _| live_ids.contains(id));
-    ui.set_workspace_name(
-        state
-            .workspace
-            .linux_root
-            .to_string_lossy()
-            .to_string()
-            .into(),
-    );
-    ui.set_status_text(state.status.clone().into());
-    ui.set_save_conflict(state.save_conflict.is_some());
-    ui.set_tree_action_pending(state.tree_action_pending);
     ui.set_focused_group(state.tab_groups.focused_group() as i32);
     sync_layout(ui, state);
-    sync_tree(ui, state);
-    sync_git_changes(ui, state);
     sync_tabs(ui, state);
     for group in state.tab_groups.groups() {
         sync_group(ui, state, group);
@@ -4027,6 +4002,18 @@ fn diff_kind_name(kind: git::DiffKind) -> &'static str {
     }
 }
 
+// Live PTY frames must not reset editors, previews or containing pane metadata.
+// This also keeps native IME state attached while the TUI moves its caret.
+fn sync_active_terminal(ui: &AppWindow, state: &AppState, group: usize) {
+    if let Some(terminal) = state
+        .tab_groups
+        .active(group)
+        .and_then(|id| terminal_ref(state, id))
+    {
+        sync_terminal(ui, terminal, group);
+    }
+}
+
 fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
     let (rows, columns) = terminal.size();
     let cells = terminal
@@ -4051,129 +4038,15 @@ fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
             column_span: cell.column_span,
         })
         .collect::<Vec<_>>();
-    if group == 0 {
-        ui.set_terminal_grid_rows(rows.into());
-        ui.set_terminal_grid_columns(columns.into());
-        ui.set_terminal_cursor_row(terminal.cursor_row());
-        ui.set_terminal_cursor_column(terminal.cursor_column());
-        update_terminal_model(ui.get_terminal_cells(), cells, |model| {
-            ui.set_terminal_cells(model)
-        });
-        ui.set_terminal_update_generation(ui.get_terminal_update_generation().wrapping_add(1));
-    } else if group == 1 {
-        ui.set_secondary_terminal_grid_rows(rows.into());
-        ui.set_secondary_terminal_grid_columns(columns.into());
-        ui.set_secondary_terminal_cursor_row(terminal.cursor_row());
-        ui.set_secondary_terminal_cursor_column(terminal.cursor_column());
-        update_terminal_model(ui.get_secondary_terminal_cells(), cells, |model| {
-            ui.set_secondary_terminal_cells(model)
-        });
-        ui.set_secondary_terminal_update_generation(
-            ui.get_secondary_terminal_update_generation()
-                .wrapping_add(1),
-        );
-    } else {
-        edit_extra_pane(ui, group, |pane| {
-            pane.terminal_grid_rows = rows.into();
-            pane.terminal_grid_columns = columns.into();
-            pane.terminal_cursor_row = terminal.cursor_row();
-            pane.terminal_cursor_column = terminal.cursor_column();
-            update_terminal_model(pane.terminal_cells.clone(), cells, |model| {
-                pane.terminal_cells = model;
-            });
-            pane.terminal_update_generation = pane.terminal_update_generation.wrapping_add(1);
-        });
-    }
-}
-
-fn update_terminal_model(
-    current: ModelRc<TerminalCell>,
-    cells: Vec<TerminalCell>,
-    set_model: impl FnOnce(ModelRc<TerminalCell>),
-) {
-    let Some(model) = current.as_any().downcast_ref::<VecModel<TerminalCell>>() else {
-        set_model(ModelRc::new(VecModel::from(cells)));
-        return;
-    };
-
-    let old_count = model.row_count();
-    if old_count == cells.len()
-        && cells.iter().enumerate().all(|(index, cell)| {
-            model
-                .row_data(index)
-                .is_some_and(|current| current.row == cell.row && current.column == cell.column)
-        })
-    {
-        let changed = cells
-            .iter()
-            .enumerate()
-            .filter_map(|(index, cell)| {
-                model
-                    .row_data(index)
-                    .is_none_or(|current| !terminal_cells_equal(&current, cell))
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if changed.len() > 256 && changed.len() * 3 > cells.len() {
-            model.set_vec(cells);
-        } else {
-            for index in changed {
-                model.set_row_data(index, cells[index].clone());
-            }
-        }
-        return;
-    }
-
-    // Sparse cells are sorted by screen position. Preserve the unchanged
-    // prefix and suffix so ordinary typing normally removes the old cursor
-    // cell and inserts only the new glyph and cursor cells.
-    let prefix = (0..old_count.min(cells.len()))
-        .take_while(|index| {
-            model
-                .row_data(*index)
-                .is_some_and(|current| terminal_cells_equal(&current, &cells[*index]))
-        })
-        .count();
-    let max_suffix = (old_count - prefix).min(cells.len() - prefix);
-    let suffix = (0..max_suffix)
-        .take_while(|offset| {
-            let old_index = old_count - 1 - offset;
-            let new_index = cells.len() - 1 - offset;
-            model
-                .row_data(old_index)
-                .is_some_and(|current| terminal_cells_equal(&current, &cells[new_index]))
-        })
-        .count();
-    let old_middle_count = old_count - prefix - suffix;
-    let new_middle_count = cells.len() - prefix - suffix;
-
-    if old_middle_count + new_middle_count > 256 {
-        model.set_vec(cells);
-        return;
-    }
-
-    for _ in 0..old_middle_count {
-        model.remove(prefix);
-    }
-    for (offset, cell) in cells
-        .into_iter()
-        .skip(prefix)
-        .take(new_middle_count)
-        .enumerate()
-    {
-        model.insert(prefix + offset, cell);
-    }
-}
-
-fn terminal_cells_equal(left: &TerminalCell, right: &TerminalCell) -> bool {
-    left.row == right.row
-        && left.column == right.column
-        && left.glyph == right.glyph
-        && left.foreground == right.foreground
-        && left.background == right.background
-        && left.bold == right.bold
-        && left.cursor == right.cursor
-        && left.column_span == right.column_span
+    terminal_view::sync_frame(
+        ui,
+        group,
+        rows,
+        columns,
+        terminal.cursor_row(),
+        terminal.cursor_column(),
+        cells,
+    );
 }
 
 fn clear_terminal_group(ui: &AppWindow, group: usize) {

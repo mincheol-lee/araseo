@@ -13,6 +13,9 @@ swash = "0.2"
 [target.'cfg(windows)'.dependencies]
 slint = { version = "1.17", default-features = false, features = ["backend-winit", "unstable-winit-030"] }
 
+[dev-dependencies]
+araseo-harness = { path = "../harness" }
+
 [build-dependencies]
 slint-build = "1.17"
 
@@ -25,3 +28,5 @@ i-slint-renderer-software = { path = "../vendor/i-slint-renderer-software" }
 
 # Keep Windows resize presentation consistent with the native client surface.
 i-slint-backend-winit = { path = "../vendor/i-slint-backend-winit" }
+
+vt100 = { path = "../vendor/vt100" }

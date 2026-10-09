@@ -1,5 +1,8 @@
 slint::include_modules!();
 
+#[path = "../../src/terminal_view.rs"]
+pub mod terminal_view;
+
 #[cfg(test)]
 #[path = "../../src/emoji.rs"]
 mod emoji;
@@ -28,6 +31,14 @@ mod shortcuts;
 #[cfg(test)]
 #[path = "../../src/window_resize.rs"]
 mod window_resize;
+
+#[cfg(test)]
+#[path = "../../src/terminal_layout.rs"]
+mod terminal_layout;
+
+#[cfg(test)]
+#[path = "../../src/terminal_focus.rs"]
+mod terminal_focus;
 
 #[cfg(test)]
 mod tests {
@@ -107,6 +118,278 @@ mod tests {
         fn clipboard_text(&self, clipboard: Clipboard) -> Option<String> {
             (clipboard == Clipboard::DefaultClipboard).then(|| self.clipboard.borrow().clone())
         }
+    }
+
+    #[test]
+    fn dragging_tabs_in_the_strip_reorders_without_docking() {
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        slint::platform::set_platform(Box::new(TestPlatform {
+            window: window.clone(), clipboard: Rc::new(RefCell::new(String::new())),
+        })).unwrap();
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(PhysicalSize::new(1200, 800));
+        ui.set_primary_tabs(ModelRc::new(VecModel::from((1..=3).map(|id| TabEntry {
+            id, title: "A".into(), kind: "file".into(), ..Default::default()
+        }).collect::<Vec<_>>())));
+        ui.set_primary_active_tab_id(2);
+        let reorders = Rc::new(RefCell::new(Vec::new()));
+        let observed = reorders.clone();
+        ui.on_tab_reorder_requested(move |id, target, after| observed.borrow_mut().push((id, target, after)));
+        let docks = Rc::new(RefCell::new(Vec::new()));
+        let observed = docks.clone();
+        ui.on_tab_dock_requested(move |id, zone| observed.borrow_mut().push((id, zone)));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let observed = clicks.clone();
+        ui.on_tab_activated(move |id| observed.borrow_mut().push(id));
+        render(&window);
+        let x = ui.get_sidebar_width() + 6.0;
+        let layout = ui.get_workspace_layout();
+        let drag = |from: f32, to: f32| {
+            dispatch_pointer(&ui, WindowEvent::PointerPressed { position: LogicalPosition::new(x+from, 17.0), button: PointerEventButton::Left });
+            dispatch_pointer(&ui, WindowEvent::PointerMoved { position: LogicalPosition::new(x+to, 17.0) });
+            render(&window);
+            dispatch_pointer(&ui, WindowEvent::PointerReleased { position: LogicalPosition::new(x+to, 17.0), button: PointerEventButton::Left });
+            render(&window);
+        };
+        drag(20.0, 305.0);
+        assert_eq!(*reorders.borrow(), vec![(1, 3, true)]);
+        drag(238.0, 10.0);
+        assert_eq!(*reorders.borrow(), vec![(1,3,true), (3,1,false)]);
+        assert!(docks.borrow().is_empty());
+        assert_eq!(ui.get_workspace_layout(), layout);
+        assert!(clicks.borrow().is_empty(), "drag release must not activate a different tab");
+        dispatch_click(&ui, x+130.0, 17.0);
+        assert_eq!(*clicks.borrow(), vec![2]);
+        assert_eq!(reorders.borrow().len(), 2);
+        // A fast gesture can press/move/release before another frame is drawn.
+        dispatch_pointer(&ui, WindowEvent::PointerPressed { position: LogicalPosition::new(x+20.0,17.0), button: PointerEventButton::Left });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved { position: LogicalPosition::new(x+190.0,17.0) });
+        dispatch_pointer(&ui, WindowEvent::PointerReleased { position: LogicalPosition::new(x+190.0,17.0), button: PointerEventButton::Left });
+        assert_eq!(reorders.borrow().last(), Some(&(1,2,true)));
+        assert_eq!(reorders.borrow().len(), 3);
+        ui.set_secondary_tabs(ModelRc::new(VecModel::from((4..=5).map(|id| TabEntry {
+            id, title: "A".into(), kind: "file".into(), group: 1, ..Default::default()
+        }).collect::<Vec<_>>())));
+        ui.set_secondary_active_tab_id(4);
+        ui.set_workspace_layout(3);
+        ui.set_panel_split_ratio(0.5);
+        render(&window);
+        let sx = x + ui.get_secondary_group_x();
+        let sy = ui.get_secondary_group_y()+17.0;
+        dispatch_pointer(&ui, WindowEvent::PointerPressed { position: LogicalPosition::new(sx+20.0,sy), button: PointerEventButton::Left });
+        dispatch_pointer(&ui, WindowEvent::PointerMoved { position: LogicalPosition::new(sx+190.0,sy) });
+        render(&window);
+        dispatch_pointer(&ui, WindowEvent::PointerReleased { position: LogicalPosition::new(sx+190.0,sy), button: PointerEventButton::Left });
+        assert_eq!(reorders.borrow().last(), Some(&(4,5,true)));
+        assert_eq!(reorders.borrow().len(), 4);
+        assert!(docks.borrow().is_empty());
+        ui.set_dynamic_panes(true);
+        ui.set_primary_layout_visible(false);
+        ui.set_secondary_layout_visible(false);
+        ui.set_extra_panes(ModelRc::new(VecModel::from(vec![PaneEntry {
+            group: 2, x: 0.0, y: 0.0, width: 1.0, height: 1.0, visible: true,
+            active_tab_id: 7, active_kind: "file".into(),
+            tabs: ModelRc::new(VecModel::from((7..=8).map(|id| TabEntry { id, title: "A".into(), kind: "file".into(), group: 2, ..Default::default() }).collect::<Vec<_>>())),
+            ..Default::default()
+        }])));
+        render(&window);
+        drag(20.0, 190.0);
+        assert_eq!(reorders.borrow().last(), Some(&(7,8,true)));
+        assert_eq!(reorders.borrow().len(), 5);
+    }
+
+    #[test]
+    fn ime_composition_follows_hidden_terminal_input_position_and_commits_once() {
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        slint::platform::set_platform(Box::new(TestPlatform {
+            window: window.clone(), clipboard: Rc::new(RefCell::new(String::new())),
+        })).unwrap();
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(PhysicalSize::new(1200, 800));
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry { id: 1, title: "Claude".into(), kind: "terminal".into(), ..Default::default() }])));
+        ui.set_primary_active_tab_id(1);
+        ui.set_primary_active_kind("terminal".into());
+        ui.set_terminal_grid_rows(24);
+        ui.set_terminal_grid_columns(80);
+        // The native cursor is hidden, but the terminal reports its input location.
+        ui.set_terminal_cursor_row(10);
+        ui.set_terminal_cursor_column(20);
+        ui.set_terminal_cells(ModelRc::new(VecModel::from(vec![TerminalCell {
+            row: 10, column: 20, glyph: " ".into(), cursor: false, column_span: 1,
+            foreground: slint::Color::from_rgb_u8(255,255,255),
+            background: slint::Color::from_rgb_u8(0x28,0x2c,0x34), ..Default::default()
+        }])));
+        let commits = Rc::new(RefCell::new(Vec::new()));
+        let observed = commits.clone();
+        ui.on_terminal_text(move |id, text| observed.borrow_mut().push((id,text.to_string())));
+        render(&window);
+        ui.invoke_focus_terminal();
+        let before = render(&window);
+        dispatch_preedit(&ui, "h");
+        let after = render(&window);
+        let changed = before.iter().zip(&after).enumerate().filter_map(|(i,(a,b))| (a != b).then_some(i)).collect::<Vec<_>>();
+        assert!(changed.len() > 5, "composition must paint before pressing space");
+        let x = ui.get_sidebar_width() as usize + 6 + 20*8;
+        let y = 36 + 10*16;
+        assert!(changed.iter().all(|i| i%1200 >= x && i%1200 < x+32 && i/1200 >= y && i/1200 < y+16), "composition was painted away from the reported input caret");
+        dispatch_preedit(&ui, "ㅎ");
+        assert_eq!(ui.get_terminal_ime_preedit().as_str(), "ㅎ");
+        assert!(commits.borrow().is_empty(), "preedit must not send unfinished Hangul to the CLI");
+        dispatch_preedit(&ui, "한");
+        dispatch_commit(&ui, "한");
+        assert_eq!(*commits.borrow(), vec![(1,"한".into())]);
+        assert_eq!(ui.get_terminal_ime_preedit().as_str(), "");
+        assert!(!ui.get_terminal_cells().row_data(0).unwrap().cursor);
+        // Native-cursor mode must not paint white composition over a white block.
+        let mut cursor = ui.get_terminal_cells().row_data(0).unwrap();
+        cursor.cursor = true;
+        ui.set_terminal_cells(ModelRc::new(VecModel::from(vec![cursor])));
+        render(&window);
+        dispatch_preedit(&ui, "h");
+        let composed = render(&window);
+        for row in y..y+16 {
+            let range = row*1200+x..row*1200+x+32;
+            assert_eq!(&composed[range.clone()], &after[range], "native cursor must not obscure or alter the composition preview");
+        }
+        dispatch_preedit(&ui, "");
+        assert_eq!(commits.borrow().len(), 1, "canceling composition must not send text");
+    }
+
+    #[test]
+    fn moving_a_running_terminal_to_bottom_and_extra_panes_restores_focus_and_geometry() {
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+        slint::platform::set_platform(Box::new(TestPlatform {
+            window: window.clone(), clipboard: Rc::new(RefCell::new(String::new())),
+        })).unwrap();
+        let ui = AppWindow::new().unwrap();
+        ui.window().set_size(PhysicalSize::new(1200,800));
+        ui.set_dynamic_panes(true);
+        ui.set_primary_active_tab_id(2);
+        ui.set_primary_active_kind("terminal".into());
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry { id: 2, title: "Codex".into(), kind: "terminal".into(), ..Default::default() }])));
+        ui.set_terminal_grid_rows(46);
+        ui.set_terminal_grid_columns(118);
+        let keys = Rc::new(RefCell::new(Vec::new()));
+        let observed = keys.clone();
+        ui.on_terminal_text(move |id,text| observed.borrow_mut().push((id,text.to_string())));
+        let mut pixels = vec![TestPixel::default();1200*800];
+        let draw = |pixels: &mut Vec<TestPixel>| {
+            window.request_redraw();
+            window.draw_if_needed(|renderer| { renderer.render(pixels,1200); });
+        };
+        draw(&mut pixels);
+        ui.invoke_focus_terminal();
+        draw(&mut pixels);
+        assert!(ui.get_terminal_ime_active());
+
+        // Copy the layout/state changes made by docking, without user input or
+        // a TUI redraw. The session ID survives the move to the lower pane.
+        ui.set_focused_group(1);
+        ui.set_primary_active_tab_id(1);
+        ui.set_primary_active_kind("file".into());
+        ui.set_primary_tabs(ModelRc::new(VecModel::from(vec![TabEntry { id: 1, title: "file".into(), kind: "file".into(), ..Default::default() }])));
+        ui.set_primary_layout_height(0.5);
+        ui.set_secondary_layout_x(0.0);
+        ui.set_secondary_layout_y(0.5);
+        ui.set_secondary_layout_width(1.0);
+        ui.set_secondary_layout_height(0.5);
+        ui.set_secondary_layout_visible(true);
+        ui.set_secondary_active_tab_id(2);
+        ui.set_secondary_active_kind("terminal".into());
+        ui.set_secondary_tabs(ModelRc::new(VecModel::from(vec![TabEntry { id: 2, title: "Codex".into(), kind: "terminal".into(), group: 1, ..Default::default() }])));
+        let size = terminal_layout::grid_size(ui.get_workspace_area_width(),ui.get_workspace_area_height()*0.5,ui.get_terminal_font_size()).unwrap();
+        ui.set_secondary_terminal_grid_rows(size.0.into());
+        ui.set_secondary_terminal_grid_columns(size.1.into());
+        ui.set_secondary_terminal_cells(ModelRc::new(VecModel::from(vec![TerminalCell {
+            row: i32::from(size.0)-1, column: i32::from(size.1)-1, glyph: "Z".into(), column_span: 1,
+            foreground: slint::Color::from_rgb_u8(255,255,255), background: slint::Color::from_rgb_u8(0x28,0x2c,0x34), ..Default::default()
+        }])));
+        let transfer = terminal_focus::TerminalFocusTransfer::default();
+        transfer.request(&ui);
+        draw(&mut pixels);
+        slint::platform::update_timers_and_animations();
+        draw(&mut pixels);
+        assert_eq!((ui.get_secondary_terminal_rows() as u16,ui.get_secondary_terminal_columns() as u16),size);
+        assert!(ui.get_secondary_terminal_ime_active(),"lower pane never received IME focus");
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: "x".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: "x".into() });
+        assert_eq!(keys.borrow().last(), Some(&(2,"x".into())),"first key after docking was lost or sent to another tab");
+        let mut fresh = vec![TestPixel::default();1200*800];
+        window.request_redraw();
+        window.draw_if_needed(|renderer| {
+            renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+            renderer.render(&mut fresh,1200);
+        });
+        assert_eq!(pixels,fresh,"partial rendering left stale/clipped pixels after docking");
+
+        ui.set_secondary_layout_visible(false);
+        ui.set_focused_group(2);
+        ui.set_extra_panes(ModelRc::new(VecModel::from(vec![PaneEntry {
+            group: 2, x: 0.0, y: 0.5, width: 1.0, height: 0.5, visible: true,
+            active_tab_id: 2, active_kind: "terminal".into(), terminal_grid_rows: size.0.into(), terminal_grid_columns: size.1.into(),
+            tabs: ModelRc::new(VecModel::from(vec![TabEntry { id: 2,title: "Codex".into(),kind: "terminal".into(),group: 2,..Default::default() }])),
+            ..Default::default()
+        }])));
+        transfer.request(&ui);
+        draw(&mut pixels);
+        slint::platform::update_timers_and_animations();
+        draw(&mut pixels);
+        ui.window().dispatch_event(WindowEvent::KeyPressed { text: "y".into() });
+        ui.window().dispatch_event(WindowEvent::KeyReleased { text: "y".into() });
+        assert_eq!(keys.borrow().last(), Some(&(2,"y".into())),"newly created extra pane did not accept its first key");
+        let panes = ui.get_extra_panes();
+        let model = panes.as_any().downcast_ref::<VecModel<PaneEntry>>().unwrap();
+        dispatch_click(&ui,ui.get_sidebar_width()+300.0,650.0);
+        for (index,text) in ["a","b","c","d","e"].iter().enumerate() {
+            // A live TUI answers each key with output and moves its caret.
+            // This updates the containing pane model just like sync_terminal.
+            crate::terminal_view::sync_frame(&ui, 2, size.0, size.1,
+                i32::from(size.0)-1, index as i32, vec![TerminalCell {
+                row: i32::from(size.0)-1, column: index as i32, glyph: "X".into(), column_span: 1,
+                foreground: slint::Color::from_rgb_u8(255,255,255), background: slint::Color::from_rgb_u8(0x28,0x2c,0x34), ..Default::default()
+            }]);
+            draw(&mut pixels);
+            slint::platform::update_timers_and_animations();
+            draw(&mut pixels);
+            let count = keys.borrow().len();
+            ui.window().dispatch_event(WindowEvent::KeyPressed { text: (*text).into() });
+            ui.window().dispatch_event(WindowEvent::KeyReleased { text: (*text).into() });
+            assert_eq!(keys.borrow().len(),count+1,"typing stopped after a TUI output update");
+            assert_eq!(keys.borrow().last(),Some(&(2,text.to_string())));
+        }
+        // A PTY redraw/resize during Korean composition must not replace the
+        // focused input or send a partial preedit to the running application.
+        dispatch_preedit(&ui, "한");
+        let count = keys.borrow().len();
+        crate::terminal_view::sync_frame(&ui, 2, size.0, size.1,
+            i32::from(size.0)+10, 4, Vec::new());
+        draw(&mut pixels);
+        assert_eq!(keys.borrow().len(), count);
+        ui.window().dispatch_event(WindowEvent::KeyPressed {text: "한".into()});
+        ui.window().dispatch_event(WindowEvent::KeyReleased {text: "한".into()});
+        dispatch_preedit(&ui, "");
+        assert_eq!(keys.borrow().len(), count+1, "PTY redraw lost or duplicated the IME commit");
+        assert_eq!(keys.borrow().last(), Some(&(2,"한".into())));
+        // The focus counter can already have advanced when a repeated pane is
+        // first constructed. It must adopt focus from current state, not wait
+        // for a later counter change or another click.
+        ui.set_focused_group(3);
+        ui.set_terminal_focus_generation(ui.get_terminal_focus_generation()+1);
+        let mut previous = model.row_data(0).unwrap();
+        previous.visible = false;
+        model.set_row_data(0,previous);
+        model.push(PaneEntry {
+            group:3,x:0.0,y:0.5,width:1.0,height:0.5,visible:true,
+            active_tab_id:3,active_kind:"terminal".into(),terminal_grid_rows:size.0.into(),terminal_grid_columns:size.1.into(),
+            tabs:ModelRc::new(VecModel::from(vec![TabEntry {id:3,title:"new terminal".into(),kind:"terminal".into(),group:3,..Default::default()}])),
+            ..Default::default()
+        });
+        draw(&mut pixels);
+        slint::platform::update_timers_and_animations();
+        draw(&mut pixels);
+        ui.window().dispatch_event(WindowEvent::KeyPressed {text:"z".into()});
+        ui.window().dispatch_event(WindowEvent::KeyReleased {text:"z".into()});
+        assert_eq!(keys.borrow().last(),Some(&(3,"z".into())),"new pane ignored focus state established before its construction");
     }
 
     #[test]
