@@ -10,9 +10,13 @@ struct Queue {
     closed: bool,
     error: Option<String>,
 }
+#[derive(Clone)]
 pub struct TerminalInput {
     queue: Arc<(Mutex<Queue>, Condvar)>,
+    // The writer thread holds only the queue. The last sender closes it.
+    _lifetime: Arc<InputLifetime>,
 }
+struct InputLifetime(Arc<(Mutex<Queue>, Condvar)>);
 impl TerminalInput {
     pub fn new(mut writer: impl Write + Send + 'static) -> io::Result<Self> {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
@@ -42,7 +46,10 @@ impl TerminalInput {
                     }
                 }
             })?;
-        Ok(Self { queue })
+        Ok(Self {
+            _lifetime: Arc::new(InputLifetime(queue.clone())),
+            queue,
+        })
     }
     pub fn take_error(&mut self) -> Option<String> {
         self.queue
@@ -80,12 +87,12 @@ impl Write for TerminalInput {
         Ok(())
     }
 }
-impl Drop for TerminalInput {
+impl Drop for InputLifetime {
     fn drop(&mut self) {
-        let mut state = self.queue.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
         state.chunks.clear();
-        self.queue.1.notify_one();
+        self.0.1.notify_one();
     }
 }
 #[cfg(test)]
@@ -93,6 +100,29 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+    struct Recorded(mpsc::Sender<Vec<u8>>);
+    impl Write for Recorded {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.send(bytes.to_vec()).unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn dropping_one_sender_does_not_close_shared_protocol_input() {
+        let (sent, received) = mpsc::channel();
+        let input = TerminalInput::new(Recorded(sent)).unwrap();
+        let mut protocol = input.clone();
+        drop(input);
+        protocol.write_all(b"\x1b[2;6R").unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"\x1b[2;6R"
+        );
+        drop(protocol);
+    }
     struct Blocked {
         started: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,

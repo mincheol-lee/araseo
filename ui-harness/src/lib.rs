@@ -56,6 +56,42 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
+    fn dense_terminal_row_updates_keep_the_model_and_unaffected_cells() {
+        use i_slint_core::properties::PropertyTracker;
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        slint::platform::set_platform(Box::new(TestPlatform {
+            window, clipboard: Rc::new(RefCell::new(String::new())),
+        })).unwrap();
+        let ui = AppWindow::new().unwrap();
+        let cell = |row, column, glyph: &str| TerminalCell {
+            row, column, glyph: glyph.into(), column_span: 1, ..Default::default()
+        };
+        let initial = (0..16).flat_map(|row| (0..80).map(move |column| cell(row,column,"A"))).collect();
+        terminal_view::sync_frame(&ui,0,16,80,0,0,initial);
+        let model = ui.get_terminal_cells();
+        let tracker = Box::pin(PropertyTracker::<false>::default());
+        tracker.as_ref().evaluate(|| model.model_tracker().track_row_count_changes());
+        let updates = (4..12).map(|row| (row as usize,(0..80).map(|col| cell(row,col,"B")).collect())).collect();
+        terminal_view::sync_frame_rows(&ui,0,16,80,0,0,&[80;16],updates);
+        assert!(!tracker.is_dirty(), "dense output must not reset/recreate the entire model");
+        assert_eq!(model.row_count(),1280);
+        assert_eq!(model.row_data(3*80).unwrap().glyph,"A");
+        assert_eq!(model.row_data(4*80).unwrap().glyph,"B");
+        assert_eq!(model.row_data(12*80).unwrap().glyph,"A");
+        // Sparse insertion and removal in distant rows preserve row offsets.
+        terminal_view::sync_frame_rows(&ui,0,17,80,0,0,&[80;16],vec![
+            (16,vec![cell(16,4,"new")]),
+            (13,vec![cell(13,5,"sparse")]),
+            (2,vec![cell(2,1,"first"),cell(2,3,"second")]),
+        ]);
+        assert_eq!(model.row_count(),1124);
+        assert_eq!(model.row_data(160).unwrap().glyph,"first");
+        assert_eq!(model.row_data(161).unwrap().glyph,"second");
+        assert_eq!(model.row_data(962).unwrap().glyph,"sparse");
+        assert_eq!(model.row_data(1123).unwrap().glyph,"new");
+    }
+
+    #[test]
     fn tab_shortcuts_are_available_before_any_focus_change() {
         assert_eq!(shortcuts::tab_cycle_delta(true, false, false, true), Some(1));
         assert_eq!(shortcuts::tab_cycle_delta(true, true, false, true), Some(-1));
@@ -343,11 +379,20 @@ mod tests {
         for (index,text) in ["a","b","c","d","e"].iter().enumerate() {
             // A live TUI answers each key with output and moves its caret.
             // This updates the containing pane model just like sync_terminal.
-            crate::terminal_view::sync_frame(&ui, 2, size.0, size.1,
-                i32::from(size.0)-1, index as i32, vec![TerminalCell {
+            let mut counts = vec![0; usize::from(size.0)];
+            if index == 0 {
+                crate::terminal_view::sync_frame(&ui, 2, size.0, size.1,
+                    i32::from(size.0)-1, index as i32, vec![TerminalCell {
+                    row: i32::from(size.0)-1, column: 0, glyph: "X".into(), column_span: 1,
+                    ..Default::default()
+                }]);
+            }
+            *counts.last_mut().unwrap() = 1;
+            crate::terminal_view::sync_frame_rows(&ui, 2, size.0, size.1,
+                i32::from(size.0)-1, index as i32, &counts, vec![(usize::from(size.0)-1, vec![TerminalCell {
                 row: i32::from(size.0)-1, column: index as i32, glyph: "X".into(), column_span: 1,
                 foreground: slint::Color::from_rgb_u8(255,255,255), background: slint::Color::from_rgb_u8(0x28,0x2c,0x34), ..Default::default()
-            }]);
+            }])]);
             draw(&mut pixels);
             slint::platform::update_timers_and_animations();
             draw(&mut pixels);
