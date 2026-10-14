@@ -433,6 +433,20 @@ impl TabGroups {
             .filter_map(|(id, tab_group)| (*tab_group == group).then_some(*id))
             .collect()
     }
+    pub fn active_tabs(&self) -> Vec<(GroupId, Option<TabId>)> {
+        self.groups()
+            .into_iter()
+            .map(|group| (group, self.active(group)))
+            .collect()
+    }
+
+    pub fn changed_active_groups(&self, previous: &[(GroupId, Option<TabId>)]) -> Vec<GroupId> {
+        self.active_tabs()
+            .into_iter()
+            .filter_map(|(group, active)| (!previous.contains(&(group, active))).then_some(group))
+            .collect()
+    }
+
     pub fn groups(&self) -> Vec<GroupId> {
         self.layout()
             .0
@@ -487,6 +501,22 @@ impl TabGroups {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_a_file_updates_its_group_without_refreshing_the_other_terminal() {
+        let mut tabs = TabGroups::default();
+        tabs.add(1, 0);
+        tabs.add(2, 0);
+        tabs.dock_into(2, 0, Dock::Bottom);
+        let before = tabs.active_tabs();
+        tabs.add(3, 0);
+        assert_eq!(tabs.changed_active_groups(&before), vec![0]);
+        let before = tabs.active_tabs();
+        tabs.activate(3);
+        assert!(tabs.changed_active_groups(&before).is_empty());
+        tabs.activate(1);
+        assert_eq!(tabs.changed_active_groups(&before), vec![0]);
+    }
 
     #[test]
     fn repeated_nested_splits_and_collapse() {

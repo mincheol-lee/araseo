@@ -88,6 +88,7 @@ struct AppState {
     pending_terminals: VecDeque<(usize, PathBuf)>,
     git_status_loader: Background<HashMap<PathBuf, GitStatus>>,
     terminal_dirty: HashSet<TabId>,
+    terminal_frames: RefCell<HashMap<usize, (TabId, Arc<terminal::TerminalFrame>)>>,
     diff_cache: RefCell<HashMap<TabId, (i32, ModelRc<DiffRow>)>>,
     next_tab_id: TabId,
     next_terminal_number: u32,
@@ -101,7 +102,7 @@ struct AppState {
     syncing_editor: Cell<bool>,
     emoji_icons: emoji::EmojiIcons,
     tree_loader: Background<Result<Vec<FlatNode>>>,
-    file_loader: Background<Result<(OpenedFile, usize)>>,
+    file_loader: Background<Result<(OpenedFile, usize, Instant, Instant)>>,
     page_loader: Background<Result<(TabId, usize, i32, f32, RenderedPage)>>,
     markdown_source_tabs: HashSet<TabId>,
     markdown_preview_cache: RefCell<HashMap<TabId, (u64, ModelRc<PreviewBlock>)>>,
@@ -293,6 +294,7 @@ fn run() -> Result<()> {
         pending_terminals: VecDeque::new(),
         git_status_loader: Background::default(),
         terminal_dirty: HashSet::new(),
+        terminal_frames: RefCell::new(HashMap::new()),
         diff_cache: RefCell::new(HashMap::new()),
         next_tab_id: 0,
         next_terminal_number: 1,
@@ -405,16 +407,24 @@ fn run() -> Result<()> {
         ui.on_wsl_process_termination_requested(move |index, force| {
             let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
-            if state.wsl_process_pending || ui.get_wsl_diagnostics_running() { return; }
-            let Some((workspace, report)) = &state.wsl_report else { return };
-            let Some(target) = usize::try_from(index).ok()
+            if state.wsl_process_pending || ui.get_wsl_diagnostics_running() {
+                return;
+            }
+            let Some((workspace, report)) = &state.wsl_report else {
+                return;
+            };
+            let Some(target) = usize::try_from(index)
+                .ok()
                 .and_then(|index| report.checks.get(index))
-                .and_then(|check| check.process.clone()) else { return };
+                .and_then(|check| check.process.clone())
+            else {
+                return;
+            };
             let workspace = workspace.clone();
             state.wsl_process_pending = true;
-            state.wsl_process_loader.request(move || {
-                wsl_diagnostics::terminate_process(&workspace, &target, force)
-            });
+            state
+                .wsl_process_loader
+                .request(move || wsl_diagnostics::terminate_process(&workspace, &target, force));
             ui.set_wsl_process_running(true);
             ui.set_wsl_process_selected(-1);
             ui.set_wsl_process_message("Stopping process...".into());
@@ -520,6 +530,7 @@ fn run() -> Result<()> {
         let state = state.clone();
         ui.on_tree_activated(move |index| {
             let mut state = state.borrow_mut();
+            let before = state.tab_groups.active_tabs();
             if let Some(node) = state.tree.get(index as usize).cloned() {
                 if node.is_directory {
                     if !state.expanded.remove(&node.linux_path) {
@@ -531,7 +542,7 @@ fn run() -> Result<()> {
                 }
             }
             if let Some(ui) = weak.upgrade() {
-                sync_ui(&ui, &state);
+                sync_file_navigation(&ui, &state, &before);
             }
         });
     }
@@ -1115,15 +1126,11 @@ fn run() -> Result<()> {
             let Ok(tab_id) = TabId::try_from(tab_id) else {
                 return;
             };
-            let Some(ui) = weak.upgrade() else {
+            let Some(_ui) = weak.upgrade() else {
                 return;
             };
             let mut state = state.borrow_mut();
-            let visible_group = state
-                .tab_groups
-                .group_of(tab_id)
-                .filter(|group| state.tab_groups.active(*group) == Some(tab_id));
-            let changed = terminal_mut(&mut state, tab_id).is_some_and(|terminal| {
+            if let Some(terminal) = terminal_mut(&mut state, tab_id) {
                 terminal.scroll_scrollback(terminal::TerminalWheel {
                     rows,
                     row,
@@ -1131,10 +1138,7 @@ fn run() -> Result<()> {
                     control,
                     alt,
                     shift,
-                })
-            });
-            if changed && let Some(group) = visible_group {
-                sync_group(&ui, &state, group);
+                });
             }
         });
     }
@@ -1692,8 +1696,19 @@ fn run() -> Result<()> {
                 sync_git_changes(&ui, &state);
             }
             if let Some(result) = state.file_loader.poll() {
+                let before = state.tab_groups.active_tabs();
                 match result {
-                    Ok((opened, group)) => {
+                    Ok((opened, group, started, ready)) => {
+                        diagnostics_log::event(&format!(
+                            "file open read_ms={} ready_to_ui_ms={}",
+                            ready.duration_since(started).as_millis(),
+                            ready.elapsed().as_millis()
+                        ));
+                        let group = if state.tab_groups.groups().contains(&group) {
+                            group
+                        } else {
+                            state.tab_groups.focused_group()
+                        };
                         let content = match opened {
                             OpenedFile::Text(document) => Ok(TabContent::File(document)),
                             OpenedFile::Preview(loaded) => {
@@ -1715,7 +1730,7 @@ fn run() -> Result<()> {
                     }
                     Err(error) => state.status = error.to_string(),
                 }
-                sync_ui(&ui, &state);
+                sync_file_navigation(&ui, &state, &before);
             }
             if let Some(result) = state.page_loader.poll() {
                 match result {
@@ -1863,6 +1878,7 @@ fn run() -> Result<()> {
         let weak = ui.as_weak();
         let state = state.clone();
         let window_activity = window_activity.clone();
+        let mut next_group = 0;
         timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut state = state.borrow_mut();
@@ -1874,20 +1890,41 @@ fn run() -> Result<()> {
                     ui.set_agent_frame((ui.get_agent_frame() + 1) % 8);
                 }
             }
-            let active = state
-                .tab_groups
-                .groups()
+            let active = visible_panes(&state)
                 .into_iter()
-                .filter_map(|group| state.tab_groups.active(group).map(|id| (id, group)))
+                .filter_map(|(group, _)| state.tab_groups.active(group).map(|id| (id, group)))
                 .collect::<HashMap<_, _>>();
+            // Also poll as a fallback if a callback briefly encounters a busy
+            // mailbox. Parsing continues for hidden tabs; presentation pauses.
+            let mut polled = Vec::new();
+            for tab in &mut state.tabs {
+                if let TabContent::Terminal { session, .. } = &mut tab.content {
+                    session.set_visible(active.contains_key(&tab.id));
+                    if session.poll() && active.contains_key(&tab.id) {
+                        polled.push(tab.id);
+                    }
+                }
+            }
+            state.terminal_dirty.extend(polled);
             let mut changed_groups = resize_visible_terminals(&ui, &mut state);
             for id in std::mem::take(&mut state.terminal_dirty) {
                 if let Some(group) = active.get(&id) {
                     changed_groups.insert(*group);
                 }
             }
-            for group in changed_groups {
+            let mut groups = changed_groups.into_iter().collect::<Vec<_>>();
+            groups.sort_unstable_by_key(|group| (*group < next_group, *group));
+            let started = Instant::now();
+            for (index, group) in groups.into_iter().enumerate() {
+                // Bound aggregate model work across panes, then yield to input.
+                if index > 0 && started.elapsed() >= Duration::from_millis(8) {
+                    if let Some(id) = state.tab_groups.active(group) {
+                        state.terminal_dirty.insert(id);
+                    }
+                    continue;
+                }
                 sync_active_terminal(&ui, &state, group);
+                next_group = group.saturating_add(1);
             }
         });
     }
@@ -2585,6 +2622,7 @@ fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
     let workspace = workspace_for_path(state, &linux_path)?;
     let group = state.tab_groups.focused_group();
     state.status = format!("Opening {}...", linux_path.display());
+    let started = Instant::now();
     state.file_loader.request(move || {
         let host_path = workspace.host_path(&linux_path)?;
         let opened = match preview::kind_for(&linux_path) {
@@ -2593,7 +2631,7 @@ fn open_document(state: &mut AppState, linux_path: PathBuf) -> Result<()> {
             }
             None => OpenedFile::Text(Document::open(linux_path, host_path)?),
         };
-        Ok((opened, group))
+        Ok((opened, group, started, Instant::now()))
     });
     Ok(())
 }
@@ -3484,6 +3522,25 @@ fn sync_ui(ui: &AppWindow, state: &AppState) {
     sync_workspace_ui(ui, state);
 }
 
+// Opening a file changes tabs and one editor. Keep the file tree, Git models
+// and terminals in other panes attached to their existing presentation.
+fn sync_file_navigation(ui: &AppWindow, state: &AppState, before: &[(usize, Option<TabId>)]) {
+    ui.set_status_text(state.status.clone().into());
+    ui.set_focused_group(state.tab_groups.focused_group() as i32);
+    let groups = state.tab_groups.changed_active_groups(before);
+    if !groups.is_empty() {
+        sync_tabs(ui, state);
+    }
+    for group in groups {
+        sync_group(ui, state, group);
+    }
+    let path = focused_tab_id(state)
+        .and_then(|id| state.tabs.iter().find(|tab| tab.id == id))
+        .map(tab_detail)
+        .unwrap_or_default();
+    ui.set_active_path(path.into());
+}
+
 // Pane movement does not change the file tree or Git state. Avoid rebuilding
 // those models on the UI thread while a running terminal is being relocated.
 fn sync_workspace_ui(ui: &AppWindow, state: &AppState) {
@@ -3494,6 +3551,10 @@ fn sync_workspace_ui(ui: &AppWindow, state: &AppState) {
         .iter()
         .filter_map(|group| state.tab_groups.active(*group))
         .collect::<HashSet<_>>();
+    state
+        .terminal_frames
+        .borrow_mut()
+        .retain(|group, (id, _)| state.tab_groups.active(*group) == Some(*id));
     state
         .diff_cache
         .borrow_mut()
@@ -3553,12 +3614,12 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                     if !markdown_preview {
                         sync_editor_view(ui, state, document, 0, ui.get_editor_text());
                     }
-                    clear_terminal_group(ui, 0);
+                    clear_terminal_group(ui, state, 0);
                 }
                 TabContent::Preview(preview) => {
                     state.editor_views.borrow_mut()[0].clear();
                     ui.set_primary_active_kind(preview_kind_name(preview.kind).into());
-                    clear_terminal_group(ui, 0);
+                    clear_terminal_group(ui, state, 0);
                 }
                 TabContent::Diff(diff) => {
                     state.editor_views.borrow_mut()[0].clear();
@@ -3566,14 +3627,14 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                     ui.set_syntax_highlight_enabled(false);
                     ui.set_highlighted_text(slint::StyledText::default());
                     sync_diff(ui, state, tab.id, diff, 0);
-                    clear_terminal_group(ui, 0);
+                    clear_terminal_group(ui, state, 0);
                 }
                 TabContent::Terminal { session, .. } => {
                     state.editor_views.borrow_mut()[0].clear();
                     ui.set_primary_active_kind("terminal".into());
                     ui.set_syntax_highlight_enabled(false);
                     ui.set_highlighted_text(slint::StyledText::default());
-                    sync_terminal(ui, session, 0);
+                    sync_terminal(ui, state, tab.id, session, 0);
                 }
             }
         }
@@ -3596,12 +3657,12 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                     if !markdown_preview {
                         sync_editor_view(ui, state, document, 1, ui.get_secondary_editor_text());
                     }
-                    clear_terminal_group(ui, 1);
+                    clear_terminal_group(ui, state, 1);
                 }
                 TabContent::Preview(preview) => {
                     state.editor_views.borrow_mut()[1].clear();
                     ui.set_secondary_active_kind(preview_kind_name(preview.kind).into());
-                    clear_terminal_group(ui, 1);
+                    clear_terminal_group(ui, state, 1);
                 }
                 TabContent::Diff(diff) => {
                     state.editor_views.borrow_mut()[1].clear();
@@ -3609,14 +3670,14 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
                     ui.set_secondary_syntax_highlight_enabled(false);
                     ui.set_secondary_highlighted_text(slint::StyledText::default());
                     sync_diff(ui, state, tab.id, diff, 1);
-                    clear_terminal_group(ui, 1);
+                    clear_terminal_group(ui, state, 1);
                 }
                 TabContent::Terminal { session, .. } => {
                     state.editor_views.borrow_mut()[1].clear();
                     ui.set_secondary_active_kind("terminal".into());
                     ui.set_secondary_syntax_highlight_enabled(false);
                     ui.set_secondary_highlighted_text(slint::StyledText::default());
-                    sync_terminal(ui, session, 1);
+                    sync_terminal(ui, state, tab.id, session, 1);
                 }
             }
         }
@@ -3631,7 +3692,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
             ui.set_syntax_highlight_enabled(false);
             ui.set_highlighted_text(slint::StyledText::default());
             ui.set_diff_rows(ModelRc::new(VecModel::from(Vec::<DiffRow>::new())));
-            clear_terminal_group(ui, 0);
+            clear_terminal_group(ui, state, 0);
         }
         (1, None) => {
             state.editor_views.borrow_mut()[1].clear();
@@ -3644,7 +3705,7 @@ fn sync_group(ui: &AppWindow, state: &AppState, group: usize) {
             ui.set_secondary_syntax_highlight_enabled(false);
             ui.set_secondary_highlighted_text(slint::StyledText::default());
             ui.set_secondary_diff_rows(ModelRc::new(VecModel::from(Vec::<DiffRow>::new())));
-            clear_terminal_group(ui, 1);
+            clear_terminal_group(ui, state, 1);
         }
         _ => {}
     }
@@ -3784,7 +3845,7 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
             pane.syntax_highlight_enabled = false;
             pane.diff_rows = ModelRc::new(VecModel::from(Vec::<DiffRow>::new()));
         });
-        clear_terminal_group(ui, group);
+        clear_terminal_group(ui, state, group);
         return;
     };
     edit_extra_pane(ui, group, |pane| {
@@ -3821,11 +3882,11 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
             {
                 sync_editor_view(ui, state, document, group, pane.editor_text);
             }
-            clear_terminal_group(ui, group);
+            clear_terminal_group(ui, state, group);
         }
         TabContent::Preview(_) => {
             state.extra_editor_views.borrow_mut().remove(&group);
-            clear_terminal_group(ui, group);
+            clear_terminal_group(ui, state, group);
         }
         TabContent::Diff(diff) => {
             state.extra_editor_views.borrow_mut().remove(&group);
@@ -3834,7 +3895,7 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
                 pane.highlighted_text = slint::StyledText::default();
             });
             sync_diff(ui, state, tab.id, diff, group);
-            clear_terminal_group(ui, group);
+            clear_terminal_group(ui, state, group);
         }
         TabContent::Terminal { session, .. } => {
             state.extra_editor_views.borrow_mut().remove(&group);
@@ -3842,7 +3903,7 @@ fn sync_extra_group(ui: &AppWindow, state: &AppState, group: usize) {
                 pane.syntax_highlight_enabled = false;
                 pane.highlighted_text = slint::StyledText::default();
             });
-            sync_terminal(ui, session, group);
+            sync_terminal(ui, state, tab.id, session, group);
         }
     }
 }
@@ -4010,46 +4071,113 @@ fn sync_active_terminal(ui: &AppWindow, state: &AppState, group: usize) {
         .active(group)
         .and_then(|id| terminal_ref(state, id))
     {
-        sync_terminal(ui, terminal, group);
+        sync_terminal(
+            ui,
+            state,
+            state.tab_groups.active(group).unwrap(),
+            terminal,
+            group,
+        );
     }
 }
 
-fn sync_terminal(ui: &AppWindow, terminal: &TerminalSession, group: usize) {
-    let (rows, columns) = terminal.size();
-    let cells = terminal
-        .cells()
-        .into_iter()
-        .map(|cell| TerminalCell {
-            row: cell.row,
-            column: cell.column,
-            glyph: cell.glyph.into(),
-            foreground: slint::Color::from_rgb_u8(
-                cell.foreground[0],
-                cell.foreground[1],
-                cell.foreground[2],
-            ),
-            background: slint::Color::from_rgb_u8(
-                cell.background[0],
-                cell.background[1],
-                cell.background[2],
-            ),
-            bold: cell.bold,
-            cursor: cell.cursor,
-            column_span: cell.column_span,
-        })
-        .collect::<Vec<_>>();
-    terminal_view::sync_frame(
-        ui,
-        group,
-        rows,
-        columns,
-        terminal.cursor_row(),
-        terminal.cursor_column(),
-        cells,
-    );
+fn terminal_cell(cell: &terminal::DisplayCell) -> TerminalCell {
+    TerminalCell {
+        row: cell.row,
+        column: cell.column,
+        glyph: cell.glyph.as_str().into(),
+        foreground: slint::Color::from_rgb_u8(
+            cell.foreground[0],
+            cell.foreground[1],
+            cell.foreground[2],
+        ),
+        background: slint::Color::from_rgb_u8(
+            cell.background[0],
+            cell.background[1],
+            cell.background[2],
+        ),
+        bold: cell.bold,
+        cursor: cell.cursor,
+        column_span: cell.column_span,
+    }
 }
 
-fn clear_terminal_group(ui: &AppWindow, group: usize) {
+fn sync_terminal(
+    ui: &AppWindow,
+    state: &AppState,
+    id: TabId,
+    terminal: &TerminalSession,
+    group: usize,
+) {
+    let frame = terminal.frame();
+    let mut cache = state.terminal_frames.borrow_mut();
+    let previous = cache
+        .get(&group)
+        .filter(|(tab, _)| *tab == id)
+        .map(|(_, frame)| frame);
+    if previous.is_some_and(|previous| Arc::ptr_eq(previous, &frame)) {
+        return;
+    }
+    let started = Instant::now();
+    let (cursor_row, cursor_column) = frame
+        .cursor
+        .map_or((-1, -1), |(row, col)| (i32::from(row), i32::from(col)));
+    if let Some(previous) = previous {
+        let mut updates = Vec::new();
+        for (row, cells) in frame.rows.iter().enumerate() {
+            if previous
+                .rows
+                .get(row)
+                .is_none_or(|old| !Arc::ptr_eq(old, cells))
+            {
+                updates.push((row, cells.cells.iter().map(terminal_cell).collect()));
+            }
+        }
+        for row in frame.rows.len()..previous.rows.len() {
+            updates.push((row, Vec::new()));
+        }
+        let counts = previous
+            .rows
+            .iter()
+            .map(|row| row.cells.len())
+            .collect::<Vec<_>>();
+        terminal_view::sync_frame_rows(
+            ui,
+            group,
+            frame.size.0,
+            frame.size.1,
+            cursor_row,
+            cursor_column,
+            &counts,
+            updates,
+        );
+    } else {
+        let cells = frame
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter().map(terminal_cell))
+            .collect();
+        terminal_view::sync_frame(
+            ui,
+            group,
+            frame.size.0,
+            frame.size.1,
+            cursor_row,
+            cursor_column,
+            cells,
+        );
+    }
+    if started.elapsed() >= Duration::from_millis(100) {
+        diagnostics_log::event(&format!(
+            "terminal model update {} ms",
+            started.elapsed().as_millis()
+        ));
+    }
+    cache.insert(group, (id, frame));
+}
+
+fn clear_terminal_group(ui: &AppWindow, state: &AppState, group: usize) {
+    state.terminal_frames.borrow_mut().remove(&group);
     if group == 0 {
         update_terminal_model(ui.get_terminal_cells(), Vec::new(), |model| {
             ui.set_terminal_cells(model)

@@ -67,6 +67,95 @@ pub fn sync_frame(
     }
 }
 
+/// Apply only changed terminal rows. Updates run from bottom to top so sparse
+/// insertions in one row cannot invalidate the offsets of another row.
+pub fn sync_frame_rows(
+    ui: &AppWindow,
+    group: usize,
+    rows: u16,
+    columns: u16,
+    cursor_row: i32,
+    cursor_column: i32,
+    previous_counts: &[usize],
+    updates: Vec<(usize, Vec<TerminalCell>)>,
+) {
+    let current = if group == 0 {
+        ui.get_terminal_cells()
+    } else if group == 1 {
+        ui.get_secondary_terminal_cells()
+    } else {
+        extra_pane(ui, group).unwrap_or_default().terminal_cells
+    };
+    let model = current
+        .as_any()
+        .downcast_ref::<VecModel<TerminalCell>>()
+        .expect("terminal cells use a VecModel");
+    apply_rows(model, previous_counts, updates);
+    if group == 0 {
+        ui.set_terminal_grid_rows(rows.into());
+        ui.set_terminal_grid_columns(columns.into());
+        ui.set_terminal_cursor_row(cursor_row);
+        ui.set_terminal_cursor_column(cursor_column);
+        ui.set_terminal_update_generation(ui.get_terminal_update_generation().wrapping_add(1));
+    } else if group == 1 {
+        ui.set_secondary_terminal_grid_rows(rows.into());
+        ui.set_secondary_terminal_grid_columns(columns.into());
+        ui.set_secondary_terminal_cursor_row(cursor_row);
+        ui.set_secondary_terminal_cursor_column(cursor_column);
+        ui.set_secondary_terminal_update_generation(
+            ui.get_secondary_terminal_update_generation()
+                .wrapping_add(1),
+        );
+    } else {
+        edit_extra_pane(ui, group, |pane| {
+            pane.terminal_grid_rows = rows.into();
+            pane.terminal_grid_columns = columns.into();
+            pane.terminal_cursor_row = cursor_row;
+            pane.terminal_cursor_column = cursor_column;
+            pane.terminal_update_generation = pane.terminal_update_generation.wrapping_add(1);
+        });
+    }
+}
+
+fn apply_rows(
+    model: &VecModel<TerminalCell>,
+    previous_counts: &[usize],
+    mut updates: Vec<(usize, Vec<TerminalCell>)>,
+) {
+    let mut offsets = Vec::with_capacity(previous_counts.len() + 1);
+    offsets.push(0);
+    for count in previous_counts {
+        offsets.push(offsets.last().unwrap() + count);
+    }
+    updates.sort_unstable_by_key(|(row, _)| std::cmp::Reverse(*row));
+    for (row, cells) in updates {
+        let start = offsets
+            .get(row)
+            .copied()
+            .unwrap_or_else(|| *offsets.last().unwrap());
+        let mut remaining = previous_counts.get(row).copied().unwrap_or(0);
+        let mut index = start;
+        for cell in cells {
+            while remaining > 0 && model.row_data(index).unwrap().column < cell.column {
+                model.remove(index);
+                remaining -= 1;
+            }
+            if remaining > 0 && model.row_data(index).unwrap().column == cell.column {
+                if !terminal_cells_equal(&model.row_data(index).unwrap(), &cell) {
+                    model.set_row_data(index, cell);
+                }
+                remaining -= 1;
+            } else {
+                model.insert(index, cell);
+            }
+            index += 1;
+        }
+        for _ in 0..remaining {
+            model.remove(index);
+        }
+    }
+}
+
 pub fn update_terminal_model(
     current: ModelRc<TerminalCell>,
     cells: Vec<TerminalCell>,

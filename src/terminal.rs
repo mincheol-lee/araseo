@@ -1,5 +1,9 @@
 use crate::terminal_input::TerminalInput;
+#[path = "terminal_output.rs"]
+mod output;
 use anyhow::{Context, Result};
+pub use output::TerminalFrame;
+use output::TerminalOutput;
 #[cfg(not(target_os = "windows"))]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -302,9 +306,8 @@ pub struct TerminalSession {
     #[cfg(not(target_os = "windows"))]
     master: Box<dyn MasterPty + Send>,
     writer: TerminalInput,
-    receiver: mpsc::Receiver<Vec<u8>>,
-    output_signal: Arc<OutputSignal>,
-    parser: vt100::Parser<TerminalCallbacks>,
+    output: TerminalOutput,
+    requested_size: (u16, u16),
     _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     _pipe_child: Option<std::process::Child>,
     #[cfg(target_os = "windows")]
@@ -472,13 +475,11 @@ impl TerminalSession {
         let stderr = child.stderr.take().context("WSL stderr is unavailable")?;
         let stdin = child.stdin.take().context("WSL stdin is unavailable")?;
 
-        // Backpressure bounds unread output to roughly 512 KiB per terminal.
-        let (sender, receiver) = mpsc::sync_channel(64);
-        let output_signal = Arc::new(OutputSignal::default());
-        spawn_reader(stdout, sender.clone(), output_signal.clone())?;
-        spawn_reader(stderr, sender, output_signal.clone())?;
-
         let writer = TerminalInput::new(stdin)?;
+        let output = TerminalOutput::spawn(24, 80, writer.clone())?;
+        spawn_reader(stdout, output.sender.clone())?;
+        spawn_reader(stderr, output.sender.clone())?;
+
         let windows_resize = WindowsPtyResize::new(distro.to_string(), tty_path_file.clone())?;
         Ok(Self {
             agent_probe: AgentProbe {
@@ -487,12 +488,9 @@ impl TerminalSession {
                 distro: distro.to_string(),
             },
             writer,
-            receiver,
-            output_signal,
-            // util-linux `script` allocates an 80x24 Unix PTY by default.
-            // Keep the VT parser at the same size so full-screen TUIs such as
-            // Codex do not wrap every row into a narrow UI-sized buffer.
-            parser: vt100::Parser::new_with_callbacks(24, 80, 10_000, TerminalCallbacks::default()),
+            output,
+            // Match util-linux script's initial PTY grid.
+            requested_size: (24, 80),
             _pty_child: None,
             _pipe_child: cleanup.pipe.take(),
             windows_resize,
@@ -527,9 +525,8 @@ impl TerminalSession {
         };
         let reader = pair.master.try_clone_reader()?;
         let writer = TerminalInput::new(pair.master.take_writer()?)?;
-        let (sender, receiver) = mpsc::sync_channel(64);
-        let output_signal = Arc::new(OutputSignal::default());
-        spawn_reader(reader, sender, output_signal.clone())?;
+        let output = TerminalOutput::spawn(24, 100, writer.clone())?;
+        spawn_reader(reader, output.sender.clone())?;
 
         Ok(Self {
             agent_probe: AgentProbe {
@@ -543,26 +540,15 @@ impl TerminalSession {
             },
             master: pair.master,
             writer,
-            receiver,
-            output_signal,
-            parser: vt100::Parser::new_with_callbacks(
-                24,
-                100,
-                10_000,
-                TerminalCallbacks::default(),
-            ),
+            output,
+            requested_size: (24, 100),
             _pty_child: cleanup.pty.take(),
             _pipe_child: None,
         })
     }
 
     pub fn poll(&mut self) -> bool {
-        let changed = poll_output(&self.receiver, &self.output_signal, &mut self.parser);
-        if !self.parser.callbacks().replies.is_empty() {
-            // Protocol replies are not user input: do not reset scrollback.
-            write_terminal_replies(&mut self.writer, self.parser.callbacks_mut());
-        }
-        changed
+        self.output.poll()
     }
 
     pub fn take_input_error(&mut self) -> Option<String> {
@@ -574,23 +560,39 @@ impl TerminalSession {
     }
 
     pub fn set_output_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
-        self.output_signal.set_waker(Arc::new(waker));
+        self.output.set_waker(waker);
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        self.output.set_visible(visible);
+    }
+
+    pub fn frame(&self) -> Arc<TerminalFrame> {
+        self.output.frame.clone()
     }
 
     pub fn cells(&self) -> Vec<DisplayCell> {
-        display_cells(self.parser.screen())
+        self.output
+            .frame
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter().cloned())
+            .collect()
     }
 
     pub fn size(&self) -> (u16, u16) {
-        self.parser.screen().size()
+        self.requested_size
     }
 
     pub fn cursor_row(&self) -> i32 {
-        input_cursor_position(self.parser.screen()).map_or(-1, |(row, _)| row.into())
+        self.output.frame.cursor.map_or(-1, |(row, _)| row.into())
     }
 
     pub fn cursor_column(&self) -> i32 {
-        input_cursor_position(self.parser.screen()).map_or(-1, |(_, column)| column.into())
+        self.output
+            .frame
+            .cursor
+            .map_or(-1, |(_, column)| column.into())
     }
 
     pub fn selection_text(
@@ -600,36 +602,27 @@ impl TerminalSession {
         cursor_row: i32,
         cursor_column: i32,
     ) -> String {
-        selection_text(
-            self.parser.screen(),
-            anchor_row,
-            anchor_column,
-            cursor_row,
-            cursor_column,
-        )
+        self.output
+            .frame
+            .selection_text(anchor_row, anchor_column, cursor_row, cursor_column)
     }
 
     pub fn scroll_scrollback(&mut self, wheel: TerminalWheel) -> bool {
-        if let Some(input) = mouse_scroll_input(self.parser.screen(), wheel) {
-            return report_mouse_scroll(self.parser.screen_mut(), &mut self.writer, &input);
-        }
-        // Never guess an application's scroll key bindings. Shift overrides
-        // mouse capture so retained output remains accessible locally.
-        scroll_screen(self.parser.screen_mut(), wheel.rows)
+        self.output.scroll(wheel)
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> bool {
-        let returned_to_bottom = self.parser.screen().scrollback() > 0;
-        self.parser.screen_mut().set_scrollback(0);
+        let returned_to_bottom = self.output.frame.scrollback > 0;
+        self.output.bottom();
         let _ = self.writer.write_all(bytes);
         returned_to_bottom
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         #[cfg(target_os = "windows")]
         self.windows_resize.apply(rows, cols);
-
-        if self.parser.screen().size() == (rows, cols) {
+        if self.requested_size == (rows, cols) {
             return false;
         }
         #[cfg(not(target_os = "windows"))]
@@ -639,42 +632,11 @@ impl TerminalSession {
             pixel_width: 0,
             pixel_height: 0,
         });
-        // The view uses the new grid immediately; the background WSL resize
-        // independently notifies the foreground TUI to redraw at that size.
-        self.parser.screen_mut().set_size(rows, cols);
+        // The parser receives a coalesced size command independently of
+        // presentation; the PTY notifies the foreground TUI to redraw.
+        self.requested_size = (rows, cols);
+        self.output.resize(rows, cols);
         true
-    }
-}
-
-// Bound one UI callback even when a command continuously produces output.
-// Chunk boundaries are not VT boundaries: the parser retains partial escapes.
-fn poll_output<CB: vt100::Callbacks>(
-    receiver: &mpsc::Receiver<Vec<u8>>,
-    signal: &OutputSignal,
-    parser: &mut vt100::Parser<CB>,
-) -> bool {
-    let mut processed = 0;
-    let started = std::time::Instant::now();
-    loop {
-        let bytes = match receiver.try_recv() {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                signal.clear_pending();
-                // Close the race between draining the channel and clearing
-                // the signal, without dropping output or losing a wakeup.
-                match receiver.try_recv() {
-                    Ok(bytes) => bytes,
-                    Err(_) => return processed > 0,
-                }
-            }
-        };
-        parser.process(&bytes);
-        processed += bytes.len();
-        if processed >= 64 * 1024 || started.elapsed() >= std::time::Duration::from_millis(4) {
-            signal.clear_pending();
-            signal.notify();
-            return true;
-        }
     }
 }
 
@@ -683,53 +645,58 @@ fn input_cursor_position(screen: &vt100::Screen) -> Option<(u16, u16)> {
     (screen.scrollback() == 0).then(|| screen.cursor_position())
 }
 
+#[cfg(test)]
 fn display_cells(screen: &vt100::Screen) -> Vec<DisplayCell> {
-    let (rows, columns) = screen.size();
+    (0..screen.size().0)
+        .flat_map(|row| display_row(screen, row))
+        .collect()
+}
+
+fn display_row(screen: &vt100::Screen, row: u16) -> Vec<DisplayCell> {
+    let (_, columns) = screen.size();
     let cursor_position =
         (!screen.hide_cursor() && screen.scrollback() == 0).then(|| screen.cursor_position());
     let mut cells = Vec::new();
-    for row in 0..rows {
-        for column in 0..columns {
-            let cell = screen.cell(row, column);
-            let color = cell.map(vt100::Cell::fgcolor).unwrap_or_default();
-            // Match Orca/xterm's bright ANSI colors for bold shell output.
-            let color = match color {
-                vt100::Color::Idx(index @ 0..=7) if cell.is_some_and(vt100::Cell::bold) => {
-                    vt100::Color::Idx(index + 8)
-                }
-                color => color,
-            };
-            let mut foreground = terminal_color(color, DEFAULT_FOREGROUND);
-            let mut background = terminal_color(
-                cell.map(vt100::Cell::bgcolor).unwrap_or_default(),
-                DEFAULT_BACKGROUND,
-            );
-            if cell.is_some_and(vt100::Cell::inverse) {
-                std::mem::swap(&mut foreground, &mut background);
+    for column in 0..columns {
+        let cell = screen.cell(row, column);
+        let color = cell.map(vt100::Cell::fgcolor).unwrap_or_default();
+        // Match Orca/xterm's bright ANSI colors for bold shell output.
+        let color = match color {
+            vt100::Color::Idx(index @ 0..=7) if cell.is_some_and(vt100::Cell::bold) => {
+                vt100::Color::Idx(index + 8)
             }
-            if cell.is_some_and(vt100::Cell::dim) {
-                foreground = foreground.map(|channel| channel.saturating_mul(2) / 3);
-            }
-            let glyph = cell
-                .map(vt100::Cell::contents)
-                .filter(|contents| !contents.is_empty())
-                .unwrap_or(" ");
-            let cursor = cursor_position == Some((row, column));
-            let column_span = cell_column_span(cell);
-            if column_span == 0 || (!cursor && glyph == " " && background == DEFAULT_BACKGROUND) {
-                continue;
-            }
-            cells.push(DisplayCell {
-                row: row.into(),
-                column: column.into(),
-                glyph: glyph.to_string(),
-                foreground,
-                background,
-                bold: cell.is_some_and(vt100::Cell::bold),
-                cursor,
-                column_span,
-            });
+            color => color,
+        };
+        let mut foreground = terminal_color(color, DEFAULT_FOREGROUND);
+        let mut background = terminal_color(
+            cell.map(vt100::Cell::bgcolor).unwrap_or_default(),
+            DEFAULT_BACKGROUND,
+        );
+        if cell.is_some_and(vt100::Cell::inverse) {
+            std::mem::swap(&mut foreground, &mut background);
         }
+        if cell.is_some_and(vt100::Cell::dim) {
+            foreground = foreground.map(|channel| channel.saturating_mul(2) / 3);
+        }
+        let glyph = cell
+            .map(vt100::Cell::contents)
+            .filter(|contents| !contents.is_empty())
+            .unwrap_or(" ");
+        let cursor = cursor_position == Some((row, column));
+        let column_span = cell_column_span(cell);
+        if column_span == 0 || (!cursor && glyph == " " && background == DEFAULT_BACKGROUND) {
+            continue;
+        }
+        cells.push(DisplayCell {
+            row: row.into(),
+            column: column.into(),
+            glyph: glyph.to_string(),
+            foreground,
+            background,
+            bold: cell.is_some_and(vt100::Cell::bold),
+            cursor,
+            column_span,
+        });
     }
     cells
 }
@@ -745,6 +712,7 @@ fn scroll_screen(screen: &mut vt100::Screen, rows: i32) -> bool {
     screen.scrollback() != current
 }
 
+#[cfg(test)]
 fn selection_text(
     screen: &vt100::Screen,
     anchor_row: i32,
@@ -857,8 +825,7 @@ fn cell_column_span(cell: Option<&vt100::Cell>) -> i32 {
 
 fn spawn_reader(
     mut reader: impl Read + Send + 'static,
-    sender: mpsc::SyncSender<Vec<u8>>,
-    output_signal: Arc<OutputSignal>,
+    sender: mpsc::SyncSender<output::Event>,
 ) -> std::io::Result<()> {
     thread::Builder::new()
         .name("araseo-terminal-output".into())
@@ -868,10 +835,12 @@ fn spawn_reader(
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        if sender.send(buffer[..count].to_vec()).is_err() {
+                        if sender
+                            .send(output::Event::Output(buffer[..count].to_vec()))
+                            .is_err()
+                        {
                             break;
                         }
-                        output_signal.notify();
                     }
                 }
             }
@@ -1143,7 +1112,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             terminal.poll();
-            if terminal.parser.screen().contents().contains("PTY_READY") {
+            if terminal
+                .selection_text(0, 0, i32::MAX, i32::MAX)
+                .contains("PTY_READY")
+            {
                 break;
             }
             assert!(
@@ -1157,7 +1129,6 @@ mod tests {
     #[test]
     fn answers_split_default_color_queries_without_moving_scrollback() {
         let (sender, receiver) = mpsc::channel();
-        let signal = OutputSignal::default();
         let mut parser = vt100::Parser::new_with_callbacks(3, 12, 20, TerminalCallbacks::default());
         parser.process(b"one\r\ntwo\r\nthree\r\nfour");
         assert!(scroll_screen(parser.screen_mut(), 1));
@@ -1167,7 +1138,9 @@ mod tests {
         sender
             .send(b"\x1b]12;?\x07\x1b]11;rgb:0000/0000/0000\x07".to_vec())
             .unwrap();
-        assert!(poll_output(&receiver, &signal, &mut parser));
+        for bytes in receiver.try_iter() {
+            parser.process(&bytes);
+        }
         assert_eq!(parser.screen().scrollback(), 1);
         assert!(parser.screen().contents().contains("one"));
 
@@ -1180,41 +1153,6 @@ mod tests {
         assert_eq!(writer, expected);
     }
 
-    #[test]
-    fn busy_terminal_yields_and_reschedules_without_losing_output() {
-        let (sender, receiver) = mpsc::channel();
-        let signal = OutputSignal::default();
-        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = wakes.clone();
-        signal.set_waker(Arc::new(move || {
-            count.fetch_add(1, AtomicOrdering::SeqCst);
-        }));
-        for _ in 0..32 {
-            sender.send(vec![b'x'; 8192]).unwrap();
-        }
-        // Include an escape and UTF-8 character split across chunks.
-        sender.send(b"\x1b[2J\x1b[H\x1b[3".to_vec()).unwrap();
-        sender
-            .send([b"1m".as_slice(), &"한".as_bytes()[..1]].concat())
-            .unwrap();
-        sender.send("한".as_bytes()[1..].to_vec()).unwrap();
-        let mut parser = vt100::Parser::new(24, 80, 0);
-        assert!(poll_output(&receiver, &signal, &mut parser));
-        assert!(wakes.load(AtomicOrdering::SeqCst) > 0);
-        assert!(!parser.screen().contents().contains('한'));
-        let mut polls = 1;
-        while poll_output(&receiver, &signal, &mut parser) {
-            polls += 1;
-            assert!(polls < 100);
-        }
-        assert!(polls > 1);
-        assert_eq!(parser.screen().contents(), "한");
-        assert_eq!(
-            parser.screen().cell(0, 0).unwrap().fgcolor(),
-            vt100::Color::Idx(1)
-        );
-        assert!(!signal.pending.load(AtomicOrdering::Acquire));
-    }
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -1275,9 +1213,8 @@ mod tests {
         let mut terminal = TerminalSession::spawn("", Path::new("/tmp")).unwrap();
         terminal.write(b"stty -echo -icanon min 1 time 0; printf '\\033[?1049h\\033[?1000h\\033[?1006h'; dd bs=1 count=10 2>/dev/null | od -An -tx1; stty sane\r");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !terminal.parser.screen().alternate_screen()
-            || terminal.parser.screen().mouse_protocol_encoding()
-                != vt100::MouseProtocolEncoding::Sgr
+        while !terminal.output.frame.alternate
+            || terminal.output.frame.mouse_encoding != vt100::MouseProtocolEncoding::Sgr
         {
             terminal.poll();
             assert!(
@@ -1293,16 +1230,14 @@ mod tests {
         // If Shift had injected bytes, dd would consume them before this report.
         terminal.scroll_scrollback(wheel(1));
         while !terminal
-            .parser
-            .screen()
-            .contents()
+            .selection_text(0, 0, i32::MAX, i32::MAX)
             .contains("1b 5b 3c 36 34 3b 35 3b 32 4d")
         {
             terminal.poll();
             assert!(
                 std::time::Instant::now() < deadline,
                 "PTY received incorrect wheel bytes: {}",
-                terminal.parser.screen().contents()
+                terminal.selection_text(0, 0, i32::MAX, i32::MAX)
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -1715,7 +1650,10 @@ while True:
             let deadline = Instant::now() + timeout;
             loop {
                 terminal.poll();
-                if terminal.parser.screen().contents().contains(text) {
+                if terminal
+                    .selection_text(0, 0, i32::MAX, i32::MAX)
+                    .contains(text)
+                {
                     break;
                 }
                 assert!(Instant::now() < deadline, "TUI never produced {text}");
