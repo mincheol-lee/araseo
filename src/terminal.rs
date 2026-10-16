@@ -2,8 +2,8 @@ use crate::terminal_input::TerminalInput;
 #[path = "terminal_output.rs"]
 mod output;
 use anyhow::{Context, Result};
-pub use output::TerminalFrame;
 use output::TerminalOutput;
+pub use output::{FrameRow, TerminalFrame};
 #[cfg(not(target_os = "windows"))]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -432,6 +432,26 @@ fn detect_agent(processes: &str) -> Option<AgentKind> {
 }
 
 impl TerminalSession {
+    /// UI tests inspect bytes after native input dispatch without depending on
+    /// a shell's echo, buffering, or keyboard protocol negotiation.
+    #[cfg(feature = "ui-tests")]
+    pub fn capture_input(&mut self) -> std::io::Result<mpsc::Receiver<Vec<u8>>> {
+        struct Recorder(mpsc::Sender<Vec<u8>>);
+        impl Write for Recorder {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .send(bytes.to_vec())
+                    .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.writer = TerminalInput::new(Recorder(sender))?;
+        Ok(receiver)
+    }
     pub fn spawn(_distro: &str, linux_root: &Path) -> Result<Self> {
         #[cfg(target_os = "windows")]
         {
@@ -557,6 +577,17 @@ impl TerminalSession {
 
     pub fn agent_probe(&self) -> AgentProbe {
         self.agent_probe.clone()
+    }
+
+    pub fn distribution(&self) -> &str {
+        #[cfg(windows)]
+        {
+            &self.agent_probe.distro
+        }
+        #[cfg(not(windows))]
+        {
+            ""
+        }
     }
 
     pub fn set_output_waker(&self, waker: impl Fn() + Send + Sync + 'static) {

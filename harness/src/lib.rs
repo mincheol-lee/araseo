@@ -12,6 +12,8 @@ pub mod diagnostics_log;
 pub mod document;
 #[path = "../../src/git.rs"]
 pub mod git;
+#[path = "../../src/git_view.rs"]
+pub mod git_view;
 #[path = "../../src/markdown_preview.rs"]
 pub mod markdown_preview;
 #[path = "../../src/preview.rs"]
@@ -53,3 +55,6 @@ pub mod terminal_resize;
 pub mod terminal_layout;
 
 pub mod codex_fixture;
+
+#[path = "../../src/terminal_paint.rs"]
+pub mod terminal_paint;

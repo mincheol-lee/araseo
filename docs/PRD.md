@@ -1,3 +1,6 @@
+> Historical MVP specification. The current GPUI Kit frontend is described in
+> [GPUI-PORT.md](GPUI-PORT.md); the original Slint design below is retained for context.
+
 # Araseo MVP Product Requirements Document
 
 | Item | Details |

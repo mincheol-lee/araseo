@@ -26,7 +26,7 @@ impl Drop for ComApartment {
 }
 
 /// Called on a dedicated thread so the Explorer dialog has its own STA and
-/// the Slint event loop remains free to repaint.
+/// the GPUI event loop remains free to repaint.
 pub fn pick_folder(owner: usize, workspace: &Workspace) -> Result<Option<PathBuf>> {
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
         .ok()

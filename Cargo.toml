@@ -6,7 +6,11 @@ description = "Araseo, a lightweight Windows editor for WSL workspaces"
 license = "MIT"
 build = "build.rs"
 
+[features]
+ui-tests = ["gpui-kit/test-support"]
+
 [dependencies]
+gpui-kit = { version = "=0.7.3", features = ["tree-sitter-languages"] }
 anyhow = "1"
 hayro = "0.7.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
@@ -15,32 +19,19 @@ portable-pty = "0.9"
 pulldown-cmark = "0.13.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-slint = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "unstable-winit-030"] }
-swash = "0.2"
 vt100 = "0.16"
+
+[build-dependencies]
+embed-resource = "3.0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Kernel", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 
-[build-dependencies]
-slint-build = "1.17"
-
 [patch.crates-io]
-# Cargo resolves this optional Slint package when the software renderer is
-# enabled, even though Araseo never uses the testing backend.
-i-slint-backend-testing = { path = "ui-harness/vendor/i-slint-backend-testing" }
-# Slint 1.17 converts off-screen glyph coordinates to i16 before clipping.
-# Keep a narrowly patched copy so large documents cannot overflow the renderer.
-# Resized native surfaces also invalidate reused buffers and request a repaint.
-i-slint-renderer-software = { path = "vendor/i-slint-renderer-software" }
-# Inline TUIs scroll a top-anchored DEC region to retain a fixed prompt.
-# Preserve the rows they scroll out in the terminal's history.
 vt100 = { path = "vendor/vt100" }
-
-
-# Keep Windows resize presentation consistent with the native client surface.
-i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }
+# Build release HLSL shaders for the Windows target when Cargo runs in WSL.
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 
 [profile.release]
 debug = "line-tables-only"

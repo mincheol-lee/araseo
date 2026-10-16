@@ -204,6 +204,17 @@ pub struct TabGroups {
     next_split: usize,
 }
 
+/// A frontend-independent description for restoring an existing split tree.
+pub enum LayoutSpec {
+    Group(GroupId),
+    Split {
+        axis: Axis,
+        ratio: u16,
+        first: Box<LayoutSpec>,
+        second: Box<LayoutSpec>,
+    },
+}
+
 impl Default for TabGroups {
     fn default() -> Self {
         Self {
@@ -218,6 +229,26 @@ impl Default for TabGroups {
 }
 
 impl TabGroups {
+    pub fn layout_spec(&self) -> LayoutSpec {
+        fn convert(node: &Node) -> LayoutSpec {
+            match node {
+                Node::Leaf(group) => LayoutSpec::Group(*group),
+                Node::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                    ..
+                } => LayoutSpec::Split {
+                    axis: *axis,
+                    ratio: *ratio,
+                    first: Box::new(convert(first)),
+                    second: Box::new(convert(second)),
+                },
+            }
+        }
+        convert(&self.root)
+    }
     /// Reject malformed saved layouts before any indexing or pruning occurs.
     pub fn restore(
         mut saved: Self,

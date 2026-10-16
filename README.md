@@ -6,10 +6,14 @@ Araseo brings the essentials of a coding IDE into one fast, focused desktop
 application: browse a workspace, open and edit files, inspect Git changes, and
 run WSL commands or coding agents without leaving the window.
 
-The Windows app is built with Rust and Slint. Files, Git commands, and terminal
+The Windows app is built with Rust and GPUI Kit. Files, Git commands, and terminal
 sessions stay in the selected WSL distribution.
 
 ## Preview
+
+These screenshots illustrate workspace layouts from the earlier frontend.
+The current build uses GPUI Kit; see the feature descriptions below for its
+updated controls and behavior.
 
 ![Araseo workspace with file explorer, two terminal panes, and two editor panes](assets/araseo-workspace.png)
 
@@ -27,12 +31,18 @@ source file open in the panes below.
 - Edit files in tabs with line numbers, syntax highlighting, find, undo and
   redo. Open files are refreshed when disk changes are detected; unsaved edits
   are protected by a reload or overwrite choice.
-- Inspect changes in Git repositories nested inside the workspace. Open a
-  side-by-side diff or discard a change after confirmation.
+- Inspect changes grouped by project or Git repository, including repositories
+  nested inside the workspace. Groups show their path and change count and can
+  be collapsed. File rows show their relative folder and status. Open a
+  side-by-side diff or discard a change after confirmation. Both diff columns
+  fit the current pane width, wrapping long lines when the pane is resized.
 - Run independent WSL terminals in tabs. PTY and VT100 rendering support
   interactive programs, ANSI colors, Korean text, IME input, and selection.
-  Codex and Claude Code icons stay still while waiting for input or approval and
-  rotate while handling a prompt. Araseo passes session-scoped activity hooks
+  Codex and Claude Code tabs display their original logos. During active work,
+  the logo rotates once per 800 ms, with animation updates capped at 10 Hz.
+  It stays still while waiting for input or approval, when the window is
+  inactive, or when reduced motion is enabled. The logo disappears when the
+  agent exits. Araseo passes session-scoped activity hooks
   to these CLIs without changing their saved configuration. Codex may ask you
   to trust the hooks through `/hooks` before its activity can be shown.
 - Arrange file, diff, and terminal tabs in repeatable horizontal or vertical
@@ -65,11 +75,16 @@ versions, manual installation, and removal.
 
 ## Using Araseo
 
+Tabs, **New Terminal (+)**, and minimize/maximize/close controls share a compact
+top row. The Windows executable embeds the Araseo logo for the native window
+and taskbar icon.
+
 - Click a file in the tree to open it. Use the **FILES** toolbar or an item's
-  context menu for file operations. Drag a file from the tree into a terminal
-  to paste its Linux path.
-- Click **⊞** in the **FILES** toolbar to add another folder in the same WSL
-  distribution. On Windows, choose **Browse...** to select a folder in File
+  context menu for file operations. The **New File** and **New Folder** icons
+  create entries in the selected directory, or the selected file's parent.
+  Drag a file from the tree into a terminal to paste its Linux path.
+- Click **Add Project** in the **FILES** toolbar to add another folder in the
+  same WSL distribution. On Windows, choose **Browse...** to select a folder in File
   Explorer, or enter its absolute Linux path (for example,
   `/home/user/other-project`). Added folders appear as separate roots in the
   tree, with their own Git changes. Right-click an added root and select
@@ -80,21 +95,21 @@ versions, manual installation, and removal.
 - Press `Ctrl+S` to save, `Ctrl+F` to find in the active file, and `Ctrl+Z`
   or `Ctrl+Y` to undo or redo. `Ctrl+Tab` and `Ctrl+Shift+Tab` cycle tabs.
 - Select **GIT** in the sidebar to browse changed and untracked files. Click
-  a change to open its diff.
+  a project heading to collapse or expand its changes, or a file to open its
+  diff. The **HEAD** and **Working Tree** sides reflow to the current window or
+  split-pane width; copying text preserves the original unwrapped source.
 - Drag a tab to a pane edge to split the workspace, or to the center of a pane
-  to move it there. Drag a divider to resize the panes. Use **+** in a pane's
-  tab bar to start another terminal. Moving a terminal preserves its session,
-  immediately updates its grid to the destination pane, and transfers input
-  focus so the next keystroke reaches the same running program.
-  Cursor-position and terminal-size queries are answered during redraws so
-  interactive CLIs can resume input after resizing.
+  to move it there. Drag a divider to resize the panes. Use the top-right **+**
+  or `Ctrl+Shift+T` to start another terminal. Moving a terminal preserves its
+  session, immediately updates its grid to the destination pane, and transfers
+  input focus so the next keystroke reaches the same running program.
 - Drag a tab left or right within its pane's tab bar to reorder it. The blue
   insertion line shows the drop position; dragging into the content area still
   docks or splits the pane. The order is saved with the workspace session.
 - Codex launched with `codex` uses the terminal's supported legacy key protocol
   (`CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT=1`) by default. An existing value
-  is respected, and this affects only that command. Terminal output refreshes
-  the cells and caret without rebuilding the surrounding panel.
+  is respected, and this affects only that command. Terminal output uses one
+  painted surface with cached shaping for unchanged rows.
 - Claude launched with `claude` in an Araseo terminal defaults to
   `CLAUDE_CODE_NATIVE_CURSOR=1` so IME composition follows its input caret.
   Existing values of that environment variable are respected. This is scoped
@@ -148,62 +163,51 @@ directory and uses a Unix PTY instead of ConPTY.
 Ubuntu development builds require Fontconfig and pkg-config headers:
 
 ```bash
-sudo apt install pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev
+sudo apt install pkg-config libfontconfig1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev
 ```
 
-Run the core and Slint UI Harness tests, plus release installer tests:
+Run the core and GPUI UI Harness tests, plus release installer tests:
 
 ```bash
 ./scripts/verify
 ```
 
 The tests use the production modules for editor, file tree, workspace, Git,
-terminal, and UI behavior. On Linux, this command needs the `libfontconfig1`
-runtime library, but not the UI development headers.
+terminal, and UI behavior. Linux verification uses the development packages
+listed above to link the native GPUI test platform.
 
-Set `ARASEO_UI_SNAPSHOT_DIR` to have the UI Harness write PNG snapshots of key
-editor, terminal, dialog, Git diff, and split-pane states:
-
-```bash
-ARASEO_UI_SNAPSHOT_DIR=/tmp/araseo-ui-snapshots ./scripts/verify
-```
-
-Before distributing a Windows build, also compile every test and the Slint UI
-for the Windows target. From WSL, this requires the
-`x86_64-pc-windows-gnu` Rust target and a MinGW-w64 cross compiler:
+Before distributing a Windows build, verify both targets:
 
 ```bash
 ./scripts/verify --windows
 ```
 
-For native Windows resize verification, build the production UI fixture:
+Windows release builds require the Windows SDK HLSL compiler (`fxc.exe`). The
+vendored GPUI Windows build script also supports WSL cross builds with MinGW
+and a Windows SDK on the host; `GPUI_FXC_PATH` can override its compiler path.
+The application itself does not require the SDK or administrator privileges.
 
-```bash
-cargo build --locked --manifest-path ui-harness/Cargo.toml --example windows_resize --target x86_64-pc-windows-gnu
+For native Windows input, docking, session restore and resize checks, copy the
+release executable to a Windows local folder and run:
+
+```powershell
+.\scripts\test-windows-workbench.ps1 -Executable C:\Tests\araseo.exe -OutputDirectory C:\Tests\gpui-results
 ```
 
-Run `scripts/test-windows-resize.ps1` in Windows PowerShell with `-Executable`
-pointing to that fixture and `-OutputDirectory` for its PNG captures. Copy the
-fixture to a Windows local folder first when building from WSL. The test uses
-its own disposable window and compares native client pixels after resizing,
-maximizing, minimizing and a native surface-loss repaint. Blank captures fail.
-It never closes an existing Araseo window.
+The script creates a private WSL workspace and settings directory, drags a
+running terminal into a lower split, verifies native typing and shell input,
+reopens the saved layout, and compares captures before and after forced
+repaints. It closes only its own app processes. Do not interact with the test
+window while it runs. The `test-windows-terminal-input.ps1` and `test-windows-resize.ps1` wrappers
+also accept the production executable. Korean IME event semantics have
+headless regression tests; physical IME composition must additionally be
+checked on the affected Windows keyboard/IME combinations.
 
-For native Windows terminal input verification, build the UI Harness example
-`windows_terminal_input` for the Windows target and run
-`scripts/test-windows-terminal-input.ps1` with `-Executable` and
-`-OutputDirectory`. Select English input mode for the ASCII keyboard fixture.
-The script sends keys only while its own disposable window is foreground and
-checks continuous typing after output and cursor updates in bottom and extra
-panes. It closes only that fixture process.
-
-The `windows_codex_input` example runs the installed Codex CLI with an isolated
-temporary configuration and a closed loopback model endpoint. Run the same
-PowerShell script against it to verify that `abcdef` reaches Codex's composer
-after moving its running session into both kinds of lower panes. No prompt is
-submitted. The fixture uses `--no-daemon` to avoid changing the user's daemon.
-The `codex_input_probe` example in the core Harness checks the same CLI before
-and after a real PTY resize on Linux.
+Use `-Mode Git` to check project groups, collapse/expand, and diff reflow after
+resizing. Use `-Mode Agent` to check Claude/Codex tab logos, rotation during
+work, stopping while waiting, and removal after exit. The agent fixture uses
+terminal-local process names and activity files without contacting either
+agent service. Each mode also checks that the native window has its app icon.
 
 For Windows-to-WSL resize latency verification, build the headless fixture
 `harness/examples/windows_resize_latency.rs` with the Windows target, then run
@@ -219,11 +223,13 @@ release workflow: it verifies Linux and Windows targets, builds the Windows
 executable, and publishes the GitHub Release assets. A suffix such as
 `-beta.1` marks a pre-release.
 
-The app uses Rust for workspace, document, Git, and terminal logic and Slint
-for its native UI. Workspace startup, file loading, tree scanning, and syntax
-highlighting run on background workers. The manual presentation microbenchmark
-is `cargo test --manifest-path ui-harness/Cargo.toml benchmark_edit_presentation -- --ignored --nocapture`;
-it measures part of the editor update path, not end-to-end typing latency.
+The app uses Rust for workspace, document, Git, and terminal logic and GPUI
+Kit for its native UI. Windows rendering uses GPUI's DirectX backend. Each
+terminal has one custom painted surface, a persistent native IME handler, and
+cached runs for unchanged rows. PTY parsing and protocol replies remain on
+workers. Docked content uses GPUI view caching, and the agent logo has a separate
+view with capped animation updates so rotation can reuse cached terminal content.
+See [docs/GPUI-PORT.md](docs/GPUI-PORT.md) for the migration and validation notes.
 
 Font settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or
 `$XDG_CONFIG_HOME/araseo/fonts.conf` on Linux (default:
@@ -236,7 +242,7 @@ tab selection and split layout, sidebar width, and window size under
 Unsaved editor text is restored, and changes to the disk copy still require
 conflict resolution before saving. Terminal tabs start new shells in their
 original folders; running commands and terminal history cannot resume. Git
-diff tabs are temporary and are not reopened.
+diff tabs are reopened from current repository state.
 
 In **WSL environment**, each process owned by your WSL user has a **Stop**
 button. Confirm with **Terminate** for a normal exit request, or **Force kill**

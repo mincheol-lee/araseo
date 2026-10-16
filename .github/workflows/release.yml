@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+
 jobs:
   verify:
     name: Verify Linux and Windows targets
@@ -17,7 +21,7 @@ jobs:
       - name: Install system and Rust target dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libfontconfig1 mingw-w64
+          sudo apt-get install --yes pkg-config libfontconfig1-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev mingw-w64
           rustup target add x86_64-pc-windows-gnu
       - name: Run required verification
         run: ./scripts/verify --windows
@@ -51,7 +55,7 @@ jobs:
           $stage = Join-Path $PWD "release-stage"
           $archive = Join-Path $PWD "release-archive"
           New-Item -ItemType Directory -Force -Path $stage, $archive | Out-Null
-          Copy-Item dist/araseo.exe, scripts/araseo, scripts/install.sh, README.md, INSTALL.md, LICENSE -Destination $archive
+          Copy-Item dist/araseo.exe, scripts/araseo, scripts/install.sh, README.md, INSTALL.md, LICENSE, THIRD-PARTY-NOTICES.txt -Destination $archive
           Copy-Item dist/araseo.exe, scripts/araseo, scripts/install.sh -Destination $stage
           Compress-Archive -Path "$archive/*" -DestinationPath "$stage/araseo-windows-x86_64.zip"
           $symbols = Join-Path $PWD "release-symbols"
