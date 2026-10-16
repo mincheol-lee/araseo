@@ -6,7 +6,33 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, UNIX_EPOCH};
+
+/// Serialize atomic file replacement and reject stale background saves. A
+/// close snapshot must never be overwritten by an older debounced snapshot.
+#[derive(Clone, Default)]
+pub struct SessionWriter {
+    issued: Arc<AtomicU64>,
+    written: Arc<Mutex<u64>>,
+}
+impl SessionWriter {
+    pub fn reserve(&self) -> u64 {
+        self.issued.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    pub fn save(&self, generation: u64, session: &Session, path: &Path) -> io::Result<()> {
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        if generation <= *written {
+            return Ok(());
+        }
+        session.save(path)?;
+        *written = generation;
+        Ok(())
+    }
+}
 
 const FORMAT: u32 = 1;
 const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
@@ -24,6 +50,9 @@ pub struct Session {
     pub window_height: u32,
     pub maximized: bool,
     pub maximized_group: Option<usize>,
+    /// GPUI dock layout. Older sessions remain readable during UI migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpui_layout: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,6 +131,7 @@ impl Session {
             window_height: 800,
             maximized: false,
             maximized_group: None,
+            gpui_layout: None,
         }
     }
 
@@ -178,6 +208,37 @@ mod tests {
         assert_eq!(restored.tabs[0].id, 7);
         assert!(Session::load(&path, "Other", Path::new("/projects/a")).is_none());
         assert!(Session::load(&path, "Ubuntu", Path::new("/projects/b")).is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn older_background_save_cannot_overwrite_close_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "araseo-gpui-save-order-{}.json",
+            std::process::id()
+        ));
+        let writer = SessionWriter::default();
+        let older_generation = writer.reserve();
+        let mut latest = Session::new(
+            "Ubuntu".into(),
+            "/workspace".into(),
+            vec![],
+            TabGroups::default(),
+        );
+        latest.sidebar_width = 340.;
+        latest.gpui_layout = Some(serde_json::json!({"center": {"tabs": [7, 2]}}));
+        let close_generation = writer.reserve();
+        writer.save(close_generation, &latest, &path).unwrap();
+        let older = Session::new(
+            "Ubuntu".into(),
+            "/workspace".into(),
+            vec![],
+            TabGroups::default(),
+        );
+        writer.save(older_generation, &older, &path).unwrap();
+        let restored = Session::load(&path, "Ubuntu", Path::new("/workspace")).unwrap();
+        assert_eq!(restored.sidebar_width, 340.);
+        assert_eq!(restored.gpui_layout, latest.gpui_layout);
         fs::remove_file(path).unwrap();
     }
 

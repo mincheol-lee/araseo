@@ -325,6 +325,7 @@ pub struct FileDiff {
     pub path: PathBuf,
     pub status: GitStatus,
     pub lines: Vec<DiffLine>,
+    pub patch: String,
 }
 
 pub fn load_diff(
@@ -334,10 +335,21 @@ pub fn load_diff(
     status: GitStatus,
 ) -> anyhow::Result<FileDiff> {
     let relative = validated_relative_path(workspace, repository, path)?;
-    let lines = if status == GitStatus::Untracked {
+    let (lines, patch) = if status == GitStatus::Untracked {
         let text = fs::read_to_string(workspace.host_path(path)?)
             .with_context(|| format!("cannot read untracked file: {}", path.display()))?;
-        inserted_lines(&text)
+        let lines = inserted_lines(&text);
+        let quoted = serde_json::to_string(&relative.to_string_lossy()).unwrap();
+        let mut patch = format!(
+            "--- /dev/null\n+++ {quoted}\n@@ -0,0 +1,{} @@\n",
+            text.lines().count()
+        );
+        for line in text.lines() {
+            patch.push('+');
+            patch.push_str(line);
+            patch.push('\n');
+        }
+        (lines, patch)
     } else {
         let mut command = git_command(workspace, repository)?;
         command.args([
@@ -363,7 +375,8 @@ pub fn load_diff(
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        parse_unified_diff(&String::from_utf8_lossy(&output.stdout))
+        let patch = String::from_utf8_lossy(&output.stdout).into_owned();
+        (parse_unified_diff(&patch), patch)
     };
 
     let lines = if lines.is_empty() {
@@ -384,6 +397,7 @@ pub fn load_diff(
         path: path.to_path_buf(),
         status,
         lines,
+        patch,
     })
 }
 

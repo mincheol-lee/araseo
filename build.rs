@@ -19,15 +19,17 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/refs");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=src");
-    println!("cargo:rerun-if-changed=ui");
     println!("cargo:rerun-if-changed=Cargo.toml");
-    // The generated UI needs more stack than Windows gives a process main thread
-    // in release builds. Compile it on a thread with an explicit stack size.
-    std::thread::Builder::new()
-        .stack_size(32 * 1024 * 1024)
-        .spawn(|| slint_build::compile("ui/app.slint"))
-        .expect("failed to start Slint UI compilation")
-        .join()
-        .expect("Slint UI compilation panicked")
-        .expect("failed to compile Slint UI");
+    println!("cargo:rerun-if-changed=assets/araseo.rc");
+    println!("cargo:rerun-if-changed=assets/araseo.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // GPUI loads resource 1 for the native window and taskbar icon.
+        embed_resource::compile_for(
+            "assets/araseo.rc",
+            ["araseo"],
+            embed_resource::ParamsIncludeDirs(["assets"]),
+        )
+        .manifest_required()
+        .expect("failed to embed the Araseo Windows icon");
+    }
 }
