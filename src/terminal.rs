@@ -921,7 +921,10 @@ const ANSI_COLORS: [[u8; 3]; 16] = [
     [0xea, 0xea, 0xea],
 ];
 
-pub fn encode_key(text: &str, control: bool, alt: bool, _shift: bool) -> Vec<u8> {
+/// Xterm functional-key modifiers and CSI-u for otherwise ambiguous keys.
+/// Ordinary text and C0 shortcuts remain compatible with shells. We do not
+/// advertise Kitty event/release reporting, which this terminal cannot emit.
+pub fn encode_key(text: &str, control: bool, alt: bool, shift: bool) -> Vec<u8> {
     if matches!(
         text,
         "\u{10}"
@@ -933,34 +936,112 @@ pub fn encode_key(text: &str, control: bool, alt: bool, _shift: bool) -> Vec<u8>
             | "\u{16}"
             | "\u{17}"
             | "\u{18}"
+            | "shift"
+            | "control"
+            | "alt"
+            | "super"
+            | "fn"
+            | "capslock"
     ) {
         return Vec::new();
     }
-    let mut bytes = if control && text.len() == 1 {
-        let byte = text.as_bytes()[0].to_ascii_lowercase();
-        if byte.is_ascii_lowercase() {
-            vec![byte - b'a' + 1]
+    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(control);
+    let cursor = match text {
+        "<UP>" => Some('A'),
+        "<DOWN>" => Some('B'),
+        "<RIGHT>" => Some('C'),
+        "<LEFT>" => Some('D'),
+        "<HOME>" => Some('H'),
+        "<END>" => Some('F'),
+        "<F1>" => Some('P'),
+        "<F2>" => Some('Q'),
+        "<F3>" => Some('R'),
+        "<F4>" => Some('S'),
+        _ => None,
+    };
+    if let Some(final_byte) = cursor {
+        return if modifier != 1 {
+            format!("\x1b[1;{modifier}{final_byte}").into_bytes()
+        } else if matches!(text, "<F1>" | "<F2>" | "<F3>" | "<F4>") {
+            format!("\x1bO{final_byte}").into_bytes()
         } else {
-            text.as_bytes().to_vec()
+            format!("\x1b[{final_byte}").into_bytes()
+        };
+    }
+    let numbered = match text {
+        "<INSERT>" => Some(2),
+        "<DELETE>" => Some(3),
+        "<PAGEUP>" => Some(5),
+        "<PAGEDOWN>" => Some(6),
+        "<F5>" => Some(15),
+        "<F6>" => Some(17),
+        "<F7>" => Some(18),
+        "<F8>" => Some(19),
+        "<F9>" => Some(20),
+        "<F10>" => Some(21),
+        "<F11>" => Some(23),
+        "<F12>" => Some(24),
+        _ => None,
+    };
+    if let Some(number) = numbered {
+        return if modifier == 1 {
+            format!("\x1b[{number}~").into_bytes()
+        } else {
+            format!("\x1b[{number};{modifier}~").into_bytes()
+        };
+    }
+    let special = match text {
+        "<ENTER>" | "\r" | "\n" => Some(13),
+        "<TAB>" | "<BACKTAB>" | "\u{19}" => Some(9),
+        "<BACKSPACE>" => Some(127),
+        "<ESCAPE>" => Some(27),
+        _ => None,
+    };
+    if alt && !control && text.len() == 1 {
+        let byte = if shift {
+            text.as_bytes()[0].to_ascii_uppercase()
+        } else {
+            text.as_bytes()[0]
+        };
+        // ESC [, ESC ], and SS3/string introducers can leave a TUI parser
+        // waiting for a sequence terminator instead of reading the next key.
+        if matches!(byte, b'[' | b']' | b'O' | b'P' | b'X' | b'^' | b'_') {
+            let code = if shift && byte.is_ascii_alphabetic() {
+                byte.to_ascii_lowercase()
+            } else {
+                byte
+            };
+            return format!("\x1b[{};{modifier}u", u32::from(code)).into_bytes();
         }
+    }
+    let mut bytes = if let Some(code) = special {
+        if code == 9 && (shift || matches!(text, "<BACKTAB>" | "\u{19}")) && !control && !alt {
+            return b"\x1b[Z".to_vec();
+        }
+        if control || shift {
+            return format!("\x1b[{code};{modifier}u").into_bytes();
+        }
+        vec![code as u8]
+    } else if control && text.len() == 1 {
+        let byte = text.as_bytes()[0].to_ascii_lowercase();
+        if shift {
+            return format!("\x1b[{};{modifier}u", u32::from(byte)).into_bytes();
+        }
+        match byte {
+            b'a'..=b'z' => vec![byte - b'a' + 1],
+            b' ' | b'@' | b'2' => vec![0],
+            b'[' | b'3' => vec![27],
+            b'\\' | b'4' => vec![28],
+            b']' | b'5' => vec![29],
+            b'^' | b'6' => vec![30],
+            b'_' | b'/' | b'7' => vec![31],
+            b'?' | b'8' => vec![127],
+            _ => return format!("\x1b[{};{modifier}u", u32::from(byte)).into_bytes(),
+        }
+    } else if alt && shift && text.len() == 1 {
+        vec![text.as_bytes()[0].to_ascii_uppercase()]
     } else {
-        match text {
-            "<UP>" => b"\x1b[A".to_vec(),
-            "<DOWN>" => b"\x1b[B".to_vec(),
-            "<LEFT>" => b"\x1b[D".to_vec(),
-            "<RIGHT>" => b"\x1b[C".to_vec(),
-            "<HOME>" => b"\x1b[H".to_vec(),
-            "<END>" => b"\x1b[F".to_vec(),
-            "<PAGEUP>" => b"\x1b[5~".to_vec(),
-            "<PAGEDOWN>" => b"\x1b[6~".to_vec(),
-            "<DELETE>" => b"\x1b[3~".to_vec(),
-            "<BACKSPACE>" => vec![0x7f],
-            "<ENTER>" | "\n" | "\r" => b"\r".to_vec(),
-            "<BACKTAB>" | "\u{19}" => b"\x1b[Z".to_vec(),
-            "<TAB>" => b"\t".to_vec(),
-            "<ESCAPE>" => vec![0x1b],
-            value => value.as_bytes().to_vec(),
-        }
+        text.as_bytes().to_vec()
     };
     if alt {
         bytes.insert(0, 0x1b);
@@ -1191,6 +1272,82 @@ mod tests {
     fn encodes_control_keys() {
         assert_eq!(encode_key("c", true, false, false), vec![3]);
         assert_eq!(encode_key("x", false, true, false), b"\x1bx");
+    }
+
+    #[test]
+    fn preserves_all_modifier_combinations_on_navigation_editing_and_function_keys() {
+        for (control, alt, shift, modifier) in [
+            (false, false, true, 2),
+            (false, true, false, 3),
+            (false, true, true, 4),
+            (true, false, false, 5),
+            (true, false, true, 6),
+            (true, true, false, 7),
+            (true, true, true, 8),
+        ] {
+            for (key, final_byte) in [
+                ("<LEFT>", 'D'),
+                ("<RIGHT>", 'C'),
+                ("<UP>", 'A'),
+                ("<DOWN>", 'B'),
+                ("<HOME>", 'H'),
+                ("<END>", 'F'),
+                ("<F1>", 'P'),
+            ] {
+                assert_eq!(
+                    encode_key(key, control, alt, shift),
+                    format!("\x1b[1;{modifier}{final_byte}").as_bytes()
+                );
+            }
+            for (key, number) in [
+                ("<INSERT>", 2),
+                ("<DELETE>", 3),
+                ("<PAGEUP>", 5),
+                ("<PAGEDOWN>", 6),
+                ("<F5>", 15),
+                ("<F12>", 24),
+            ] {
+                assert_eq!(
+                    encode_key(key, control, alt, shift),
+                    format!("\x1b[{number};{modifier}~").as_bytes()
+                );
+            }
+        }
+        assert_eq!(encode_key("<LEFT>", false, false, false), b"\x1b[D");
+        assert_eq!(encode_key("<DELETE>", false, false, false), b"\x1b[3~");
+        assert_eq!(encode_key("<F1>", false, false, false), b"\x1bOP");
+    }
+
+    #[test]
+    fn disambiguates_enter_and_control_combinations_without_changing_plain_text() {
+        assert_eq!(encode_key("<ENTER>", false, false, true), b"\x1b[13;2u");
+        assert_eq!(encode_key("<ENTER>", true, false, false), b"\x1b[13;5u");
+        assert_eq!(encode_key("<ENTER>", false, true, false), b"\x1b\r");
+        assert_eq!(encode_key("<ENTER>", false, false, false), b"\r");
+        assert_eq!(encode_key("<BACKSPACE>", false, false, false), b"\x7f");
+        assert_eq!(
+            encode_key("<BACKSPACE>", true, false, false),
+            b"\x1b[127;5u"
+        );
+        for (key, byte) in [
+            (" ", 0),
+            ("[", 27),
+            ("\\", 28),
+            ("]", 29),
+            ("^", 30),
+            ("_", 31),
+        ] {
+            assert_eq!(encode_key(key, true, false, false), [byte]);
+        }
+        assert_eq!(encode_key("r", true, false, true), b"\x1b[114;6u");
+        assert_eq!(encode_key("b", false, true, true), b"\x1bB");
+        assert_eq!(encode_key("]", false, true, false), b"\x1b[93;3u");
+        assert_eq!(encode_key("[", false, true, false), b"\x1b[91;3u");
+        assert_eq!(encode_key("o", false, true, true), b"\x1b[111;4u");
+        assert_eq!(
+            encode_key("한글A!", false, false, false),
+            "한글A!".as_bytes()
+        );
     }
 
     #[test]

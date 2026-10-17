@@ -209,9 +209,16 @@ work, stopping while waiting, and removal after exit. The agent fixture uses
 terminal-local process names and activity files without contacting either
 agent service. Each mode also checks that the native window has its app icon.
 
-Use `-Mode TerminalInput` to check native Tab/Shift+Tab delivery and wheel
-direction in both normal and alternate screen buffers. This fixture records
-terminal input bytes without starting an agent or contacting a service.
+Use `-Mode TerminalInput` to check native Tab/Shift+Tab, modified navigation,
+editing and function keys, Ctrl+W/Ctrl+S, and wheel direction in both normal and
+alternate screen buffers. This fixture records terminal input bytes without
+starting an agent or contacting a service. See [terminal key encoding](docs/TERMINAL-INPUT.md)
+for supported combinations and application shortcuts.
+
+Right-click a file tab for **Close File**, **Close Other Files**, or **Close All
+Files**. Bulk commands apply across split panes to file, preview, and diff tabs;
+terminal tabs and running sessions are excluded. If any target has unsaved
+changes, confirm discarding them or cancel to keep the whole batch open.
 
 For Windows-to-WSL resize latency verification, build the headless fixture
 `harness/examples/windows_resize_latency.rs` with the Windows target, then run

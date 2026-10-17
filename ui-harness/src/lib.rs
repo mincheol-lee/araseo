@@ -429,6 +429,10 @@ mod tests {
         cx.update(|cx| {
             gpui_kit::init(cx);
             araseo::gpui_terminal::init(cx);
+            cx.bind_keys([
+                gpui::KeyBinding::new("ctrl-w", araseo::gpui_app::CloseTab, Some("Araseo")),
+                gpui::KeyBinding::new("ctrl-s", araseo::gpui_app::Save, Some("Araseo")),
+            ]);
         });
         let (handle, terminal) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
@@ -445,7 +449,24 @@ mod tests {
             assert_eq!(input.recv_timeout(Duration::from_secs(2)).unwrap(), b"b");
             // Root normally consumes these as focus navigation before the
             // terminal's raw key listener can send completion/backtab bytes.
-            for (key, expected) in [("tab", b"\t".as_slice()), ("shift-tab", b"\x1b[Z")] {
+            for (key, expected) in [
+                ("tab", b"\t".as_slice()),
+                ("shift-tab", b"\x1b[Z"),
+                ("shift-left", b"\x1b[1;2D"),
+                ("ctrl-right", b"\x1b[1;5C"),
+                ("alt-left", b"\x1b[1;3D"),
+                ("ctrl-shift-left", b"\x1b[1;6D"),
+                ("ctrl-alt-shift-end", b"\x1b[1;8F"),
+                ("shift-enter", b"\x1b[13;2u"),
+                ("ctrl-backspace", b"\x1b[127;5u"),
+                ("ctrl-delete", b"\x1b[3;5~"),
+                ("shift-f5", b"\x1b[15;2~"),
+                ("ctrl-shift-r", b"\x1b[114;6u"),
+                ("ctrl-space", b"\x00"),
+                ("alt-]", b"\x1b[93;3u"),
+                ("ctrl-w", b"\x17"),
+                ("ctrl-s", b"\x13"),
+            ] {
                 window.press(key, cx);
                 assert_eq!(
                     input.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -453,6 +474,22 @@ mod tests {
                 );
                 assert!(terminal.focus_handle(cx).is_focused(window));
             }
+            // A printable AltGr character belongs to native text input even
+            // though Windows reports Ctrl+Alt modifiers for the physical key.
+            let mut altgr = gpui::Keystroke::parse("ctrl-alt-q").unwrap();
+            altgr.key_char = Some("@".into());
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                    keystroke: altgr,
+                    is_held: false,
+                    prefer_character_input: true,
+                }),
+                cx,
+            );
+            terminal.update(cx, |terminal, cx| {
+                terminal.replace_text_in_range(None, "@", window, cx);
+            });
+            assert_eq!(input.recv_timeout(Duration::from_secs(2)).unwrap(), b"@");
             terminal.update(cx, |terminal, cx| {
                 terminal.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
                 terminal.replace_and_mark_text_in_range(None, "한", None, window, cx);
@@ -715,6 +752,243 @@ mod tests {
         std::fs::remove_file(first).unwrap();
         std::fs::remove_file(second).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+    #[gpui_kit::test]
+    async fn file_tab_menus_preserve_terminals_and_confirm_unsaved_batches(
+        cx: &mut TestAppContext,
+    ) {
+        use araseo::{
+            gpui_app::Workbench,
+            session::Session,
+            tabs::{Dock, TabGroups},
+            workspace::Workspace,
+        };
+        use gpui_kit::test::TestAppContextExt;
+        let original = file();
+        let root = original.with_extension("close-files-workspace");
+        std::fs::create_dir(&root).unwrap();
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::rename(original, &first).unwrap();
+        std::fs::write(&second, "saved on disk").unwrap();
+        let mut groups = TabGroups::default();
+        for id in [10, 20, 30, 40, 50, 60] {
+            groups.add(id, 0);
+        }
+        groups.dock_into(60, 0, Dock::Bottom);
+        groups.activate(10);
+        let saved = Session::new(
+            "Ubuntu".into(),
+            root.clone(),
+            vec![
+                SavedTab {
+                    id: 10,
+                    path: first.clone(),
+                    kind: SavedKind::File {
+                        unsaved_text: None,
+                        revision: None,
+                    },
+                },
+                SavedTab {
+                    id: 20,
+                    path: second.clone(),
+                    kind: SavedKind::File {
+                        unsaved_text: Some("unsaved draft".into()),
+                        revision: None,
+                    },
+                },
+                SavedTab {
+                    id: 30,
+                    path: root.join("missing.png"),
+                    kind: SavedKind::Preview,
+                },
+                SavedTab {
+                    id: 40,
+                    path: first.clone(),
+                    kind: SavedKind::Diff,
+                },
+                SavedTab {
+                    id: 50,
+                    path: root.clone(),
+                    kind: SavedKind::Terminal { number: 1 },
+                },
+                SavedTab {
+                    id: 60,
+                    path: root.clone(),
+                    kind: SavedKind::Terminal { number: 2 },
+                },
+            ],
+            groups,
+        );
+        cx.update(gpui_kit::init);
+        let (handle, workbench) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1500.), px(900.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        let mut workbench = Workbench::new(
+                            Workspace::prepare("Ubuntu", root.clone()).unwrap(),
+                            Some(saved),
+                            None,
+                            window,
+                            cx,
+                        );
+                        let pending = workbench.panel_for_test(20).unwrap();
+                        assert!(
+                            pending.read(cx).has_unsaved_changes(),
+                            "restored drafts must be protected before loading finishes"
+                        );
+                        workbench.disable_session_persistence_for_test();
+                        workbench
+                    })
+                },
+            )
+            .unwrap()
+        });
+        cx.wait_for(handle, std::time::Duration::from_secs(5), |_, cx| {
+            workbench.read(cx).session_restore_complete()
+        })
+        .await;
+        let terminals = cx.update(|cx| {
+            araseo::gpui_terminal::init(cx);
+            cx.bind_keys([
+                gpui::KeyBinding::new("ctrl-w", araseo::gpui_app::CloseTab, Some("Araseo")),
+                gpui::KeyBinding::new("ctrl-s", araseo::gpui_app::Save, Some("Araseo")),
+            ]);
+            [50, 60].map(|id| {
+                let panel = workbench.read(cx).panel_for_test(id).unwrap();
+                let Content::Terminal(terminal) = &panel.read(cx).content else {
+                    panic!("terminal not restored")
+                };
+                let terminal = terminal.clone();
+                let input =
+                    terminal.update(cx, |terminal, _| terminal.session.capture_input().unwrap());
+                (id, panel, terminal, input)
+            })
+        });
+        // Cancel keeps the entire batch, including clean files and dirty buffers.
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.right_click(("workspace-tab-title", 10u32), cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(
+                window.within("popup-menu").find(2usize).label(),
+                Some("Close Other Files")
+            );
+            window.within("popup-menu").click(2usize, cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |window, _| {
+            window.try_find("cancel-dialog").is_some()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| window.click("cancel-dialog", cx))
+            .unwrap();
+        cx.update(|cx| {
+            for id in [10, 20, 30, 40, 50, 60] {
+                assert!(workbench.read(cx).panel_for_test(id).is_some());
+            }
+            let dirty = workbench.read(cx).panel_for_test(20).unwrap();
+            let Content::File { document, .. } = &dirty.read(cx).content else {
+                panic!()
+            };
+            assert!(document.dirty);
+            assert_eq!(document.text, "unsaved draft");
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.right_click(("workspace-tab-title", 10u32), cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            window.within("popup-menu").click(2usize, cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |window, _| {
+            window.try_find("confirm-dialog").is_some()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| window.click("confirm-dialog", cx))
+            .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |_, cx| {
+            [20, 30, 40]
+                .iter()
+                .all(|id| workbench.read(cx).panel_for_test(*id).is_none())
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            assert!(workbench.read(cx).panel_for_test(10).is_some());
+            window.right_click(("workspace-tab-title", 10u32), cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |window, _| {
+            window.try_find("popup-menu").is_some()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(
+                window.within("popup-menu").find(3usize).label(),
+                Some("Close All Files")
+            );
+            window.within("popup-menu").click(3usize, cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |_, cx| {
+            workbench.read(cx).panel_for_test(10).is_none()
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            for (id, before, terminal, input) in &terminals {
+                let after = workbench.read(cx).panel_for_test(*id).unwrap();
+                assert_eq!(before.entity_id(), after.entity_id());
+                let Content::Terminal(current) = &after.read(cx).content else {
+                    panic!()
+                };
+                assert_eq!(current.entity_id(), terminal.entity_id());
+                terminal.focus_handle(cx).focus(window, cx);
+                window.press("ctrl-w", cx);
+                assert_eq!(
+                    input
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap(),
+                    b"\x17"
+                );
+                window.press("ctrl-s", cx);
+                assert_eq!(
+                    input
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap(),
+                    b"\x13"
+                );
+                window.input("z", cx);
+                assert_eq!(
+                    input
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap(),
+                    b"z"
+                );
+            }
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "saved on disk");
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[gpui_kit::test]
     fn legacy_zoomed_pane_restores(cx: &mut TestAppContext) {

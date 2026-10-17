@@ -33,6 +33,7 @@ public static class WorkbenchInput {
  public static void Text(string text){foreach(char c in text){var a=new Input[2];a[0].type=1;a[0].key.scan=c;a[0].key.flags=4;a[1]=a[0];a[1].key.flags=6;if(SendInput(2,a,40)!=2)throw new Exception("SendInput failed");}}
  public static void Enter(){var a=new Input[2];a[0].type=1;a[0].key.vk=13;a[1]=a[0];a[1].key.flags=2;if(SendInput(2,a,40)!=2)throw new Exception("Enter failed");}
  public static void Tab(bool backwards){var a=new Input[backwards?4:2];int i=0;if(backwards){a[i].type=1;a[i++].key.vk=16;}a[i].type=1;a[i++].key.vk=9;a[i].type=1;a[i].key.vk=9;a[i++].key.flags=2;if(backwards){a[i].type=1;a[i].key.vk=16;a[i].key.flags=2;}if(SendInput((uint)a.Length,a,40)!=a.Length)throw new Exception("Tab failed");}
+ public static void Chord(ushort vk,int modifiers){var keys=new System.Collections.Generic.List<ushort>();if((modifiers&1)!=0)keys.Add(16);if((modifiers&2)!=0)keys.Add(18);if((modifiers&4)!=0)keys.Add(17);var a=new Input[2+2*keys.Count];int i=0;foreach(var k in keys){a[i].type=1;a[i++].key.vk=k;}a[i].type=1;a[i++].key.vk=vk;a[i].type=1;a[i].key.vk=vk;a[i++].key.flags=2;keys.Reverse();foreach(var k in keys){a[i].type=1;a[i].key.vk=k;a[i++].key.flags=2;}if(SendInput((uint)a.Length,a,40)!=a.Length)throw new Exception("Chord failed");}
  public static void Wheel(int delta){mouse_event(0x0800,0,0,unchecked((uint)delta),UIntPtr.Zero);}
 }
 '@
@@ -206,14 +207,19 @@ try {
    Start-Sleep -Milliseconds 300
    Assert-Foreground
    [WorkbenchInput]::Text('/per');[WorkbenchInput]::Tab($false);[WorkbenchInput]::Text('mission');[WorkbenchInput]::Tab($true)
+   foreach($chord in @(@(37,1),@(39,4),@(37,2),@(37,5),@(35,7),@(13,1),@(8,4),@(46,4),@(116,1),@(82,5),@(87,4),@(83,4))){
+    Assert-Foreground
+    [WorkbenchInput]::Chord([uint16]$chord[0],[int]$chord[1])
+   }
+   Assert-Foreground
    [WorkbenchInput]::Wheel(120);Start-Sleep -Milliseconds 200;[WorkbenchInput]::Wheel(-120);Start-Sleep -Milliseconds 200
    [WorkbenchInput]::Enter()
    $deadline=(Get-Date).AddSeconds(10)
    do{Start-Sleep -Milliseconds 150;$done=Invoke-PrivatePython 'import json,pathlib,sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["done"])' $resultPath}while($done-ne 'True' -and (Get-Date)-lt $deadline)
    if($done-ne 'True'){throw "The $buffer terminal lost keyboard focus"}
-   Invoke-PrivatePython 'import json,pathlib,re,sys; d=bytes.fromhex(json.loads(pathlib.Path(sys.argv[1]).read_text())["hex"]); assert d.startswith(b"/per\tmission\x1b[Z"),d; reports=re.findall(rb"\x1b\[<(64|65);\d+;\d+M",d); assert reports and reports[0]==b"64" and reports[-1]==b"65",d; assert reports==sorted(reports),d; print("Tab, Backtab, wheel-up and wheel-down bytes: passed")' $resultPath
+   Invoke-PrivatePython 'import json,pathlib,re,sys; d=bytes.fromhex(json.loads(pathlib.Path(sys.argv[1]).read_text())["hex"]); assert d.startswith(b"/per\tmission\x1b[Z\x1b[1;2D\x1b[1;5C\x1b[1;3D\x1b[1;6D\x1b[1;8F\x1b[13;2u\x1b[127;5u\x1b[3;5~\x1b[15;2~\x1b[114;6u\x17\x13"),d; reports=re.findall(rb"\x1b\[<(64|65);\d+;\d+M",d); assert reports and reports[0]==b"64" and reports[-1]==b"65",d; assert reports==sorted(reports),d; print("Tab, Backtab, modified keys, wheel-up and wheel-down bytes: passed")' $resultPath
    Capture "terminal-input-$buffer.png"
-   Write-Output "Native terminal completion keys and wheel direction ($buffer buffer): passed"
+   Write-Output "Native terminal completion/modifier keys and wheel direction ($buffer buffer): passed"
   }
  }
  if($Mode -eq 'Agent'){

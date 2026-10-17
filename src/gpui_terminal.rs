@@ -13,6 +13,9 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("tab", NoAction, Some("Terminal")),
         KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
+        // These are input-editing commands in agent TUIs (delete word / stash).
+        KeyBinding::new("ctrl-w", NoAction, Some("Terminal")),
+        KeyBinding::new("ctrl-s", NoAction, Some("Terminal")),
     ]);
 }
 
@@ -140,7 +143,9 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        if (modifiers.control && key == "v") || (modifiers.shift && key == "insert") {
+        if (modifiers.control && !modifiers.alt && key == "v")
+            || (modifiers.shift && key == "insert")
+        {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                 self.send(&text, cx);
             }
@@ -152,10 +157,25 @@ impl TerminalView {
         if !self.composition.text.is_empty() {
             return;
         }
+        // AltGr is represented as Ctrl+Alt on Windows. Let native input commit
+        // its printable layout character instead of turning it into a shortcut.
+        if modifiers.control
+            && modifiers.alt
+            && event.prefer_character_input
+            && event
+                .keystroke
+                .key_char
+                .as_ref()
+                .is_some_and(|text| !text.is_empty() && text.chars().all(|ch| !ch.is_control()))
+        {
+            return;
+        }
         let special = match key.as_str() {
+            "space" if modifiers.control || modifiers.alt => Some(" "),
             "enter" => Some("<ENTER>"),
             "backspace" => Some("<BACKSPACE>"),
             "delete" => Some("<DELETE>"),
+            "insert" => Some("<INSERT>"),
             "escape" => Some("<ESCAPE>"),
             "tab" if modifiers.shift => Some("<BACKTAB>"),
             "tab" => Some("<TAB>"),
@@ -167,6 +187,18 @@ impl TerminalView {
             "end" => Some("<END>"),
             "pageup" => Some("<PAGEUP>"),
             "pagedown" => Some("<PAGEDOWN>"),
+            "f1" => Some("<F1>"),
+            "f2" => Some("<F2>"),
+            "f3" => Some("<F3>"),
+            "f4" => Some("<F4>"),
+            "f5" => Some("<F5>"),
+            "f6" => Some("<F6>"),
+            "f7" => Some("<F7>"),
+            "f8" => Some("<F8>"),
+            "f9" => Some("<F9>"),
+            "f10" => Some("<F10>"),
+            "f11" => Some("<F11>"),
+            "f12" => Some("<F12>"),
             _ => None,
         };
         if modifiers.control && key == "c" && self.selection.is_some() {
