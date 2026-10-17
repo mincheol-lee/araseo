@@ -107,9 +107,14 @@ continuous input after dragging a running terminal into a lower split, session
 restoration, shrink/grow, maximize/restore and minimize/restore. The resize
 checks compare the displayed surface before and after an explicit repaint.
 Mixed ASCII/Korean terminal output was also visually inspected. The headless
-suite passes 120 core tests and 13 production GPUI UI tests, plus installer and
+suite passes 120 core tests and 14 production GPUI UI tests, plus installer and
 launcher fixtures. The executable retains its matching embedded GNU debug
 information.
+
+Terminal input regressions cover Tab/Backtab remaining inside the terminal and
+positive upward line/pixel wheel deltas opening older history. The native
+`TerminalInput` check records actual key and SGR wheel reports in both normal
+and alternate screen buffers, without launching agent clients.
 
 The compact-header follow-up additionally exercises actual file/folder/project
 creation through the Windows icon buttons, and clicks the custom caption buttons

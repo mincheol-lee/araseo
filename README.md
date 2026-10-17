@@ -209,6 +209,10 @@ work, stopping while waiting, and removal after exit. The agent fixture uses
 terminal-local process names and activity files without contacting either
 agent service. Each mode also checks that the native window has its app icon.
 
+Use `-Mode TerminalInput` to check native Tab/Shift+Tab delivery and wheel
+direction in both normal and alternate screen buffers. This fixture records
+terminal input bytes without starting an agent or contacting a service.
+
 For Windows-to-WSL resize latency verification, build the headless fixture
 `harness/examples/windows_resize_latency.rs` with the Windows target, then run
 it on Windows with the WSL distribution name as its argument. It uses a private

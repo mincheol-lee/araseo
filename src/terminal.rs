@@ -240,6 +240,7 @@ pub struct DisplayCell {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TerminalWheel {
+    /// Positive rows scroll toward older output (wheel up); negative toward newer.
     pub rows: i32,
     pub row: i32,
     pub column: i32,

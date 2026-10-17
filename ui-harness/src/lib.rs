@@ -426,7 +426,10 @@ mod tests {
         use std::time::Duration;
         let mut session = TerminalSession::spawn("Ubuntu", &std::env::temp_dir()).unwrap();
         let input = session.capture_input().unwrap();
-        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            araseo::gpui_terminal::init(cx);
+        });
         let (handle, terminal) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
                 cx.new(|cx| TerminalView::new(session, 14., 120, cx))
@@ -440,6 +443,16 @@ mod tests {
             window.input("b", cx);
             assert_eq!(input.recv_timeout(Duration::from_secs(2)).unwrap(), b"a");
             assert_eq!(input.recv_timeout(Duration::from_secs(2)).unwrap(), b"b");
+            // Root normally consumes these as focus navigation before the
+            // terminal's raw key listener can send completion/backtab bytes.
+            for (key, expected) in [("tab", b"\t".as_slice()), ("shift-tab", b"\x1b[Z")] {
+                window.press(key, cx);
+                assert_eq!(
+                    input.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    expected
+                );
+                assert!(terminal.focus_handle(cx).is_focused(window));
+            }
             terminal.update(cx, |terminal, cx| {
                 terminal.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
                 terminal.replace_and_mark_text_in_range(None, "한", None, window, cx);
@@ -456,6 +469,78 @@ mod tests {
             window.render_frame(cx);
             window.input("c", cx);
             assert_eq!(input.recv_timeout(Duration::from_secs(2)).unwrap(), b"c");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn terminal_wheel_up_reads_history_and_down_returns_to_live_output(cx: &mut TestAppContext) {
+        use araseo::{gpui_terminal::TerminalView, terminal::TerminalSession};
+        use gpui::{ScrollDelta, point};
+        use std::time::{Duration, Instant};
+
+        fn wait(session: &mut TerminalSession, ready: impl Fn(&TerminalSession) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                session.poll();
+                if ready(session) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "terminal did not reach the expected view"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let mut session = TerminalSession::spawn("Ubuntu", &std::env::temp_dir()).unwrap();
+        session.write(b"printf 'HISTORY-%03d\\r\\n' $(seq 1 100)\r");
+        wait(&mut session, |session| {
+            session
+                .selection_text(0, 0, i32::MAX, i32::MAX)
+                .contains("HISTORY-100")
+        });
+        cx.update(gpui_kit::init);
+        let (handle, terminal) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| {
+                cx.new(|cx| TerminalView::new(session, 14., 120, cx))
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            // Both physical wheel steps and touchpad pixel deltas use GPUI's
+            // positive-up convention. Exercise the production hit-test path.
+            for (up, down) in [
+                (
+                    ScrollDelta::Lines(point(0., 3.)),
+                    ScrollDelta::Lines(point(0., -3.)),
+                ),
+                (
+                    ScrollDelta::Pixels(point(px(0.), px(56.7))),
+                    ScrollDelta::Pixels(point(px(0.), px(-56.7))),
+                ),
+            ] {
+                window.scroll("terminal-surface", up, cx);
+                terminal.update(cx, |terminal, _| {
+                    wait(&mut terminal.session, |session| {
+                        session.frame().scrollback > 0
+                    });
+                });
+                window.scroll("terminal-surface", down, cx);
+                terminal.update(cx, |terminal, _| {
+                    wait(&mut terminal.session, |session| {
+                        session.frame().scrollback == 0
+                    });
+                    assert!(
+                        terminal
+                            .session
+                            .selection_text(0, 0, i32::MAX, i32::MAX)
+                            .contains("HISTORY-100")
+                    );
+                });
+            }
         })
         .unwrap();
     }
