@@ -72,7 +72,19 @@ ARASEO_RELEASE_URL=file://$release_directory \
 ARASEO_INSTALL_DIR=$install_directory \
 ARASEO_BIN_DIR=$bin_directory \
 XDG_CONFIG_HOME=$config_home \
-    "$repository_root/scripts/install.sh"
+    "$repository_root/scripts/install.sh" \
+    >"$test_root/install.stdout" 2>"$test_root/install.stderr"
+
+cat "$test_root/install.stdout"
+cat "$test_root/install.stderr" >&2
+if ! grep -q 'Dload.*Upload' "$test_root/install.stderr"; then
+    echo "Installer did not display curl download progress on stderr." >&2
+    exit 1
+fi
+if grep -q 'Dload.*Upload' "$test_root/install.stdout"; then
+    echo "Download progress leaked into installer stdout." >&2
+    exit 1
+fi
 
 test -x "$install_directory/araseo.exe"
 test -x "$bin_directory/araseo"

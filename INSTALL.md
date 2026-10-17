@@ -12,8 +12,11 @@ Run the following command inside WSL:
 curl -fsSL https://github.com/mincheol-lee/araseo/releases/latest/download/install.sh | sh
 ```
 
-The installer verifies SHA-256 checksums before it changes the installation. It
-places the Windows executable in `%LOCALAPPDATA%\Programs\Araseo` and the WSL
+The installer shows download progress, including transfer sizes, speed, and time
+estimates, and reports when it locates the installation directory, verifies
+checksums, and installs the files. It verifies SHA-256 checksums before changing
+the installation. It places the Windows executable in
+`%LOCALAPPDATA%\Programs\Araseo` and the WSL
 launcher in `~/.local/bin/araseo`. If `~/.local/bin` is not already on `PATH`,
 the installer prints the required next step.
 

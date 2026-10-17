@@ -69,6 +69,7 @@ windows_install_directory() {
     printf '%s/Programs/Araseo\n' "$local_app_data"
 }
 
+echo "Locating Windows installation directory..."
 install_directory=$(windows_install_directory)
 executable_path=$install_directory/araseo.exe
 launcher_path=$bin_directory/araseo
@@ -111,7 +112,7 @@ trap cleanup EXIT HUP INT TERM
 
 for asset in araseo.exe araseo SHA256SUMS; do
     echo "Downloading $asset..."
-    curl --fail --location --silent --show-error \
+    curl --fail --location --show-error \
         "$release_url/$asset" --output "$temporary_directory/$asset"
 done
 
@@ -130,9 +131,11 @@ verify_asset() {
         }
 }
 
+echo "Verifying download checksums..."
 verify_asset araseo.exe
 verify_asset araseo
 
+echo "Installing application and launcher..."
 install -d "$install_directory" "$bin_directory" "$config_directory"
 install -m 755 "$temporary_directory/araseo.exe" "$executable_path"
 install -m 755 "$temporary_directory/araseo" "$launcher_path"
