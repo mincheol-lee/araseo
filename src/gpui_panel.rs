@@ -17,9 +17,10 @@ use gpui_kit::component::{
     diff::{Diff, DiffFile, DiffMode, DiffState},
     dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState},
     input::{EditorState, InputEvent},
+    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     text::{TextView, TextViewState},
 };
-use gpui_kit::{prelude::*, *};
+use gpui_kit::{base::TestSupportExt, prelude::*, *};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub enum Opened {
@@ -113,9 +114,11 @@ pub enum Content {
     Terminal(Entity<TerminalView>),
     Error(String),
 }
+#[derive(Clone)]
 pub enum ContentEvent {
     Closed(TabId),
     RequestClose(TabId),
+    RequestCloseFiles(Option<TabId>),
     Changed,
     Focused(TabId),
     Message(String),
@@ -151,6 +154,51 @@ pub struct WorkspacePanel {
     selecting_pdf: bool,
 }
 impl WorkspacePanel {
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.dirty
+            || (matches!(self.content, Content::Loading | Content::Error(_))
+                && matches!(
+                    self.kind,
+                    SavedKind::File {
+                        unsaved_text: Some(_),
+                        ..
+                    }
+                ))
+    }
+
+    pub fn discard_unsaved_changes(&mut self) {
+        self.dirty = false;
+        if let SavedKind::File {
+            unsaved_text,
+            revision,
+        } = &mut self.kind
+        {
+            *unsaved_text = None;
+            *revision = None;
+        }
+    }
+
+    fn file_menu(menu: PopupMenu, panel: WeakEntity<Self>, id: TabId) -> PopupMenu {
+        let close = panel.clone();
+        let others = panel.clone();
+        menu.item(PopupMenuItem::new("Close File").on_click(move |_, _, cx| {
+            let _ = close.update(cx, |_, cx| cx.emit(ContentEvent::RequestClose(id)));
+        }))
+        .separator()
+        .item(
+            PopupMenuItem::new("Close Other Files").on_click(move |_, _, cx| {
+                let _ = others.update(cx, |_, cx| {
+                    cx.emit(ContentEvent::RequestCloseFiles(Some(id)))
+                });
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Close All Files").on_click(move |_, _, cx| {
+                let _ = panel.update(cx, |_, cx| cx.emit(ContentEvent::RequestCloseFiles(None)));
+            }),
+        )
+    }
+
     pub fn new(tab: SavedTab, font_size: f32, cx: &mut Context<Self>) -> Self {
         let title = match tab.kind {
             SavedKind::Terminal { number } => format!("Terminal {number}"),
@@ -576,7 +624,7 @@ impl BasePanel for WorkspacePanel {
         "AraseoTab"
     }
     fn closable(&self, _: &App) -> bool {
-        !self.dirty
+        !self.has_unsaved_changes()
     }
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.active = active;
@@ -600,12 +648,15 @@ impl BasePanel for WorkspacePanel {
     }
 }
 impl Panel for WorkspacePanel {
-    fn tab_name(&self, _: &App) -> Option<SharedString> {
-        Some(self.title.clone().into())
-    }
-
+    // Use the custom title in multi-tab strips too. A plain tab_name bypasses
+    // its context menu, dirty-close control, and agent icon entirely.
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let weak = cx.weak_entity();
+        let id = self.id;
+        let dirty = self.has_unsaved_changes();
+        let title = div()
+            .id(("workspace-tab-title", self.id))
+            .test_support()
             .flex()
             .items_center()
             .gap_1()
@@ -614,12 +665,8 @@ impl Panel for WorkspacePanel {
                     .clone()
                     .cached(StyleRefinement::default().size(px(16.)))
             }))
-            .child(format!(
-                "{}{}",
-                self.title,
-                if self.dirty { " ●" } else { "" }
-            ))
-            .when(self.dirty, |title| {
+            .child(format!("{}{}", self.title, if dirty { " ●" } else { "" }))
+            .when(dirty, |title| {
                 title.child(
                     Button::new(("close-dirty-tab", self.id))
                         .label("×")
@@ -630,7 +677,26 @@ impl Panel for WorkspacePanel {
                             cx.stop_propagation();
                         })),
                 )
-            })
+            });
+        if matches!(self.kind, SavedKind::Terminal { .. }) {
+            title.into_any_element()
+        } else {
+            title
+                .context_menu(move |menu, _, _| Self::file_menu(menu, weak.clone(), id))
+                .into_any_element()
+        }
+    }
+    fn dropdown_menu(
+        &mut self,
+        menu: PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PopupMenu {
+        if matches!(self.kind, SavedKind::Terminal { .. }) {
+            menu
+        } else {
+            Self::file_menu(menu, cx.weak_entity(), self.id)
+        }
     }
     fn inner_padding(&self, _: &App) -> bool {
         false

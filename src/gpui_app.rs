@@ -61,6 +61,7 @@ enum DialogAction {
     AddFolder,
     Kill(wsl_diagnostics::ProcessTarget, bool),
     Close(TabId),
+    CloseFiles(Vec<TabId>),
 }
 struct Dialog {
     title: String,
@@ -383,6 +384,10 @@ impl Workbench {
         self.focused
     }
     #[cfg(feature = "ui-tests")]
+    pub fn panel_for_test(&self, id: TabId) -> Option<Entity<WorkspacePanel>> {
+        self.panels.borrow().get(&id).cloned()
+    }
+    #[cfg(feature = "ui-tests")]
     pub fn session_restore_complete(&self) -> bool {
         self.restore_queue.is_empty() && self.restoring.is_empty() && self.restore_focus.is_none()
     }
@@ -476,13 +481,19 @@ impl Workbench {
                     this.subscriptions.remove(id);
                     this.legacy_groups.remove(*id);
                 }
-                ContentEvent::RequestClose(id) => {
-                    let id = *id;
+                ContentEvent::RequestClose(_) | ContentEvent::RequestCloseFiles(_) => {
+                    let request = event.clone();
                     let root = cx.entity();
                     cx.defer(move |cx| {
                         if let Some(window) = cx.windows().first().copied() {
                             let _ = window.update(cx, |_, window, cx| {
-                                root.update(cx, |this, cx| this.close_id(id, window, cx))
+                                root.update(cx, |this, cx| match request {
+                                    ContentEvent::RequestClose(id) => this.close_id(id, window, cx),
+                                    ContentEvent::RequestCloseFiles(keep) => {
+                                        this.close_files(keep, window, cx)
+                                    }
+                                    _ => unreachable!(),
+                                })
                             });
                         }
                     });
@@ -983,11 +994,15 @@ impl Workbench {
             .unwrap_or_default();
         if let DialogAction::Close(id) = dialog.action {
             if let Some(panel) = self.panels.borrow().get(&id).cloned() {
-                panel.update(cx, |panel, _| panel.dirty = false);
+                panel.update(cx, |panel, _| panel.discard_unsaved_changes());
                 self.dock
                     .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
             }
             cx.notify();
+            return;
+        }
+        if let DialogAction::CloseFiles(ids) = dialog.action {
+            self.remove_file_tabs(ids, window, cx);
             return;
         }
         let primary = self.workspace.clone();
@@ -1038,7 +1053,7 @@ impl Workbench {
                         .map(ActionResult::ProcessStopped)
                         .map_err(anyhow::Error::from)
                 }
-                DialogAction::Close(_) => unreachable!(),
+                DialogAction::Close(_) | DialogAction::CloseFiles(_) => unreachable!(),
             }
             .map_err(|error| format!("{error:#}"))
         });
@@ -1133,7 +1148,7 @@ impl Workbench {
         let Some(panel) = panel else {
             return;
         };
-        if panel.read(cx).dirty {
+        if panel.read(cx).has_unsaved_changes() {
             let id = panel.read(cx).id;
             self.dialog(
                 "Discard unsaved changes and close?",
@@ -1146,6 +1161,52 @@ impl Workbench {
             self.dock
                 .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
         }
+    }
+    fn close_files(&mut self, keep: Option<TabId>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut ids: Vec<_> = self
+            .panels
+            .borrow()
+            .iter()
+            .filter_map(|(id, panel)| {
+                (Some(*id) != keep && !matches!(panel.read(cx).kind, SavedKind::Terminal { .. }))
+                    .then_some(*id)
+            })
+            .collect();
+        ids.sort_unstable();
+        let dirty = ids
+            .iter()
+            .filter(|id| self.panels.borrow()[id].read(cx).has_unsaved_changes())
+            .count();
+        if dirty > 0 {
+            self.dialog(
+                &format!(
+                    "Discard unsaved changes in {dirty} file(s) and close {} file tab(s)?",
+                    ids.len()
+                ),
+                DialogAction::CloseFiles(ids),
+                None,
+                window,
+                cx,
+            );
+        } else {
+            self.remove_file_tabs(ids, window, cx);
+        }
+    }
+    fn remove_file_tabs(&mut self, ids: Vec<TabId>, window: &mut Window, cx: &mut Context<Self>) {
+        for id in ids {
+            let panel = self.panels.borrow().get(&id).cloned();
+            if let Some(panel) = panel {
+                // Recheck at removal, including loading/error tabs identified by kind.
+                if matches!(panel.read(cx).kind, SavedKind::Terminal { .. }) {
+                    continue;
+                }
+                panel.update(cx, |panel, _| panel.discard_unsaved_changes());
+                self.dock
+                    .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+            }
+        }
+        self.schedule_save();
+        cx.notify();
     }
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.closing {
