@@ -4,8 +4,17 @@ use crate::{
     terminal::{TerminalFrame, TerminalSession, TerminalWheel},
     terminal_paint::{self, Composition},
 };
-use gpui_kit::{self as gpui, prelude::*, *};
+use gpui_kit::{self as gpui, base::TestSupportExt, prelude::*, *};
 use std::{ops::Range, sync::Arc, time::Duration};
+
+pub fn init(cx: &mut App) {
+    // Root's focus-navigation actions run before raw key listeners. Let the
+    // terminal encode Tab/Backtab itself, while other controls keep navigation.
+    cx.bind_keys([
+        KeyBinding::new("tab", NoAction, Some("Terminal")),
+        KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
+    ]);
+}
 
 #[derive(Clone)]
 struct DrawRun {
@@ -305,6 +314,7 @@ impl Render for TerminalView {
         let paint = cx.entity();
         div()
             .id("terminal-surface")
+            .test_support()
             .size_full()
             .overflow_hidden()
             .bg(rgb(0x282c34))
@@ -390,7 +400,9 @@ impl Render for TerminalView {
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 let delta = event.delta.pixel_delta(this.line_height);
                 let (row, column) = this.cell_at(event.position);
-                let rows = (-delta.y / this.line_height).round() as i32;
+                // GPUI reports upward wheel motion as positive, matching both
+                // local history offsets and the terminal's wheel-up report.
+                let rows = (delta.y / this.line_height).round() as i32;
                 this.session.scroll_scrollback(TerminalWheel {
                     rows,
                     row,

@@ -2276,6 +2276,7 @@ pub fn run(workspace: Workspace, initial: Option<PathBuf>) -> anyhow::Result<()>
         .with_assets(crate::gpui_chrome::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            crate::gpui_terminal::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
             cx.bind_keys([
                 KeyBinding::new("ctrl-s", Save, Some("Araseo")),
