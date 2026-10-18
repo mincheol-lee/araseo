@@ -15,11 +15,11 @@ These screenshots illustrate workspace layouts from the earlier frontend.
 The current build uses GPUI Kit; see the feature descriptions below for its
 updated controls and behavior.
 
-![Araseo workspace with file explorer, two terminal panes, and two editor panes](assets/araseo-workspace.png)
+![Araseo workspace with file explorer, two terminal panes, and two editor panes](assets/overall_view.png)
 
 Two terminal sessions alongside source files in a split workspace.
 
-![Araseo showing a side-by-side README diff above a terminal and code editor](assets/araseo-git-diff.png)
+![Araseo showing a side-by-side README diff above a terminal and code editor](assets/git_view.png)
 
 A Git change compared between `HEAD` and the working tree, with a terminal and
 source file open in the panes below.
