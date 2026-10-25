@@ -1,6 +1,7 @@
 extern crate gpui_kit as gpui;
 pub mod appearance;
 pub mod background;
+pub mod code_navigation;
 pub mod diagnostics_log;
 pub mod document;
 pub mod document_io;
@@ -12,8 +13,10 @@ pub mod gpui_agent_icon;
 pub mod gpui_app;
 pub mod gpui_chrome;
 pub mod gpui_editor;
+pub mod gpui_navigation;
 pub mod gpui_panel;
 pub mod gpui_terminal;
+pub mod lsp_transport;
 pub mod markdown_preview;
 pub mod preview;
 pub mod process_job;

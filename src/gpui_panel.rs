@@ -116,6 +116,10 @@ pub enum Content {
 }
 #[derive(Clone)]
 pub enum ContentEvent {
+    Navigate(
+        crate::code_navigation::Location,
+        crate::code_navigation::Position,
+    ),
     Closed(TabId),
     RequestClose(TabId),
     RequestCloseFiles(Option<TabId>),
@@ -125,6 +129,8 @@ pub enum ContentEvent {
     RefreshTree,
 }
 pub struct WorkspacePanel {
+    pending_visit: Option<crate::code_navigation::Visit>,
+    pub(crate) navigation_path: Option<PathBuf>,
     pub id: TabId,
     pub path: PathBuf,
     pub kind: SavedKind,
@@ -224,6 +230,8 @@ impl WorkspacePanel {
             }
         });
         Self {
+            pending_visit: None,
+            navigation_path: None,
             id: tab.id,
             path: tab.path,
             kind: tab.kind,
@@ -347,6 +355,7 @@ impl WorkspacePanel {
             },
         };
         let focus = self.focus_handle(cx);
+        self.apply_visit(window, cx);
         self.subscriptions
             .push(cx.on_focus(&focus, window, |this, _, cx| {
                 cx.emit(ContentEvent::Focused(this.id))
@@ -355,6 +364,65 @@ impl WorkspacePanel {
             focus.focus(window, cx);
         }
         cx.emit(ContentEvent::Changed);
+        cx.notify();
+    }
+    pub fn visit(&self, cx: &App) -> Option<crate::code_navigation::Visit> {
+        let Content::File {
+            editor, document, ..
+        } = &self.content
+        else {
+            return None;
+        };
+        let editor = editor.read(cx);
+        let range = editor.selected_range();
+        let scroll = editor.scroll_offset();
+        Some(crate::code_navigation::Visit {
+            tab: Some(self.id),
+            location: crate::code_navigation::Location {
+                path: self.path.clone(),
+                range: crate::code_navigation::Range {
+                    start: crate::code_navigation::position(&document.text, range.start),
+                    end: crate::code_navigation::position(&document.text, range.end),
+                },
+            },
+            scroll: Some((f32::from(scroll.x), f32::from(scroll.y))),
+        })
+    }
+    pub fn navigate(
+        &mut self,
+        visit: crate::code_navigation::Visit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_visit = Some(visit);
+        self.apply_visit(window, cx);
+    }
+    fn apply_visit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Content::File {
+            document,
+            editor,
+            source,
+            ..
+        } = &mut self.content
+        else {
+            return;
+        };
+        let Some(visit) = self.pending_visit.take() else {
+            return;
+        };
+        *source = true;
+        let start = crate::code_navigation::offset(&document.text, visit.location.range.start);
+        let end = crate::code_navigation::offset(&document.text, visit.location.range.end);
+        let active = self.active;
+        editor.update(cx, |editor, cx| {
+            editor.set_selected_range(start..end, cx);
+            if let Some((x, y)) = visit.scroll {
+                editor.set_scroll_offset(point(px(x), px(y)), cx);
+            }
+            if active {
+                editor.focus(window, cx);
+            }
+        });
         cx.notify();
     }
     fn poll(&mut self, cx: &mut Context<Self>) {

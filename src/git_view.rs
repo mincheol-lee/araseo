@@ -94,11 +94,12 @@ pub fn groups(
     });
     groups
 }
-pub fn rows(groups: &[Group], collapsed: &HashSet<PathBuf>) -> Vec<Row> {
+/// Only explicitly expanded projects expose their changes; new projects start closed.
+pub fn rows(groups: &[Group], expanded: &HashSet<PathBuf>) -> Vec<Row> {
     let mut rows = Vec::new();
     for (index, group) in groups.iter().enumerate() {
         rows.push(Row::Group(index));
-        if !collapsed.contains(&group.root) {
+        if expanded.contains(&group.root) {
             rows.extend((0..group.changes.len()).map(|change| Row::Change {
                 group: index,
                 change,
@@ -146,8 +147,12 @@ mod tests {
         assert_eq!(nested.changes[0].directory, "src");
         assert_eq!(nested.changes[0].name, "main.rs");
         assert_eq!(status_label(nested.changes[0].status), "U");
-        let collapsed = HashSet::from([nested.root.clone()]);
-        let rows = rows(&groups, &collapsed);
+        let expanded = groups
+            .iter()
+            .filter(|group| group.root != nested.root)
+            .map(|group| group.root.clone())
+            .collect();
+        let rows = rows(&groups, &expanded);
         assert_eq!(rows.len(), 5);
         let nested_index = groups.iter().position(|g| g.name == "nested").unwrap();
         assert!(rows.contains(&Row::Group(nested_index)));
@@ -155,6 +160,50 @@ mod tests {
             group: nested_index,
             change: 0
         }));
+    }
+    #[test]
+    fn projects_start_closed_and_status_refresh_preserves_explicit_expansion() {
+        let alpha = PathBuf::from("/work/alpha");
+        let beta = PathBuf::from("/work/beta");
+        let repositories = HashSet::from([alpha.clone(), beta.clone()]);
+        let mut statuses = HashMap::from([(alpha.join("main.rs"), GitStatus::Modified)]);
+        let mut expanded = HashSet::new();
+        let initial = groups(&statuses, &repositories, &[]);
+        assert_eq!(rows(&initial, &expanded), vec![Row::Group(0)]);
+        expanded.insert(alpha.clone());
+        assert_eq!(
+            rows(&initial, &expanded),
+            vec![
+                Row::Group(0),
+                Row::Change {
+                    group: 0,
+                    change: 0
+                }
+            ]
+        );
+        statuses.insert(alpha.join("new.rs"), GitStatus::Added);
+        statuses.insert(beta.join("main.rs"), GitStatus::Modified);
+        let refreshed = groups(&statuses, &repositories, &[]);
+        assert_eq!(
+            rows(&refreshed, &expanded),
+            vec![
+                Row::Group(0),
+                Row::Change {
+                    group: 0,
+                    change: 0
+                },
+                Row::Change {
+                    group: 0,
+                    change: 1
+                },
+                Row::Group(1)
+            ]
+        );
+        expanded.remove(&alpha);
+        assert_eq!(
+            rows(&refreshed, &expanded),
+            vec![Row::Group(0), Row::Group(1)]
+        );
     }
     #[test]
     fn fallback_workspace_grouping_and_order_do_not_depend_on_hash_iteration() {

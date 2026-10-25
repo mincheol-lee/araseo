@@ -39,6 +39,26 @@ impl EditorSurface {
         Self {
             editor: editor.clone(),
             inner: Editor::new(editor)
+                .context_menu(|menu, _, _| {
+                    use crate::gpui_navigation::*;
+                    use gpui_kit::component::input::{Copy, Cut, GoToDefinition, Paste, SelectAll};
+                    menu.menu("Go to Definition · F12", Box::new(GoToDefinition))
+                        .menu("Find Definitions · Alt+F12", Box::new(FindDefinitions))
+                        .menu("Find All References · Shift+F12", Box::new(FindReferences))
+                        .menu("Show Call Hierarchy · Shift+Alt+H", Box::new(ShowCallers))
+                        .menu(
+                            "Search Project Functions · Ctrl+T",
+                            Box::new(SearchFunctions),
+                        )
+                        .separator()
+                        .menu("Back · Alt+Left", Box::new(NavigateBack))
+                        .menu("Forward · Alt+Right", Box::new(NavigateForward))
+                        .separator()
+                        .menu("Cut", Box::new(Cut))
+                        .menu("Copy", Box::new(Copy))
+                        .menu("Paste", Box::new(Paste))
+                        .menu("Select All", Box::new(SelectAll))
+                })
                 .h_full()
                 .text_size(px(font_size))
                 .bordered(false)

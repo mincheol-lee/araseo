@@ -3,8 +3,13 @@
 use crate::{
     appearance::FontSizes,
     background::Background,
+    code_navigation::{self as navigation, Language, Query, Service, Snapshot, Visit},
     document::Document,
     git, git_view,
+    gpui_navigation::{
+        self, FindDefinitions, FindReferences, NavigateBack, NavigateForward, NavigationEvent,
+        Navigator, SearchFunctions, Seed, ShowCallers,
+    },
     gpui_panel::{Content, ContentEvent, Opened, WorkspacePanel},
     session::{SavedKind, SavedTab, Session},
     tabs::{LayoutSpec, TabGroups, TabId},
@@ -12,6 +17,7 @@ use crate::{
     workspace::{self, Workspace},
     workspace_history, wsl_diagnostics,
 };
+use gpui_kit::base::Disableable;
 use gpui_kit::component::{
     Icon, IconName, Sizable, Theme, ThemeMode,
     button::{Button, ButtonVariants},
@@ -86,6 +92,11 @@ enum ActionResult {
 }
 
 pub struct Workbench {
+    navigation_service: Service,
+    navigator: Option<Entity<Navigator>>,
+    navigation_subscription: Option<Subscription>,
+    navigation_history: navigation::History,
+    external_navigation: HashMap<PathBuf, Workspace>,
     workspace: Workspace,
     added: Vec<Workspace>,
     expanded: HashSet<PathBuf>,
@@ -93,7 +104,7 @@ pub struct Workbench {
     repositories: HashSet<PathBuf>,
     git_groups: Vec<git_view::Group>,
     git_rows: Vec<git_view::Row>,
-    collapsed_git: HashSet<PathBuf>,
+    expanded_git: HashSet<PathBuf>,
     tree: Vec<FlatNode>,
     tree_selection: Option<PathBuf>,
     tree_loader: Background<Result<TreeResult, String>>,
@@ -117,6 +128,7 @@ pub struct Workbench {
     focus: FocusHandle,
     fonts: FontSizes,
     sidebar_git: bool,
+    sidebar_navigation: bool,
     sidebar_width: f32,
     resizing_sidebar: bool,
     status: String,
@@ -257,6 +269,14 @@ impl Workbench {
             .map(|path| workspace_history::load(&path, &workspace.distro, &workspace.linux_root))
             .unwrap_or_default();
         let mut this = Self {
+            navigation_service: Service::new(
+                crate::appearance::settings_path()
+                    .map(|path| path.with_file_name("code-navigation.json")),
+            ),
+            navigator: None,
+            navigation_subscription: None,
+            navigation_history: navigation::History::default(),
+            external_navigation: HashMap::new(),
             workspace,
             added: vec![],
             expanded: HashSet::new(),
@@ -264,7 +284,7 @@ impl Workbench {
             repositories: HashSet::new(),
             git_groups: Vec::new(),
             git_rows: Vec::new(),
-            collapsed_git: HashSet::new(),
+            expanded_git: HashSet::new(),
             tree: vec![],
             tree_selection: None,
             tree_loader: Background::default(),
@@ -287,6 +307,7 @@ impl Workbench {
             focused: None,
             focus: cx.focus_handle(),
             fonts,
+            sidebar_navigation: false,
             sidebar_git: saved.as_ref().is_some_and(|s| s.sidebar_view == 1),
             sidebar_width: saved.as_ref().map(|s| s.sidebar_width).unwrap_or(250.),
             resizing_sidebar: false,
@@ -378,6 +399,25 @@ impl Workbench {
             this.new_terminal(this.workspace.linux_root.clone(), window, cx);
         }
         this
+    }
+    #[cfg(feature = "ui-tests")]
+    pub fn navigate_for_test(
+        &mut self,
+        location: navigation::Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.jump_location(location, window, cx);
+    }
+    #[cfg(feature = "ui-tests")]
+    pub fn navigation_query_for_test(&self, cx: &App) -> Option<String> {
+        self.navigator
+            .as_ref()
+            .map(|nav| nav.read(cx).query_for_test(cx))
+    }
+    #[cfg(feature = "ui-tests")]
+    pub fn navigator_for_test(&self) -> Option<Entity<Navigator>> {
+        self.navigator.clone()
     }
     #[cfg(feature = "ui-tests")]
     pub fn focused_tab(&self) -> Option<TabId> {
@@ -474,8 +514,22 @@ impl Workbench {
         };
         let panel = cx.new(|cx| WorkspacePanel::new(tab, font_size, cx));
         panel.update(cx, |panel, cx| panel.set_font(font_size, brightness, cx));
-        let subscription = cx.subscribe(&panel, |this, _, event: &ContentEvent, cx| {
+        let subscription = cx.subscribe(&panel, |this, source, event: &ContentEvent, cx| {
             match event {
+                ContentEvent::Navigate(location, origin) => {
+                    let root = cx.entity();
+                    let location = location.clone();
+                    let origin = *origin;
+                    cx.defer(move |cx| {
+                        if let Some(handle) = cx.windows().first().copied() {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                root.update(cx, |this, cx| {
+                                    this.jump_from(location, Some(origin), window, cx)
+                                })
+                            });
+                        }
+                    });
+                }
                 ContentEvent::Closed(id) => {
                     this.panels.borrow_mut().remove(id);
                     this.subscriptions.remove(id);
@@ -503,7 +557,7 @@ impl Workbench {
                     this.legacy_groups.activate(*id);
                 }
                 ContentEvent::Message(message) => this.status = message.clone(),
-                ContentEvent::Changed => {}
+                ContentEvent::Changed => this.connect_editor(&source, cx),
                 ContentEvent::RefreshTree => this.refresh_tree(),
             }
             this.schedule_save();
@@ -517,7 +571,29 @@ impl Workbench {
         let Some(panel) = self.panels.borrow().get(&tab.id).cloned() else {
             return;
         };
-        let workspace = workspace_for(&self.workspace, &self.added, &tab.path).clone();
+        // Dependency definitions may be outside the starting project. Recreate
+        // their file mapping on session restore without adding a project root.
+        if matches!(tab.kind, SavedKind::File { .. })
+            && workspace::for_path(
+                std::iter::once(&self.workspace).chain(&self.added),
+                &tab.path,
+            )
+            .is_none()
+            && tab.path.to_string_lossy().starts_with('/')
+        {
+            if let Some(parent) = tab.path.parent() {
+                if let Ok(workspace) =
+                    Workspace::prepare(self.workspace.distro.clone(), parent.to_path_buf())
+                {
+                    self.external_navigation.insert(tab.path.clone(), workspace);
+                }
+            }
+        }
+        let workspace = self
+            .external_navigation
+            .get(&tab.path)
+            .unwrap_or_else(|| workspace_for(&self.workspace, &self.added, &tab.path))
+            .clone();
         let repository = self
             .repositories
             .iter()
@@ -602,6 +678,291 @@ impl Workbench {
             }
         });
         self.load_panel(tab, cx);
+        self.schedule_save();
+        cx.notify();
+    }
+    fn navigation_snapshots(&self, cx: &App) -> Vec<Snapshot> {
+        snapshots(&self.panels, cx)
+    }
+    fn connect_editor(&self, panel: &Entity<WorkspacePanel>, cx: &mut App) {
+        let (editor, path) = {
+            let panel = panel.read(cx);
+            let Content::File { editor, .. } = &panel.content else {
+                return;
+            };
+            if panel.navigation_path.as_ref() == Some(&panel.path)
+                && editor.read(cx).lsp().definition_provider.is_some()
+            {
+                return;
+            }
+            (editor.clone(), panel.path.clone())
+        };
+        if Language::for_path(&path).is_none() {
+            return;
+        }
+        let workspace = self
+            .external_navigation
+            .get(&path)
+            .unwrap_or_else(|| workspace_for(&self.workspace, &self.added, &path))
+            .clone();
+        let panels = self.panels.clone();
+        let weak = panel.downgrade();
+        let error_panel = weak.clone();
+        panel.update(cx, |panel, _| panel.navigation_path = Some(path.clone()));
+        let origin = Rc::new(Cell::new(navigation::Position::default()));
+        let provider = gpui_navigation::Definitions {
+            service: self.navigation_service.clone(),
+            workspace,
+            path,
+            snapshots: Rc::new(move |cx| snapshots(&panels, cx)),
+            error: Rc::new(move |message, cx| {
+                let _ = error_panel.update(cx, |_, cx| cx.emit(ContentEvent::Message(message)));
+            }),
+            cancel: RefCell::new(Default::default()),
+            origin: origin.clone(),
+        };
+        editor.update(cx, |editor, cx| {
+            editor.lsp_mut().definition_provider = Some(Rc::new(provider));
+            editor.lsp_mut().show_document = Some(Rc::new(move |params, _, cx| {
+                if let Ok(path) = navigation::uri_path(params.uri.as_str()) {
+                    let range = params.selection.unwrap_or_default();
+                    let location = navigation::Location {
+                        path,
+                        range: navigation::Range {
+                            start: navigation::Position {
+                                line: range.start.line,
+                                character: range.start.character,
+                            },
+                            end: navigation::Position {
+                                line: range.end.line,
+                                character: range.end.character,
+                            },
+                        },
+                    };
+                    let _ = weak.update(cx, |_, cx| {
+                        cx.emit(ContentEvent::Navigate(location, origin.get()))
+                    });
+                }
+                // Never fall through and apply another file's offsets to this document.
+                true
+            }));
+            editor.refresh(cx);
+        });
+    }
+    fn current_visit(&self, cx: &App) -> Option<Visit> {
+        self.focused
+            .and_then(|id| self.panels.borrow().get(&id).cloned())
+            .and_then(|panel| panel.read(cx).visit(cx))
+    }
+    fn start_navigation(
+        &mut self,
+        path: Option<PathBuf>,
+        mode: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.current_visit(cx);
+        if mode != 0 && current.is_none() {
+            self.status = "Open a source file and place the cursor on a function first".into();
+            cx.notify();
+            return;
+        }
+        let directory = path.is_some() || current.is_none();
+        let path = path
+            .or_else(|| current.as_ref().map(|visit| visit.location.path.clone()))
+            .or_else(|| self.tree_selection.clone())
+            .unwrap_or(self.workspace.linux_root.clone());
+        let workspace = self
+            .external_navigation
+            .get(&path)
+            .unwrap_or_else(|| workspace_for(&self.workspace, &self.added, &path))
+            .clone();
+        let language = Language::for_path(&path).unwrap_or(Language::Rust);
+        let query = match mode {
+            1 => {
+                let visit = current.unwrap();
+                Query::References(visit.location.range.start, visit.location.path)
+            }
+            2 => {
+                let visit = current.unwrap();
+                Query::Callers(visit.location.range.start, visit.location.path)
+            }
+            3 => {
+                let visit = current.unwrap();
+                Query::Definition(visit.location.range.start, visit.location.path)
+            }
+            _ => Query::Symbols(String::new()),
+        };
+        let mut paths = self
+            .repositories
+            .iter()
+            .cloned()
+            .chain(self.added.iter().map(|w| w.linux_root.clone()))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        let projects = paths
+            .into_iter()
+            .map(|path| Seed {
+                workspace: workspace_for(&self.workspace, &self.added, &path).clone(),
+                path,
+                directory: true,
+            })
+            .collect();
+        let initial_snapshots = self.navigation_snapshots(cx);
+        let service = self.navigation_service.clone();
+        self.close_navigation(window, cx);
+        let navigator = cx.new(|cx| {
+            Navigator::new(
+                Seed {
+                    workspace,
+                    path,
+                    directory,
+                },
+                projects,
+                language,
+                query,
+                initial_snapshots,
+                service,
+                window,
+                cx,
+            )
+        });
+        let panels = self.panels.clone();
+        navigator.update(cx, |nav, _| {
+            nav.snapshot_source = Some(Rc::new(move |cx| snapshots(&panels, cx)))
+        });
+        self.navigation_subscription = Some(cx.subscribe_in(
+            &navigator,
+            window,
+            |this, _, event: &NavigationEvent, window, cx| match event {
+                NavigationEvent::Jump(location) => {
+                    let location = location.clone();
+                    this.jump_location(location, window, cx);
+                }
+                NavigationEvent::Close => this.close_navigation(window, cx),
+                NavigationEvent::Refresh => {
+                    let snapshots = this.navigation_snapshots(cx);
+                    if let Some(nav) = this.navigator.clone() {
+                        nav.update(cx, |nav, cx| nav.refresh(snapshots, cx));
+                    }
+                }
+            },
+        ));
+        self.navigator = Some(navigator);
+        self.sidebar_navigation = true;
+        cx.notify();
+    }
+    fn close_navigation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_navigation = false;
+        if let Some(navigator) = self.navigator.take() {
+            navigator.update(cx, |nav, _| nav.cancel());
+        }
+        self.navigation_subscription = None;
+        if let Some(panel) = self
+            .focused
+            .and_then(|id| self.panels.borrow().get(&id).cloned())
+        {
+            panel.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+    fn jump_location(
+        &mut self,
+        location: navigation::Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.jump_from(location, None, window, cx);
+    }
+    fn jump_from(
+        &mut self,
+        location: navigation::Location,
+        origin: Option<navigation::Position>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mut current) = self.current_visit(cx) {
+            // Ctrl+click can follow a symbol away from the old caret. Back must
+            // return to the clicked call site, retaining that pane's viewport.
+            if let Some(origin) = origin {
+                current.location.range = navigation::Range {
+                    start: origin,
+                    end: origin,
+                };
+            }
+            self.navigation_history.push(current);
+        }
+        self.open_visit(
+            Visit {
+                tab: None,
+                location,
+                scroll: None,
+            },
+            window,
+            cx,
+        );
+    }
+    fn navigate_history(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = self.current_visit(cx) else {
+            return;
+        };
+        let target = if forward {
+            self.navigation_history.forward(current)
+        } else {
+            self.navigation_history.back(current)
+        };
+        if let Some(target) = target {
+            self.open_visit(target, window, cx);
+        }
+    }
+    fn open_visit(&mut self, visit: Visit, window: &mut Window, cx: &mut Context<Self>) {
+        let path = visit.location.path.clone();
+        if !path.to_string_lossy().starts_with('/')
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            self.status = "Invalid navigation target".into();
+            return;
+        }
+        if workspace::for_path(std::iter::once(&self.workspace).chain(&self.added), &path).is_none()
+        {
+            let Some(parent) = path.parent() else {
+                return;
+            };
+            if let Ok(workspace) =
+                Workspace::prepare(self.workspace.distro.clone(), parent.to_path_buf())
+            {
+                self.external_navigation.insert(path.clone(), workspace);
+            }
+        }
+        let exact = visit
+            .tab
+            .and_then(|id| self.panels.borrow().get(&id).cloned())
+            .filter(|panel| panel.read(cx).path == path);
+        if let Some(panel) = exact {
+            self.dock.update(cx, |dock, cx| {
+                dock.select_panel(PanelId::from(panel.entity_id()), window, cx)
+            });
+            self.focused = Some(panel.read(cx).id);
+            panel.update(cx, |panel, cx| panel.navigate(visit, window, cx));
+        } else {
+            self.open_file(path.clone(), window, cx);
+            let panel = self
+                .panels
+                .borrow()
+                .values()
+                .find(|p| {
+                    p.read(cx).path == path && matches!(p.read(cx).kind, SavedKind::File { .. })
+                })
+                .cloned();
+            if let Some(panel) = panel {
+                self.focused = Some(panel.read(cx).id);
+                panel.update(cx, |panel, cx| panel.navigate(visit, window, cx));
+            }
+        }
+        self.status = format!("{}", path.display());
         self.schedule_save();
         cx.notify();
     }
@@ -819,6 +1180,7 @@ impl Workbench {
                                     .into();
                                 cx.notify();
                             });
+                            self.connect_editor(panel, cx);
                         }
                     }
                     self.refresh_tree();
@@ -1331,6 +1693,8 @@ impl Workbench {
             }))
             .context_menu(move |menu, _, _| {
                 use gpui_kit::component::menu::PopupMenuItem;
+                let search_path = menu_parent.clone();
+                let search_root = weak.clone();
                 let terminal = menu_parent.clone();
                 let root = weak.clone();
                 let new_file = menu_parent.clone();
@@ -1344,13 +1708,20 @@ impl Workbench {
                 let copy = menu_path.clone();
                 let remove = menu_path.clone();
                 let remove_root = weak.clone();
-                menu.item(PopupMenuItem::new("Open Terminal Here").on_click(
+                menu.item(PopupMenuItem::new("Search Project Functions…").on_click(
                     move |_, window, cx| {
-                        let _ = root.update(cx, |this, cx| {
-                            this.new_terminal(terminal.clone(), window, cx)
+                        let _ = search_root.update(cx, |this, cx| {
+                            this.start_navigation(Some(search_path.clone()), 0, window, cx)
                         });
                     },
                 ))
+                .item(
+                    PopupMenuItem::new("Open Terminal Here").on_click(move |_, window, cx| {
+                        let _ = root.update(cx, |this, cx| {
+                            this.new_terminal(terminal.clone(), window, cx)
+                        });
+                    }),
+                )
                 .item(
                     PopupMenuItem::new("New File…").on_click(move |_, window, cx| {
                         let _ = file_root.update(cx, |this, cx| {
@@ -1464,7 +1835,7 @@ impl Workbench {
             .chain(self.added.iter().map(|w| w.linux_root.clone()))
             .collect::<Vec<_>>();
         self.git_groups = git_view::groups(&self.statuses, &self.repositories, &roots);
-        self.git_rows = git_view::rows(&self.git_groups, &self.collapsed_git);
+        self.git_rows = git_view::rows(&self.git_groups, &self.expanded_git);
     }
     fn git_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         use gpui_kit::base::TestSupportExt;
@@ -1473,7 +1844,7 @@ impl Workbench {
             git_view::Row::Group(group) => {
                 let group = &self.git_groups[group];
                 let root = group.root.clone();
-                let collapsed = self.collapsed_git.contains(&root);
+                let collapsed = !self.expanded_git.contains(&root);
                 div()
                     .id(("git-repository", index))
                     .test_support()
@@ -1529,10 +1900,10 @@ impl Workbench {
                             .child(group.changes.len().to_string()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.collapsed_git.remove(&root) {
-                            this.collapsed_git.insert(root.clone());
+                        if !this.expanded_git.remove(&root) {
+                            this.expanded_git.insert(root.clone());
                         }
-                        this.git_rows = git_view::rows(&this.git_groups, &this.collapsed_git);
+                        this.git_rows = git_view::rows(&this.git_groups, &this.expanded_git);
                         cx.notify();
                     }))
                     .into_any_element()
@@ -1616,7 +1987,16 @@ impl Workbench {
     }
     fn sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let narrow = self.sidebar_width < 210.;
-        let list = if self.sidebar_git {
+        let list = if self.sidebar_navigation && self.navigator.is_some() {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .children(self.navigator.clone())
+                .into_any_element()
+        } else if self.sidebar_git {
             let root = cx.entity();
             let count = self.git_rows.len();
             let total = self
@@ -1729,6 +2109,7 @@ impl Workbench {
                             .small()
                             .ghost()
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_navigation = false;
                                 this.sidebar_git = false;
                                 this.schedule_save();
                                 cx.notify();
@@ -1780,6 +2161,18 @@ impl Workbench {
                             })),
                     )
                     .child(div().flex_1().min_w_0())
+                    .children(self.navigator.as_ref().map(|_| {
+                        Button::new("navigation-view")
+                            .label("⌕")
+                            .small()
+                            .ghost()
+                            .accessibility_label("Code navigation")
+                            .tooltip("Code navigation results")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_navigation = true;
+                                cx.notify();
+                            }))
+                    }))
                     .child(
                         Button::new("git-view")
                             .accessibility_label("Git")
@@ -1791,6 +2184,7 @@ impl Workbench {
                             .small()
                             .ghost()
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_navigation = false;
                                 this.sidebar_git = true;
                                 this.schedule_save();
                                 cx.notify();
@@ -2063,6 +2457,22 @@ fn overlay(content: impl IntoElement) -> AnyElement {
         )
         .into_any_element()
 }
+fn snapshots(panels: &Catalog, cx: &App) -> Vec<Snapshot> {
+    panels
+        .borrow()
+        .values()
+        .filter_map(|panel| {
+            let panel = panel.read(cx);
+            let Content::File { document, .. } = &panel.content else {
+                return None;
+            };
+            Some(Snapshot {
+                path: panel.path.clone(),
+                text: document.text.clone(),
+            })
+        })
+        .collect()
+}
 fn workspace_for<'a>(primary: &'a Workspace, added: &'a [Workspace], path: &Path) -> &'a Workspace {
     workspace::for_path(std::iter::once(primary).chain(added), path).unwrap_or(primary)
 }
@@ -2250,6 +2660,24 @@ impl Render for Workbench {
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.resizing_sidebar = false),
             )
+            .on_action(cx.listener(|this, _: &SearchFunctions, window, cx| {
+                this.start_navigation(None, 0, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FindDefinitions, window, cx| {
+                this.start_navigation(None, 3, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FindReferences, window, cx| {
+                this.start_navigation(None, 1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowCallers, window, cx| {
+                this.start_navigation(None, 2, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
+                this.navigate_history(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
+                this.navigate_history(true, window, cx)
+            }))
             .on_action(cx.listener(Self::save_active))
             .on_action(cx.listener(Self::close_active))
             .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
@@ -2310,6 +2738,35 @@ impl Render for Workbench {
                                 cx.notify();
                             })),
                     )
+                    .child(
+                        Button::new("navigation-back")
+                            .label("←")
+                            .small()
+                            .ghost()
+                            .disabled(!self.navigation_history.can_back())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.navigate_history(false, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("navigation-forward")
+                            .label("→")
+                            .small()
+                            .ghost()
+                            .disabled(!self.navigation_history.can_forward())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.navigate_history(true, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("project-functions")
+                            .label("Functions")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_navigation(None, 0, window, cx)
+                            })),
+                    )
                     .child(div().flex_1().overflow_hidden().child(self.status.clone())),
             )
             .children(settings)
@@ -2338,6 +2795,7 @@ pub fn run(workspace: Workspace, initial: Option<PathBuf>) -> anyhow::Result<()>
         .run(move |cx| {
             gpui_kit::init(cx);
             crate::gpui_terminal::init(cx);
+            crate::gpui_navigation::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
             cx.bind_keys([
                 KeyBinding::new("ctrl-s", Save, Some("Araseo")),

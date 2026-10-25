@@ -1353,7 +1353,14 @@ mod tests {
             window.render_frame(cx);
             window.click("git-view", cx);
             assert!(window.find(("git-repository", 0usize)).visible());
+            assert!(window.find(("git-repository", 1usize)).visible());
+            assert!(window.try_find(("git-change", 1usize)).is_none());
+            assert!(window.try_find(("git-change", 2usize)).is_none());
+            window.click(("git-repository", 0usize), cx);
+            assert!(window.find(("git-change", 1usize)).visible());
+            assert!(window.find(("git-change", 2usize)).visible());
             assert!(window.find(("git-repository", 3usize)).visible());
+            assert!(window.try_find(("git-change", 4usize)).is_none());
             window.click(("git-repository", 0usize), cx);
             assert!(window.find(("git-repository", 1usize)).visible());
             assert!(window.try_find(("git-change", 1usize)).is_none());
@@ -1398,5 +1405,389 @@ mod tests {
             "docked diff must reflow: {heights:?}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[gpui_kit::test]
+    async fn code_navigation_reuses_split_tabs_and_restores_cursor_with_shortcuts(
+        cx: &mut TestAppContext,
+    ) {
+        use araseo::{
+            code_navigation::{Location, Position, Range},
+            gpui_app::Workbench,
+            session::Session,
+            tabs::{Dock, TabGroups},
+            workspace::Workspace,
+        };
+        use gpui_kit::test::TestAppContextExt;
+        let base = file();
+        let root = base.with_extension("navigation-workspace");
+        std::fs::remove_file(base).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        std::fs::write(&first, "// 한글 😀\nfn caller() {}\n").unwrap();
+        std::fs::write(&second, "// target\nfn target() {}\n").unwrap();
+        let mut groups = TabGroups::default();
+        groups.add(10, 0);
+        groups.add(20, 0);
+        groups.dock_into(20, 0, Dock::Right);
+        groups.activate(10);
+        let saved = Session::new(
+            "Ubuntu".into(),
+            root.clone(),
+            [(&first, 10), (&second, 20)]
+                .into_iter()
+                .map(|(path, id)| SavedTab {
+                    id,
+                    path: path.clone(),
+                    kind: SavedKind::File {
+                        unsaved_text: None,
+                        revision: None,
+                    },
+                })
+                .collect(),
+            groups,
+        );
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            araseo::gpui_navigation::init(cx);
+        });
+        let (handle, workbench) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut workbench = Workbench::new(
+                        Workspace::prepare("Ubuntu", root.clone()).unwrap(),
+                        Some(saved),
+                        None,
+                        window,
+                        cx,
+                    );
+                    workbench.disable_session_persistence_for_test();
+                    workbench
+                })
+            })
+            .unwrap()
+        });
+        cx.wait_for(handle, std::time::Duration::from_secs(3), |_, cx| {
+            workbench.read(cx).session_restore_complete()
+                && workbench.read(cx).focused_tab() == Some(10)
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            let panel = workbench.read(cx).panel_for_test(10).unwrap();
+            let Content::File { editor, .. } = &panel.read(cx).content else {
+                panic!()
+            };
+            let editor = editor.clone();
+            assert!(
+                editor.read(cx).lsp().definition_provider.is_some(),
+                "production LSP provider must be connected"
+            );
+            editor.update(cx, |editor, cx| {
+                editor.set_cursor_position(
+                    gpui_kit::component::input::Position::new(0, 6),
+                    window,
+                    cx,
+                )
+            });
+            workbench.update(cx, |workbench, cx| {
+                workbench.navigate_for_test(
+                    Location {
+                        path: second.clone(),
+                        range: Range {
+                            start: Position {
+                                line: 1,
+                                character: 3,
+                            },
+                            end: Position {
+                                line: 1,
+                                character: 9,
+                            },
+                        },
+                    },
+                    window,
+                    cx,
+                )
+            });
+            assert_eq!(workbench.read(cx).focused_tab(), Some(20));
+            let target = workbench.read(cx).panel_for_test(20).unwrap();
+            assert_eq!(
+                target.read(cx).visit(cx).unwrap().location.range.start,
+                Position {
+                    line: 1,
+                    character: 3
+                }
+            );
+            window.render_frame(cx);
+            window.press("alt-left", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |_, cx| {
+            workbench.read(cx).focused_tab() == Some(10)
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            let panel = workbench.read(cx).panel_for_test(10).unwrap();
+            assert_eq!(
+                panel.read(cx).visit(cx).unwrap().location.range.start,
+                Position {
+                    line: 0,
+                    character: 6
+                }
+            );
+            window.press("alt-right", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, std::time::Duration::from_secs(2), |_, cx| {
+            workbench.read(cx).focused_tab() == Some(20)
+        })
+        .await;
+        cx.update_window(handle, |_, window, cx| {
+            window.click("project-functions", cx);
+            window.render_frame(cx);
+            window.click("nav-query", cx);
+            window.input("navigation_test", cx);
+            assert_eq!(
+                workbench.read(cx).navigation_query_for_test(cx).as_deref(),
+                Some("navigation_test"),
+                "search input must retain focus above the editors"
+            );
+            // Results remain docked after opening a file and survive Files/Git switching.
+            let nav = workbench.read(cx).navigator_for_test().unwrap();
+            nav.update(cx, |nav, _| {
+                nav.set_results_for_test(vec![araseo::code_navigation::Row {
+                    name: "docked_target".into(),
+                    snippet: None,
+                    detail: String::new(),
+                    location: Location {
+                        path: first.clone(),
+                        range: Range::default(),
+                    },
+                    item: None,
+                    depth: 0,
+                }])
+            });
+            window.render_frame(cx);
+            window.click(("nav-result", 0usize), cx);
+            assert_eq!(
+                workbench.read(cx).navigator_for_test().unwrap().entity_id(),
+                nav.entity_id()
+            );
+            window.render_frame(cx);
+            window.click("files-view", cx);
+            window.render_frame(cx);
+            window.click("navigation-view", cx);
+            window.render_frame(cx);
+            assert_eq!(nav.read(cx).visible_results_for_test(), vec![0]);
+            window.click("nav-close", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(workbench.read(cx).navigator_for_test().is_none()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn function_picker_keyboard_opens_the_selected_result(cx: &mut TestAppContext) {
+        use araseo::{
+            code_navigation::{Language, Location, Position, Query, Range, Row, Service},
+            gpui_navigation::{NavigationEvent, Navigator, Seed},
+            workspace::Workspace,
+        };
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        for query in [
+            Query::Symbols(String::new()),
+            Query::References(
+                Position::default(),
+                "/nonexistent-test-project/file.rs".into(),
+            ),
+            Query::Definition(
+                Position::default(),
+                "/nonexistent-test-project/file.rs".into(),
+            ),
+            Query::Callers(
+                Position::default(),
+                "/nonexistent-test-project/file.rs".into(),
+            ),
+        ] {
+            let selected = Rc::new(RefCell::new(None));
+            let (handle, _subscription) = cx.update(|cx| {
+                let (handle, nav) =
+                    gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                        cx.new(|cx| {
+                            let mut nav = Navigator::new(
+                                Seed {
+                                    workspace: Workspace::prepare(
+                                        "Ubuntu",
+                                        "/nonexistent-test-project".into(),
+                                    )
+                                    .unwrap(),
+                                    path: "/nonexistent-test-project".into(),
+                                    directory: true,
+                                },
+                                vec![],
+                                Language::Rust,
+                                query.clone(),
+                                vec![],
+                                Service::default(),
+                                window,
+                                cx,
+                            );
+                            nav.set_results_for_test(
+                                (0..3)
+                                    .map(|line| Row {
+                                        snippet: None,
+                                        name: format!("function_{line}"),
+                                        detail: String::new(),
+                                        location: Location {
+                                            path: "/nonexistent-test-project/file.rs".into(),
+                                            range: Range {
+                                                start: Position { line, character: 0 },
+                                                end: Position { line, character: 3 },
+                                            },
+                                        },
+                                        item: None,
+                                        depth: 0,
+                                    })
+                                    .collect(),
+                            );
+                            nav
+                        })
+                    })
+                    .unwrap();
+                let selected = selected.clone();
+                let subscription = cx.subscribe(&nav, move |_, event: &NavigationEvent, _| {
+                    if let NavigationEvent::Jump(location) = event {
+                        *selected.borrow_mut() = Some(location.clone());
+                    }
+                });
+                // Collapse/reopen file groups uses the real visibility mapping.
+                nav.update(cx, |nav, cx| {
+                    assert_eq!(nav.visible_results_for_test(), vec![0, 1, 2]);
+                    nav.toggle_file_for_test("/nonexistent-test-project/file.rs".into(), cx);
+                    assert!(nav.visible_results_for_test().is_empty());
+                    nav.toggle_file_for_test("/nonexistent-test-project/file.rs".into(), cx);
+                    assert_eq!(nav.visible_results_for_test(), vec![0, 1, 2]);
+                });
+                (handle, subscription)
+            });
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.press("down", cx);
+                window.press("enter", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(selected.borrow().as_ref().unwrap().range.start.line, 1);
+            cx.update_window(handle, |_, window, _| window.remove_window())
+                .unwrap();
+        }
+    }
+    #[gpui_kit::test]
+    fn caller_tree_collapse_removes_only_descendants(cx: &mut TestAppContext) {
+        use araseo::{
+            code_navigation::{Language, Location, Query, Range, Row, Service},
+            gpui_navigation::{Navigator, Seed},
+            workspace::Workspace,
+        };
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let (_, nav) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    Navigator::new(
+                        Seed {
+                            workspace: Workspace::prepare("test", "/nonexistent-tree".into())
+                                .unwrap(),
+                            path: "/nonexistent-tree".into(),
+                            directory: true,
+                        },
+                        vec![],
+                        Language::Rust,
+                        Query::Symbols(String::new()),
+                        vec![],
+                        Service::default(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+            nav.update(cx, |nav, cx| {
+                nav.set_results_for_test(
+                    [0, 1, 2, 1]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, depth)| Row {
+                            name: format!("node{i}"),
+                            detail: String::new(),
+                            snippet: None,
+                            location: Location {
+                                path: "/nonexistent-tree/file.rs".into(),
+                                range: Range::default(),
+                            },
+                            item: Some(Default::default()),
+                            depth,
+                        })
+                        .collect(),
+                );
+                assert_eq!(nav.visible_results_for_test(), vec![0, 1, 2, 3]);
+                nav.collapse_for_test(1, cx);
+                assert_eq!(nav.visible_results_for_test(), vec![0, 1, 2]);
+                nav.collapse_for_test(0, cx);
+                assert_eq!(nav.visible_results_for_test(), vec![0]);
+            });
+        });
+    }
+    #[gpui_kit::test]
+    fn f12_reaches_the_editor_definition_provider_and_host_open_hook(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::{DefinitionProvider, Rope};
+        use gpui_kit::{App, Task, Window};
+        use std::{cell::Cell, rc::Rc};
+        struct Provider;
+        impl DefinitionProvider for Provider {
+            fn definitions(
+                &self,
+                _: &Rope,
+                _: usize,
+                _: &mut Window,
+                _: &mut App,
+            ) -> Task<anyhow::Result<Vec<lsp_types::LocationLink>>> {
+                Task::ready(Ok(vec![lsp_types::LocationLink {
+                    origin_selection_range: None,
+                    target_uri: "file:///project/target.py".parse().unwrap(),
+                    target_range: Default::default(),
+                    target_selection_range: Default::default(),
+                }]))
+            }
+        }
+        let (handle, panel, path) = panel(cx);
+        let opened = Rc::new(Cell::new(false));
+        cx.update(araseo::gpui_navigation::init);
+        cx.update_window(handle, |_, window, cx| {
+            let Content::File { editor, .. } = &panel.read(cx).content else {
+                panic!()
+            };
+            let editor = editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor.lsp_mut().definition_provider = Some(Rc::new(Provider));
+                let opened = opened.clone();
+                editor.lsp_mut().show_document = Some(Rc::new(move |params, _, _| {
+                    assert_eq!(params.uri.as_str(), "file:///project/target.py");
+                    opened.set(true);
+                    true
+                }));
+                editor.refresh(cx);
+                editor.focus(window, cx);
+            });
+            window.render_frame(cx);
+            window.press("f12", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            opened.get(),
+            "F12 must invoke the semantic provider and host navigation hook"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

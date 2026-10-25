@@ -16,6 +16,13 @@ pub fn init(cx: &mut App) {
         // These are input-editing commands in agent TUIs (delete word / stash).
         KeyBinding::new("ctrl-w", NoAction, Some("Terminal")),
         KeyBinding::new("ctrl-s", NoAction, Some("Terminal")),
+        // Code-navigation actions belong to editors; agent TUIs keep these keys.
+        KeyBinding::new("ctrl-t", NoAction, Some("Terminal")),
+        KeyBinding::new("alt-left", NoAction, Some("Terminal")),
+        KeyBinding::new("alt-right", NoAction, Some("Terminal")),
+        KeyBinding::new("shift-f12", NoAction, Some("Terminal")),
+        KeyBinding::new("alt-f12", NoAction, Some("Terminal")),
+        KeyBinding::new("alt-shift-h", NoAction, Some("Terminal")),
     ]);
 }
 

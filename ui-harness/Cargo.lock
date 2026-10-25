@@ -211,6 +211,7 @@ dependencies = [
  "gpui-kit",
  "hayro",
  "image",
+ "lsp-types",
  "portable-pty",
  "pulldown-cmark",
  "resvg 0.47.0",
@@ -225,8 +226,10 @@ dependencies = [
 name = "araseo-ui-harness"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "araseo",
  "gpui-kit",
+ "lsp-types",
 ]
 
 [[package]]
