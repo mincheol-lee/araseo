@@ -211,6 +211,7 @@ dependencies = [
  "gpui-kit",
  "hayro",
  "image",
+ "lsp-types",
  "portable-pty",
  "pulldown-cmark",
  "resvg 0.47.0",

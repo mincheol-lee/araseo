@@ -92,11 +92,21 @@ and taskbar icon.
   Use **Open Terminal Here** in a folder's context menu to start in that folder.
   Araseo remembers added folders for each starting workspace and WSL
   distribution, then restores accessible folders the next time it opens.
+- Search functions within a project with **Functions** / `Ctrl+T`. Use `F12`
+  or Ctrl+click for definitions, `Shift+F12` for references, and `Shift+Alt+H`
+  for callers. Follow caller chains and return with `Alt+Left` / `Alt+Right`.
+  These shortcuts keep reaching agent TUIs when a terminal is focused.
+  Language servers run locally in WSL and require a one-time user installation;
+  see [code navigation setup and shortcuts](docs/CODE-NAVIGATION.md).
+- Code navigation stays in the left sidebar: file-grouped references with source
+  previews and expandable incoming call hierarchies open locations in the editor
+  without dismissing results.
 - Press `Ctrl+S` to save, `Ctrl+F` to find in the active file, and `Ctrl+Z`
   or `Ctrl+Y` to undo or redo. `Ctrl+Tab` and `Ctrl+Shift+Tab` cycle tabs.
-- Select **GIT** in the sidebar to browse changed and untracked files. Click
-  a project heading to collapse or expand its changes, or a file to open its
-  diff. The **HEAD** and **Working Tree** sides reflow to the current window or
+- Select **GIT** in the sidebar to browse changed and untracked files. Projects
+  start collapsed. Click a project heading to expand or collapse its changes,
+  or a file to open its diff. The **HEAD** and **Working Tree** sides reflow to
+  the current window or
   split-pane width; copying text preserves the original unwrapped source.
 - Drag a tab to a pane edge to split the workspace, or to the center of a pane
   to move it there. Drag a divider to resize the panes. Use the top-right **+**
@@ -128,8 +138,8 @@ and taskbar icon.
 
 The editor accepts UTF-8 text files up to 2 MiB and preserves LF or CRLF line
 endings. Binary files and files with invalid UTF-8 cannot be edited. Araseo
-opens one workspace per window; language-server features and extensions are
-outside its current scope.
+opens one workspace per window with optional local language servers for code
+navigation. An extension marketplace is outside its current scope.
 
 ## Development
 

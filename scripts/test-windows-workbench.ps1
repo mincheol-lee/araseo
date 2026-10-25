@@ -2,7 +2,7 @@ param(
  [Parameter(Mandatory=$true)][string]$Executable,
  [Parameter(Mandatory=$true)][string]$OutputDirectory,
  [string]$Distro='Ubuntu',
- [ValidateSet('All','Terminal','TerminalInput','Resize','Git','Agent')][string]$Mode='All'
+ [ValidateSet('All','Terminal','TerminalInput','Resize','Git','Agent','Navigation')][string]$Mode='All'
 )
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Drawing
@@ -51,6 +51,16 @@ if($Mode -eq 'TerminalInput'){
  $fixture=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../ui-harness/fixtures/terminal-input.py'))
  $encodedFixture=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($fixture))
  Invoke-PrivatePython "import base64,pathlib,sys; (pathlib.Path(sys.argv[1])/'terminal-input.py').write_bytes(base64.b64decode('$encodedFixture'))" $workspace
+}
+if($Mode -eq 'Navigation'){
+ $navigationFixture=@'
+import pathlib,sys
+root=pathlib.Path(sys.argv[1])
+(root/'pyrightconfig.json').write_text('{"include":["."]}')
+(root/'helpers.py').write_text('def fixture_target():\n    return 42\n')
+(root/'main.py').write_text('from helpers import fixture_target\n\ndef caller():\n    return fixture_target()\n')
+'@
+ Invoke-PrivatePython $navigationFixture $workspace
 }
 if($Mode -eq 'Agent'){
  $agentFixture=@'
@@ -128,7 +138,7 @@ function Invoke-Button([string]$name){$root=[Windows.Automation.AutomationElemen
 function Find-Named([string]$name){
  $root=[Windows.Automation.AutomationElement]::FromHandle($handle)
  $elements=$root.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition)
- foreach($element in $elements){if($element.Current.Name.Replace('\','/') -eq $name.Replace('\','/')){return $element}}
+ foreach($element in $elements){if(([string]$element.Current.Name).Replace('\','/') -eq $name.Replace('\','/')){return $element}}
  return $null
 }
 function Wait-Named([string]$name){
@@ -207,7 +217,7 @@ try {
    Start-Sleep -Milliseconds 300
    Assert-Foreground
    [WorkbenchInput]::Text('/per');[WorkbenchInput]::Tab($false);[WorkbenchInput]::Text('mission');[WorkbenchInput]::Tab($true)
-   foreach($chord in @(@(37,1),@(39,4),@(37,2),@(37,5),@(35,7),@(13,1),@(8,4),@(46,4),@(116,1),@(82,5),@(87,4),@(83,4))){
+   foreach($chord in @(@(37,1),@(39,4),@(37,2),@(37,5),@(35,7),@(13,1),@(8,4),@(46,4),@(116,1),@(82,5),@(87,4),@(83,4),@(84,4),@(39,2),@(123,1))){
     Assert-Foreground
     [WorkbenchInput]::Chord([uint16]$chord[0],[int]$chord[1])
    }
@@ -217,10 +227,82 @@ try {
    $deadline=(Get-Date).AddSeconds(10)
    do{Start-Sleep -Milliseconds 150;$done=Invoke-PrivatePython 'import json,pathlib,sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["done"])' $resultPath}while($done-ne 'True' -and (Get-Date)-lt $deadline)
    if($done-ne 'True'){throw "The $buffer terminal lost keyboard focus"}
-   Invoke-PrivatePython 'import json,pathlib,re,sys; d=bytes.fromhex(json.loads(pathlib.Path(sys.argv[1]).read_text())["hex"]); assert d.startswith(b"/per\tmission\x1b[Z\x1b[1;2D\x1b[1;5C\x1b[1;3D\x1b[1;6D\x1b[1;8F\x1b[13;2u\x1b[127;5u\x1b[3;5~\x1b[15;2~\x1b[114;6u\x17\x13"),d; reports=re.findall(rb"\x1b\[<(64|65);\d+;\d+M",d); assert reports and reports[0]==b"64" and reports[-1]==b"65",d; assert reports==sorted(reports),d; print("Tab, Backtab, modified keys, wheel-up and wheel-down bytes: passed")' $resultPath
+   Invoke-PrivatePython 'import json,pathlib,re,sys; d=bytes.fromhex(json.loads(pathlib.Path(sys.argv[1]).read_text())["hex"]); assert d.startswith(b"/per\tmission\x1b[Z\x1b[1;2D\x1b[1;5C\x1b[1;3D\x1b[1;6D\x1b[1;8F\x1b[13;2u\x1b[127;5u\x1b[3;5~\x1b[15;2~\x1b[114;6u\x17\x13\x14\x1b[1;3C\x1b[24;2~"),d; reports=re.findall(rb"\x1b\[<(64|65);\d+;\d+M",d); assert reports and reports[0]==b"64" and reports[-1]==b"65",d; assert reports==sorted(reports),d; print("Tab, Backtab, modified keys, wheel-up and wheel-down bytes: passed")' $resultPath
    Capture "terminal-input-$buffer.png"
    Write-Output "Native terminal completion/modifier keys and wheel direction ($buffer buffer): passed"
   }
+ }
+ if($Mode -eq 'Navigation'){
+  function Assert-ActiveFile([string]$path){
+   $deadline=(Get-Date).AddSeconds(8)
+   do{
+    Start-Sleep -Milliseconds 150
+    $session=Read-Session
+    if($session){$activeId=$session.groups.active[$session.groups.focused_group];$active=@($session.tabs|Where-Object {$_.id-eq $activeId})|Select-Object -First 1;if($active -and $active.path.Replace('\','/')-eq $path){return}}
+   }while((Get-Date)-lt $deadline)
+   throw "Navigation did not activate $path"
+  }
+  Invoke-Button 'Functions'
+  Click-Named ('Rust '+[char]0x25BE)
+  Click-Named 'Python'
+  Click-Named 'Search project functions'
+  Assert-Foreground;[WorkbenchInput]::Text('fixture_target')
+  $null=Wait-Named ('fixture_target '+[char]0xB7+' helpers.py:1')
+  Capture 'navigation-search.png'
+  Click-Named ('fixture_target '+[char]0xB7+' helpers.py:1')
+  Assert-ActiveFile "$workspace/helpers.py"
+  $null=Wait-Named 'Search project functions'
+  Invoke-Button 'Files'
+  Invoke-Button 'Code navigation'
+  $null=Wait-Named ('fixture_target '+[char]0xB7+' helpers.py:1')
+  Capture 'navigation-definition.png'
+  Click-Named ('fixture_target '+[char]0xB7+' helpers.py:1')
+  Assert-Foreground;[WorkbenchInput]::Chord(72,3)
+  $null=Wait-Named ('caller '+[char]0xB7+' main.py:4')
+  $null=Wait-Named ('fixture_target '+[char]0xB7+' helpers.py:1')
+  Invoke-Button 'Expand fixture_target'
+  if(Find-Named ('caller '+[char]0xB7+' main.py:4')){throw 'Collapsed call root still shows its children'}
+  Invoke-Button 'Expand fixture_target'
+  $null=Wait-Named ('caller '+[char]0xB7+' main.py:4')
+  Capture 'navigation-callers.png'
+  Click-Named ('caller '+[char]0xB7+' main.py:4')
+  Assert-ActiveFile "$workspace/main.py"
+  Assert-Foreground;[WorkbenchInput]::Chord(123,0)
+  Assert-ActiveFile "$workspace/helpers.py"
+  Assert-Foreground;[WorkbenchInput]::Chord(37,2)
+  Assert-ActiveFile "$workspace/main.py"
+  Assert-Foreground;[WorkbenchInput]::Chord(37,2)
+  Assert-ActiveFile "$workspace/helpers.py"
+  Assert-Foreground;[WorkbenchInput]::Chord(39,2)
+  Assert-ActiveFile "$workspace/main.py"
+  Capture 'navigation-return.png'
+  Assert-Foreground;[WorkbenchInput]::Chord(123,0)
+  Assert-ActiveFile "$workspace/helpers.py"
+  Assert-Foreground;[WorkbenchInput]::Chord(123,1)
+  $null=Wait-Named 'Open helpers.py'
+  $null=Wait-Named 'Open main.py'
+  $null=Wait-Named ('Location '+[char]0xB7+' helpers.py:1')
+  $null=Wait-Named ('Location '+[char]0xB7+' main.py:4')
+  Capture 'navigation-references.png'
+  Invoke-Button 'Toggle main.py'
+  if(Find-Named ('Location '+[char]0xB7+' main.py:4')){throw 'Collapsed reference file still shows occurrences'}
+  Invoke-Button 'Toggle main.py'
+  Click-Named ('Location '+[char]0xB7+' main.py:4')
+  Assert-ActiveFile "$workspace/main.py"
+  $null=Wait-Named 'Open helpers.py'
+  Capture 'navigation-reference-open.png'
+  Invoke-Button 'Refresh navigation'
+  $null=Wait-Named ('Location '+[char]0xB7+' main.py:4')
+  Click-Named ('Location '+[char]0xB7+' main.py:4')
+  Assert-Foreground;[WorkbenchInput]::Chord(123,2)
+  $null=Wait-Named 'Open helpers.py'
+  Click-Named ('Location '+[char]0xB7+' helpers.py:1')
+  Assert-ActiveFile "$workspace/helpers.py"
+  $null=Wait-Named 'Open helpers.py'
+  Capture 'navigation-definition-list.png'
+  $session=Read-Session
+  if(@($session.tabs).Count-ne 3){throw 'Navigation duplicated file tabs or closed the terminal'}
+  Write-Output 'Native WSL LSP project search, incoming callers, F12, history and file-tab reuse: passed'
  }
  if($Mode -eq 'Agent'){
   foreach($agent in @('claude','codex')){
@@ -258,7 +340,6 @@ try {
   Invoke-Button 'Git'
   $null=Wait-Named 'Git repository alpha';$null=Wait-Named 'Git repository beta'
   Capture 'git-repositories.png'
-  Click-Named 'Git repository alpha'
   if(Find-Named "Git change $workspace/alpha/src/long.rs"){throw 'Collapsed repository still shows its changes'}
   Click-Named 'Git repository alpha'
   Click-Named "Git change $workspace/alpha/src/long.rs"

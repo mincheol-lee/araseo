@@ -6,6 +6,8 @@
 
 #[path = "../../src/background.rs"]
 pub mod background;
+#[path = "../../src/code_navigation.rs"]
+pub mod code_navigation;
 #[path = "../../src/diagnostics_log.rs"]
 pub mod diagnostics_log;
 #[path = "../../src/document.rs"]
@@ -14,6 +16,8 @@ pub mod document;
 pub mod git;
 #[path = "../../src/git_view.rs"]
 pub mod git_view;
+#[path = "../../src/lsp_transport.rs"]
+pub mod lsp_transport;
 #[path = "../../src/markdown_preview.rs"]
 pub mod markdown_preview;
 #[path = "../../src/preview.rs"]

@@ -5,6 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
+anyhow = "1"
+lsp-types = "0.97"
 araseo = { path = "..", features = ["ui-tests"] }
 gpui-kit = { version = "=0.7.3", features = ["test-support"] }
 
