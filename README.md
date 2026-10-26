@@ -38,13 +38,10 @@ source file open in the panes below.
   fit the current pane width, wrapping long lines when the pane is resized.
 - Run independent WSL terminals in tabs. PTY and VT100 rendering support
   interactive programs, ANSI colors, Korean text, IME input, and selection.
-  Codex and Claude Code tabs display their original logos. During active work,
-  the logo rotates once per 800 ms, with animation updates capped at 10 Hz.
-  It stays still while waiting for input or approval, when the window is
-  inactive, or when reduced motion is enabled. The logo disappears when the
-  agent exits. Araseo passes session-scoped activity hooks
-  to these CLIs without changing their saved configuration. Codex may ask you
-  to trust the hooks through `/hooks` before its activity can be shown.
+  Codex and Claude Code tabs display static logos while their processes are
+  detected on the terminal. The logo disappears when the agent exits. Detection
+  uses process information without injecting hooks, activity tracking, or saved
+  configuration changes into either CLI.
 - Arrange file, diff, and terminal tabs in repeatable horizontal or vertical
   splits, with a separate tab bar and resizable dividers in each pane.
 - Open read-only WSL diagnostics from the status bar, including disk, memory,
@@ -214,10 +211,10 @@ headless regression tests; physical IME composition must additionally be
 checked on the affected Windows keyboard/IME combinations.
 
 Use `-Mode Git` to check project groups, collapse/expand, and diff reflow after
-resizing. Use `-Mode Agent` to check Claude/Codex tab logos, rotation during
-work, stopping while waiting, and removal after exit. The agent fixture uses
-terminal-local process names and activity files without contacting either
-agent service. Each mode also checks that the native window has its app icon.
+resizing. Use `-Mode Agent` to check static Claude/Codex tab logos and removal
+after exit. The agent fixture uses terminal-local process names without
+contacting either agent service. Each mode also checks that the native window
+has its app icon.
 
 Use `-Mode TerminalInput` to check native Tab/Shift+Tab, modified navigation,
 editing and function keys, Ctrl+W/Ctrl+S, and wheel direction in both normal and
@@ -248,8 +245,8 @@ The app uses Rust for workspace, document, Git, and terminal logic and GPUI
 Kit for its native UI. Windows rendering uses GPUI's DirectX backend. Each
 terminal has one custom painted surface, a persistent native IME handler, and
 cached runs for unchanged rows. PTY parsing and protocol replies remain on
-workers. Docked content uses GPUI view caching, and the agent logo has a separate
-view with capped animation updates so rotation can reuse cached terminal content.
+workers. Docked content uses GPUI view caching, and the static agent logo has a
+separate view that updates only when the detected process kind changes.
 See [docs/GPUI-PORT.md](docs/GPUI-PORT.md) for the migration and validation notes.
 
 Font settings are saved in `%LOCALAPPDATA%/araseo/fonts.conf` on Windows or

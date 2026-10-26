@@ -12,6 +12,7 @@ use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -22,30 +23,22 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(windows)]
 static NEXT_TERMINAL_ID: AtomicU32 = AtomicU32::new(1);
 
-// These hooks are scoped to CLIs started inside an Araseo terminal. Each writes
-// only to that terminal's private status file; no user configuration is edited.
-// Our encoder emits legacy UTF-8/VT keys, not CSI-u event types. Keep Codex
-// on that protocol rather than relying on inherited terminal detection.
-const CODEX_HOOKS: &str = r#"hooks={UserPromptSubmit=[{hooks=[{type="command",command="printf codex:running > $ARASEO_AGENT_STATE_FILE"}]}],PermissionRequest=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}],PostToolUse=[{hooks=[{type="command",command="printf codex:running > $ARASEO_AGENT_STATE_FILE"}]}],Stop=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}],Interrupt=[{hooks=[{type="command",command="printf codex:waiting > $ARASEO_AGENT_STATE_FILE"}]}]}"#;
-const CLAUDE_SETTINGS: &str = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"printf claude:running > $ARASEO_AGENT_STATE_FILE"}]}],"PermissionRequest":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"printf claude:running > $ARASEO_AGENT_STATE_FILE"}]}],"Stop":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"StopFailure":[{"hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}],"Notification":[{"matcher":"permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input","hooks":[{"type":"command","command":"printf claude:waiting > $ARASEO_AGENT_STATE_FILE"}]}]}}"#;
-
+#[cfg(any(windows, test))]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn agent_shell_command(status_path: &str) -> String {
-    format!(
-        "export ARASEO_AGENT_STATE_FILE={}; export ARASEO_CODEX_HOOKS={}; export ARASEO_CLAUDE_SETTINGS={}; \
-         : > \"$ARASEO_AGENT_STATE_FILE\"; \
-         codex() {{ printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT=\"${{CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT:-1}}\" command codex -c \"$ARASEO_CODEX_HOOKS\" \"$@\"; araseo_result=$?; printf codex:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
-         claude() {{ printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; CLAUDE_CODE_NATIVE_CURSOR=\"${{CLAUDE_CODE_NATIVE_CURSOR:-1}}\" command claude --settings \"$ARASEO_CLAUDE_SETTINGS\" \"$@\"; araseo_result=$?; printf claude:waiting > \"$ARASEO_AGENT_STATE_FILE\"; return \"$araseo_result\"; }}; \
-         export -f codex claude; exec /bin/bash --login -i",
-        shell_quote(status_path),
-        shell_quote(CODEX_HOOKS),
-        shell_quote(CLAUDE_SETTINGS)
-    )
+// One process-only record per TTY path, including inaccessible terminals.
+#[cfg(any(windows, test))]
+const AGENT_PROCESS_PROBE: &str = "for tty_path_file do tty=$(cat \"$tty_path_file\" 2>/dev/null); ps -t \"$tty\" -o comm=,args= 2>/dev/null; printf '\\036'; done";
+
+// Keep CLI-specific keyboard/IME compatibility without adding configuration or
+// hook arguments, writing activity files, or changing saved user settings.
+fn terminal_shell_command() -> &'static str {
+    r#"codex() { CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT="${CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT:-1}" command codex "$@"; }; claude() { CLAUDE_CODE_NATIVE_CURSOR="${CLAUDE_CODE_NATIVE_CURSOR:-1}" command claude "$@"; }; export -f codex claude; exec /bin/bash --login -i"#
 }
 
 // Deliver the first change immediately; cap subsequent requests to roughly
@@ -321,16 +314,9 @@ pub enum AgentKind {
     Claude,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AgentStatus {
-    pub kind: AgentKind,
-    pub running: bool,
-}
-
 #[derive(Clone)]
 pub struct AgentProbe {
     tty: String,
-    status_path: String,
     #[cfg(windows)]
     distro: String,
 }
@@ -338,7 +324,7 @@ pub struct AgentProbe {
 impl AgentProbe {
     pub fn detect_many(
         probes: &[(crate::tabs::TabId, Self)],
-    ) -> Vec<(crate::tabs::TabId, Option<AgentStatus>)> {
+    ) -> Vec<(crate::tabs::TabId, Option<AgentKind>)> {
         #[cfg(not(windows))]
         {
             probes
@@ -353,10 +339,17 @@ impl AgentProbe {
             }
             let mut command = Command::new(r"C:\Windows\System32\wsl.exe");
             command.creation_flags(CREATE_NO_WINDOW);
-            command.args(["-d", &probes[0].1.distro, "--exec", "/bin/sh", "-c",
-                "while [ \"$#\" -ge 2 ]; do tty=$(cat \"$1\" 2>/dev/null); ps -t \"$tty\" -o comm=,args= 2>/dev/null; printf '\\034'; cat \"$2\" 2>/dev/null; printf '\\036'; shift 2; done", "araseo-agent-batch"]);
+            command.args([
+                "-d",
+                &probes[0].1.distro,
+                "--exec",
+                "/bin/sh",
+                "-c",
+                AGENT_PROCESS_PROBE,
+                "araseo-agent-batch",
+            ]);
             for (_, probe) in probes {
-                command.arg(&probe.tty).arg(&probe.status_path);
+                command.arg(&probe.tty);
             }
             let output =
                 crate::process_job::output(&mut command, std::time::Duration::from_secs(3));
@@ -368,10 +361,7 @@ impl AgentProbe {
             probes
                 .iter()
                 .map(|(id, _)| {
-                    let status = records
-                        .next()
-                        .and_then(|record| record.split_once('\x1c'))
-                        .and_then(|(processes, activity)| agent_status(processes, activity));
+                    let status = records.next().and_then(detect_agent);
                     (*id, status)
                 })
                 .collect()
@@ -379,33 +369,17 @@ impl AgentProbe {
     }
 
     #[cfg(not(windows))]
-    pub fn detect(&self) -> Option<AgentStatus> {
+    pub fn detect(&self) -> Option<AgentKind> {
         let output = crate::process_job::output(
             Command::new("ps").args(["-t", &self.tty, "-o", "comm=,args="]),
             std::time::Duration::from_secs(3),
         )
         .ok()?;
-        let (processes, activity) = (
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            std::fs::read_to_string(&self.status_path).unwrap_or_default(),
-        );
         output
             .status
             .success()
-            .then(|| agent_status(&processes, &activity))?
+            .then(|| detect_agent(&String::from_utf8_lossy(&output.stdout)))?
     }
-}
-
-fn agent_status(processes: &str, activity: &str) -> Option<AgentStatus> {
-    let kind = detect_agent(processes)?;
-    let active_marker = match kind {
-        AgentKind::Codex => "codex:running",
-        AgentKind::Claude => "claude:running",
-    };
-    Some(AgentStatus {
-        kind,
-        running: activity.trim() == active_marker,
-    })
 }
 
 fn detect_agent(processes: &str) -> Option<AgentKind> {
@@ -467,13 +441,12 @@ impl TerminalSession {
     fn spawn_windows(distro: &str, linux_root: &Path) -> Result<Self> {
         let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
         let tty_path_file = format!("/tmp/araseo-pty-{}-{terminal_id}", std::process::id());
-        let status_path = format!("/tmp/araseo-agent-{}-{terminal_id}", std::process::id());
-        let agent_shell = agent_shell_command(&status_path);
+        let shell = terminal_shell_command();
         let shell_command = format!(
             "stty rows 24 cols 80; tty > {tty_path_file}; \
              /usr/bin/env TERM=xterm-256color COLORTERM=truecolor /bin/bash -c {}; \
-             araseo_status=$?; rm -f {tty_path_file} {status_path}; exit $araseo_status",
-            shell_quote(&agent_shell)
+             araseo_status=$?; rm -f {tty_path_file}; exit $araseo_status",
+            shell_quote(shell)
         );
         let mut command = std::process::Command::new(r"C:\Windows\System32\wsl.exe");
         command.creation_flags(CREATE_NO_WINDOW);
@@ -505,7 +478,6 @@ impl TerminalSession {
         Ok(Self {
             agent_probe: AgentProbe {
                 tty: tty_path_file.clone(),
-                status_path,
                 distro: distro.to_string(),
             },
             writer,
@@ -520,8 +492,6 @@ impl TerminalSession {
 
     #[cfg(not(target_os = "windows"))]
     fn spawn_pty(linux_root: &Path) -> Result<Self> {
-        let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
-        let status_path = format!("/tmp/araseo-agent-{}-{terminal_id}", std::process::id());
         let pair = native_pty_system().openpty(PtySize {
             rows: 24,
             cols: 100,
@@ -531,7 +501,7 @@ impl TerminalSession {
 
         let mut command = CommandBuilder::new("bash");
         command.arg("-c");
-        command.arg(agent_shell_command(&status_path));
+        command.arg(terminal_shell_command());
         command.cwd(linux_root);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -557,7 +527,6 @@ impl TerminalSession {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
-                status_path,
             },
             master: pair.master,
             writer,
@@ -1080,136 +1049,151 @@ mod tests {
         assert_eq!(detect_agent("bash bash -c echo codex\n"), None);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn agent_activity_is_tied_to_the_detected_process() {
-        let codex = "codex /home/user/.cargo/bin/codex\n";
-        let claude = "claude /home/user/.local/bin/claude\n";
+    fn process_probe_keeps_terminal_records_aligned_without_activity_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("araseo-process-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let ps = directory.join("ps");
+        std::fs::write(
+            &ps,
+            r#"#!/bin/sh
+case "$2" in
+ codex-tty) printf 'codex codex\n';;
+ claude-tty) printf 'claude claude\n';;
+ *) exit 1;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(ps, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let codex = directory.join("codex tty");
+        let claude = directory.join("claude tty");
+        std::fs::write(&codex, "codex-tty").unwrap();
+        std::fs::write(&claude, "claude-tty").unwrap();
+        let output = Command::new("sh")
+            .args(["-c", AGENT_PROCESS_PROBE, "araseo-agent-batch"])
+            .arg(codex)
+            .arg(directory.join("missing tty"))
+            .arg(claude)
+            .env(
+                "PATH",
+                format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
         assert_eq!(
-            agent_status(codex, "codex:running"),
-            Some(AgentStatus {
-                kind: AgentKind::Codex,
-                running: true
-            })
+            text.split('\x1e')
+                .take(3)
+                .map(detect_agent)
+                .collect::<Vec<_>>(),
+            vec![Some(AgentKind::Codex), None, Some(AgentKind::Claude)]
         );
-        assert_eq!(
-            agent_status(codex, "codex:waiting"),
-            Some(AgentStatus {
-                kind: AgentKind::Codex,
-                running: false
-            })
-        );
-        assert_eq!(
-            agent_status(claude, "claude:running"),
-            Some(AgentStatus {
-                kind: AgentKind::Claude,
-                running: true
-            })
-        );
-        assert_eq!(
-            agent_status(claude, "codex:running"),
-            Some(AgentStatus {
-                kind: AgentKind::Claude,
-                running: false
-            })
-        );
-        assert_eq!(agent_status("bash bash\n", "codex:running"), None);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn shell_wrappers_keep_agent_commands_and_reset_activity_after_exit() {
+    fn cli_compatibility_preserves_arguments_and_exit_codes_without_injected_hooks() {
         use std::os::unix::fs::PermissionsExt;
-
         let directory =
-            std::env::temp_dir().join(format!("araseo-agent-shell-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("araseo-cli-test-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         for name in ["codex", "claude"] {
             let path = directory.join(name);
-            std::fs::write(
-                &path,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARASEO_AGENT_STATE_FILE.{name}-args\"\nprintf '%s\\n' \"${{CLAUDE_CODE_NATIVE_CURSOR-unset}}\" > \"$ARASEO_AGENT_STATE_FILE.{name}-cursor\"\nprintf '%s\\n' \"${{CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT-unset}}\" > \"$ARASEO_AGENT_STATE_FILE.{name}-keyboard\"\nprintf '{name}:running' > \"$ARASEO_AGENT_STATE_FILE\"\n"
-                ),
-            )
-            .unwrap();
+            std::fs::write(&path, format!(r#"#!/bin/sh
+printf '%s\n' "$@" > "$ARASEO_TEST_OUTPUT/{name}-args"
+printf '%s\n' "${{CLAUDE_CODE_NATIVE_CURSOR-unset}}" > "$ARASEO_TEST_OUTPUT/{name}-cursor"
+printf '%s\n' "${{CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT-unset}}" > "$ARASEO_TEST_OUTPUT/{name}-keyboard"
+printf '%s\n' "${{ARASEO_AGENT_STATE_FILE-unset}}" "${{ARASEO_CODEX_HOOKS-unset}}" "${{ARASEO_CLAUDE_SETTINGS-unset}}" > "$ARASEO_TEST_OUTPUT/{name}-injected"
+exit 17
+"#)).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let status_path = directory.join("status");
-        let script = agent_shell_command(status_path.to_str().unwrap()).replace(
-            "exec /bin/bash --login -i",
-            "codex --help; printf 'codex=%s\\n' \"$(cat \"$ARASEO_AGENT_STATE_FILE\")\"; \
-             claude --help; printf 'claude=%s\\n' \"$(cat \"$ARASEO_AGENT_STATE_FILE\")\"",
-        );
-        let output = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env_remove("CLAUDE_CODE_NATIVE_CURSOR")
-            .env_remove("CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT")
-            .env(
-                "PATH",
-                format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let script = terminal_shell_command().replace("exec /bin/bash --login -i", r#"codex --help 'two words' ''; printf 'codex=%s\n' "$?"; claude --version '한글 인수'; printf 'claude=%s\n' "$?""#);
+        let execute = |overrides: bool| {
+            let mut command = Command::new("bash");
+            command
+                .arg("-c")
+                .arg(&script)
+                .env_remove("CLAUDE_CODE_NATIVE_CURSOR")
+                .env_remove("CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT")
+                .env_remove("ARASEO_AGENT_STATE_FILE")
+                .env_remove("ARASEO_CODEX_HOOKS")
+                .env_remove("ARASEO_CLAUDE_SETTINGS")
+                .env("ARASEO_TEST_OUTPUT", &directory)
+                .env(
+                    "PATH",
+                    format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()),
+                );
+            if overrides {
+                command
+                    .env("CLAUDE_CODE_NATIVE_CURSOR", "0")
+                    .env("CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT", "0");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                "codex=17\nclaude=17\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.join("codex-args")).unwrap(),
+                "--help\ntwo words\n\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.join("claude-args")).unwrap(),
+                "--version\n한글 인수\n"
+            );
+            for name in ["codex", "claude"] {
+                assert_eq!(
+                    std::fs::read_to_string(directory.join(format!("{name}-injected"))).unwrap(),
+                    "unset\nunset\nunset\n"
+                );
+            }
+        };
+        execute(false);
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "codex=codex:waiting\nclaude=claude:waiting\n"
-        );
-        let codex_args = std::fs::read_to_string(directory.join("status.codex-args")).unwrap();
-        let claude_args = std::fs::read_to_string(directory.join("status.claude-args")).unwrap();
-        assert!(
-            codex_args.contains("UserPromptSubmit") && codex_args.contains("PermissionRequest")
-        );
-        assert!(claude_args.contains("--settings") && claude_args.contains("PostToolUse"));
-        assert_eq!(
-            std::fs::read_to_string(directory.join("status.claude-cursor"))
+            std::fs::read_to_string(directory.join("codex-keyboard"))
                 .unwrap()
                 .trim(),
             "1"
         );
         assert_eq!(
-            std::fs::read_to_string(directory.join("status.codex-cursor"))
-                .unwrap()
-                .trim(),
-            "unset"
-        );
-        assert_eq!(
-            std::fs::read_to_string(directory.join("status.codex-keyboard"))
+            std::fs::read_to_string(directory.join("claude-cursor"))
                 .unwrap()
                 .trim(),
             "1"
         );
         assert_eq!(
-            std::fs::read_to_string(directory.join("status.claude-keyboard"))
+            std::fs::read_to_string(directory.join("codex-cursor"))
                 .unwrap()
                 .trim(),
             "unset"
         );
-        let overridden = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("CLAUDE_CODE_NATIVE_CURSOR", "0")
-            .env("CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT", "0")
-            .env(
-                "PATH",
-                format!("{}:{}", directory.display(), std::env::var("PATH").unwrap()),
-            )
-            .output()
-            .unwrap();
-        assert!(overridden.status.success());
         assert_eq!(
-            std::fs::read_to_string(directory.join("status.codex-keyboard"))
+            std::fs::read_to_string(directory.join("claude-keyboard"))
+                .unwrap()
+                .trim(),
+            "unset"
+        );
+        execute(true);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("codex-keyboard"))
                 .unwrap()
                 .trim(),
             "0"
         );
         assert_eq!(
-            std::fs::read_to_string(directory.join("status.claude-cursor"))
+            std::fs::read_to_string(directory.join("claude-cursor"))
                 .unwrap()
                 .trim(),
             "0"
@@ -1219,7 +1203,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn instrumented_terminal_still_runs_interactive_shell_commands() {
+    fn terminal_still_runs_interactive_shell_commands() {
         let mut terminal = TerminalSession::spawn("", Path::new("/tmp")).unwrap();
         terminal.write(b"printf '\\x50\\x54\\x59\\x5f\\x52\\x45\\x41\\x44\\x59\\n'\n");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1233,7 +1217,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "instrumented shell did not process input"
+                "shell did not process input"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

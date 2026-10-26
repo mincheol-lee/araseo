@@ -34,7 +34,7 @@ presentation pauses.
   asynchronous save/reload, external-change protection and unsaved recovery.
 - Markdown source/preview, full-resolution raster/SVG images, image/PDF fit and
   zoom, PDF pages and text selection/copy; native side-by-side Git diff.
-- Live terminals, independent font settings, agent activity markers, terminal
+- Live terminals, independent font settings, static agent logos, terminal
   selection/copy/paste/scrolling, native IME preedit/commit and path drops.
 - Draggable/reorderable tabs, nested resizable splits, pane zoom and restored
   layout; sidebar resize, window geometry and added folders.
@@ -48,13 +48,11 @@ and original disk revisions retain the existing conflict behavior. Background
 session writes have monotonically ordered generations, so an older autosave
 cannot overwrite the close snapshot. A normal close waits for the final local
 save. Terminal restoration starts new shells; running commands do not resume.
-Agent activity uses the existing batched process probe and hook state. Claude
-and Codex terminal tabs display their bundled SVG logos. A retained icon view
-rotates working agents once per 800 ms at at most 10 redraws per second; waiting
-agents remain still. Rotation stops when the window is inactive or reduced
-motion is enabled. No repeating application timer is added: the icon schedules
-its next frame only while rendered and working, allowing cached terminal/editor
-content to be reused.
+Claude and Codex terminal tabs display their bundled static SVG logos using
+the existing batched process probe. Araseo does not inject hooks or track
+work/approval/input states. The retained icon view updates only when the detected
+agent process kind changes, without animation timers or window-activation
+subscriptions.
 
 The compact workbench removes the separate workspace-path header. The logo
 aligns with the top dock tabs, and file/folder/project creation icons sit beside
@@ -146,14 +144,9 @@ The final Windows executable passed the native 1180px -> 820px -> 1180px resize
 sequence with both source sides visible before any explicit repaint. Screenshots
 were also inspected for the grouped sidebar and narrow wrapped diff.
 
-The agent-tab follow-up verifies Claude/Codex logo selection in the production
-DockSkin, removal after exit, 10 Hz animation notifications, reuse of cached
-content, waiting-state stop, reduced motion and blur/reactivation. The native
-`test-windows-workbench.ps1 -Mode Agent` fixture uses terminal-local process
-names and the existing activity-file protocol, without contacting either agent
-service; its icon screenshots must change while working and remain identical
-while waiting.
-The final Windows fixture passed for both agent kinds: working captures had
-changing icon pixels, waiting captures were identical, and the icon disappeared
-after each terminal-local process exited. The screenshots retained the existing
-orange Claude and white Codex logos.
+The agent-tab regression checks verify static Claude/Codex logo selection in
+production DockSkin tabs, removal after process exit, and the absence of
+animation notifications. The native `test-windows-workbench.ps1 -Mode Agent`
+fixture uses terminal-local process names without contacting either agent
+service. Its icon screenshots should stay identical until the detected process
+changes or exits. This fixture no longer creates or consumes activity files.

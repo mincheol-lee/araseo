@@ -114,7 +114,7 @@ pub struct Workbench {
     action_loader: Background<Result<ActionResult, String>>,
     diagnostics_loader: Background<wsl_diagnostics::Report>,
     docker_loader: Background<Result<Vec<wsl_diagnostics::DockerUsage>, String>>,
-    agent_loader: Background<Vec<(TabId, Option<crate::terminal::AgentStatus>)>>,
+    agent_loader: Background<Vec<(TabId, Option<crate::terminal::AgentKind>)>>,
     agent_tick: u16,
     dock: Entity<DockArea>,
     _skin: Rc<DockSkin>,
