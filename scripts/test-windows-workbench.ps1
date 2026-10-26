@@ -66,19 +66,12 @@ if($Mode -eq 'Agent'){
  $agentFixture=@'
 import pathlib,sys
 root=pathlib.Path(sys.argv[1])
-(root/'control').write_text('waiting')
-(root/'agent.py').write_text('''import ctypes,os,pathlib,sys,time
+(root/'control').write_text('active')
+(root/'agent.py').write_text('''import ctypes,pathlib,sys,time
 name=sys.argv[1]
 ctypes.CDLL(None).prctl(15,name.encode(),0,0,0)
 control=pathlib.Path(__file__).with_name('control')
-status=pathlib.Path(os.environ['ARASEO_AGENT_STATE_FILE'])
-previous=None
-while True:
-    value=control.read_text().strip()
-    if value=='exit':break
-    if value!=previous:
-        status.write_text(name+':'+value)
-        previous=value
+while control.read_text().strip()!='exit':
     time.sleep(0.05)
 ''')
 '@
@@ -307,34 +300,21 @@ try {
  if($Mode -eq 'Agent'){
   foreach($agent in @('claude','codex')){
    $label=if($agent-eq 'claude'){'Claude'}else{'Codex'}
-   Invoke-PrivatePython 'import pathlib,sys; (pathlib.Path(sys.argv[1])/"control").write_text("waiting")' $workspace
+   Invoke-PrivatePython 'import pathlib,sys; (pathlib.Path(sys.argv[1])/"control").write_text("active")' $workspace
    Click-Client 500 150
    Assert-Foreground;[WorkbenchInput]::Text("HISTFILE=/dev/null; history -c; python3 $workspace/agent.py $agent");[WorkbenchInput]::Enter()
-   $null=Wait-Named "$label waiting"
-   $first=Capture-AgentIcon "$label waiting" "$agent-waiting-1.png"
+   $null=Wait-Named $label
+   $first=Capture-AgentIcon $label "$agent-static-1.png"
    Start-Sleep -Milliseconds 220
-   $second=Capture-AgentIcon "$label waiting" "$agent-waiting-2.png"
-   if($first-ne $second){throw "$label logo moves while waiting"}
-   Invoke-PrivatePython 'import pathlib,sys; (pathlib.Path(sys.argv[1])/"control").write_text("running")' $workspace
-   $null=Wait-Named "$label running"
-   $frames=@(for($index=0;$index-lt 6;$index++){
-    Capture-AgentIcon "$label running" "$agent-running-$index.png"
-    Start-Sleep -Milliseconds 90
-   })
-   if(@($frames|Select-Object -Unique).Count-lt 2){throw "$label logo does not rotate while running"}
-   Invoke-PrivatePython 'import pathlib,sys; (pathlib.Path(sys.argv[1])/"control").write_text("waiting")' $workspace
-   $null=Wait-Named "$label waiting"
-   $first=Capture-AgentIcon "$label waiting" "$agent-stopped-1.png"
-   Start-Sleep -Milliseconds 220
-   $second=Capture-AgentIcon "$label waiting" "$agent-stopped-2.png"
-   if($first-ne $second){throw "$label logo did not stop after work finished"}
+   $second=Capture-AgentIcon $label "$agent-static-2.png"
+   if($first-ne $second){throw "$label logo should stay static"}
    Invoke-PrivatePython 'import pathlib,sys; (pathlib.Path(sys.argv[1])/"control").write_text("exit")' $workspace
    $deadline=(Get-Date).AddSeconds(8)
-   do{Start-Sleep -Milliseconds 100;$remaining=Find-Named "$label waiting"}while($remaining -and (Get-Date)-lt $deadline)
+   do{Start-Sleep -Milliseconds 100;$remaining=Find-Named $label}while($remaining -and (Get-Date)-lt $deadline)
    if($remaining){throw "$label logo remains after the process exits"}
   }
   Capture 'agent-tabs.png'
-  Write-Output 'Claude/Codex tab logos, pixel-changing working rotation, static waiting and process exit: passed'
+  Write-Output 'Static Claude/Codex tab logos from process detection and removal after exit: passed'
  }
  if($Mode -eq 'Git'){
   Invoke-Button 'Git'

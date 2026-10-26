@@ -14,8 +14,8 @@ mod tests {
     use std::path::PathBuf;
 
     #[gpui_kit::test]
-    fn agent_logos_follow_status_in_the_production_dock(cx: &mut TestAppContext) {
-        use araseo::terminal::{AgentKind, AgentStatus};
+    fn agent_logos_follow_process_kind_in_the_production_dock(cx: &mut TestAppContext) {
+        use araseo::terminal::AgentKind;
         use gpui_kit::component::dock::{DockLayout, DockSkin, panel_handle};
         cx.update(gpui_kit::init);
         let (handle, panel) = cx.update(|cx| {
@@ -31,13 +31,7 @@ mod tests {
                         14.,
                         cx,
                     );
-                    panel.set_agent(
-                        Some(AgentStatus {
-                            kind: AgentKind::Claude,
-                            running: false,
-                        }),
-                        cx,
-                    );
+                    panel.set_agent(Some(AgentKind::Claude), cx);
                     panel
                 });
                 let (area, _) = DockSkin::dock_area("agent-dock", None, window, cx);
@@ -54,16 +48,9 @@ mod tests {
             .unwrap();
             (handle, panel.unwrap())
         });
-        for (kind, running, label) in [
-            (AgentKind::Claude, false, "Claude waiting"),
-            (AgentKind::Claude, true, "Claude running"),
-            (AgentKind::Codex, true, "Codex running"),
-            (AgentKind::Codex, false, "Codex waiting"),
-        ] {
+        for (kind, label) in [(AgentKind::Claude, "Claude"), (AgentKind::Codex, "Codex")] {
             cx.update_window(handle, |_, window, cx| {
-                panel.update(cx, |panel, cx| {
-                    panel.set_agent(Some(AgentStatus { kind, running }), cx)
-                });
+                panel.update(cx, |panel, cx| panel.set_agent(Some(kind), cx));
                 window.render_frame(cx);
                 let icon = window.find("agent-tab-icon");
                 assert_eq!(icon.label(), Some(label));
@@ -80,146 +67,52 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn agent_rotation_is_bounded_and_does_not_render_cached_content(cx: &mut TestAppContext) {
-        use araseo::{
-            gpui_agent_icon::AgentTabIcon,
-            terminal::{AgentKind, AgentStatus},
-        };
+    fn agent_logos_are_static_and_do_not_schedule_animation_updates(cx: &mut TestAppContext) {
+        use araseo::{gpui_agent_icon::AgentTabIcon, terminal::AgentKind};
         use gpui_kit::{prelude::*, *};
         use std::{cell::Cell, rc::Rc, time::Duration};
-        struct ContentProbe(Rc<Cell<usize>>);
-        impl Render for ContentProbe {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                self.0.set(self.0.get() + 1);
-                div().size_full().child("Terminal content")
-            }
-        }
-        struct Host {
-            icon: Entity<AgentTabIcon>,
-            content: Entity<ContentProbe>,
-        }
-        impl Render for Host {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().size_full().child(self.icon.clone()).child(
-                    self.content
-                        .clone()
-                        .cached(StyleRefinement::default().size(px(100.))),
-                )
-            }
-        }
         cx.update(gpui_kit::init);
-        let renders = Rc::new(Cell::new(0));
         let notifications = Rc::new(Cell::new(0));
         let (handle, icon, _subscription) = cx.update(|cx| {
             let icon = cx.new(AgentTabIcon::new);
-            icon.update(cx, |icon, cx| {
-                icon.set_status(
-                    Some(AgentStatus {
-                        kind: AgentKind::Claude,
-                        running: true,
-                    }),
-                    cx,
-                )
-            });
-            let subscription = cx.observe(&icon, {
-                let notifications = notifications.clone();
-                move |_, _| notifications.set(notifications.get() + 1)
-            });
-            let (handle, _) = gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+            icon.update(cx, |icon, cx| icon.set_kind(Some(AgentKind::Claude), cx));
+            let observed = notifications.clone();
+            let subscription = cx.observe(&icon, move |_, _| observed.set(observed.get() + 1));
+            let (handle, _) = gpui_kit::open_window(WindowOptions::default(), cx, |window, _| {
                 window.activate_window();
-                cx.new(|cx| Host {
-                    icon: icon.clone(),
-                    content: cx.new(|_| ContentProbe(renders.clone())),
-                })
+                icon.clone()
             })
             .unwrap();
             (handle, icon, subscription)
         });
         cx.run_until_parked();
-        let content_renders = renders.get();
         let initial = notifications.get();
-        for _ in 0..3 {
-            cx.executor().advance_clock(Duration::from_millis(105));
-            cx.run_until_parked();
-        }
-        assert_eq!(
-            notifications.get() - initial,
-            3,
-            "rotation should tick at about 10 Hz"
-        );
-        assert_eq!(
-            renders.get(),
-            content_renders,
-            "rotation must reuse cached terminal content"
-        );
-        cx.update(|cx| {
-            icon.update(cx, |icon, cx| {
-                icon.set_status(
-                    Some(AgentStatus {
-                        kind: AgentKind::Claude,
-                        running: false,
-                    }),
-                    cx,
-                )
-            })
-        });
-        cx.executor().advance_clock(Duration::from_millis(150));
-        cx.run_until_parked();
-        let stopped = notifications.get();
-        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.executor().advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
         assert_eq!(
             notifications.get(),
-            stopped,
-            "waiting must not schedule more frames"
+            initial,
+            "a static logo must not schedule animation ticks"
         );
-        cx.update(|cx| {
-            cx.set_reduce_motion(true);
-            icon.update(cx, |icon, cx| {
-                icon.set_status(
-                    Some(AgentStatus {
-                        kind: AgentKind::Codex,
-                        running: true,
-                    }),
-                    cx,
-                )
-            });
-        });
-        cx.run_until_parked();
-        let reduced = notifications.get();
-        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.update(|cx| icon.update(cx, |icon, cx| icon.set_kind(Some(AgentKind::Claude), cx)));
         cx.run_until_parked();
         assert_eq!(
             notifications.get(),
-            reduced,
-            "reduced motion must stay static"
+            initial,
+            "an unchanged process kind must not notify"
         );
-        cx.update(|cx| cx.set_reduce_motion(false));
-        cx.run_until_parked();
-        gpui_kit::VisualTestContext::from_window(handle, cx).deactivate_window();
-        cx.executor().advance_clock(Duration::from_millis(150));
-        cx.run_until_parked();
-        let inactive = notifications.get();
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        assert_eq!(
-            notifications.get(),
-            inactive,
-            "inactive windows must stop rotation"
-        );
-        cx.update_window(handle, |_, window, _| window.activate_window())
-            .unwrap();
-        cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(105));
-        cx.run_until_parked();
-        assert!(
-            notifications.get() > inactive,
-            "activation must resume working rotation"
-        );
-        cx.update_window(handle, |_, window, _| {
-            assert_eq!(window.find("agent-tab-icon").label(), Some("Codex running"))
+        cx.update_window(handle, |_, window, cx| {
+            icon.update(cx, |icon, cx| icon.set_kind(Some(AgentKind::Codex), cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("agent-tab-icon").label(), Some("Codex"));
         })
         .unwrap();
+        cx.run_until_parked();
+        let changed = notifications.get();
+        assert_eq!(changed, initial + 1);
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), changed);
     }
 
     fn file() -> PathBuf {

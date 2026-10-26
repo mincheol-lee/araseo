@@ -30,7 +30,6 @@ pub mod terminal_paint;
 #[cfg(any(windows, test))]
 pub mod terminal_resize;
 pub mod tree;
-pub mod window_activity;
 pub mod workspace;
 pub mod workspace_history;
 pub mod wsl_diagnostics;

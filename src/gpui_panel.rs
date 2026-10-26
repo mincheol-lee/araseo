@@ -9,7 +9,7 @@ use crate::{
     preview,
     session::{SavedKind, SavedTab},
     tabs::TabId,
-    terminal::{AgentStatus, TerminalSession},
+    terminal::{AgentKind, TerminalSession},
 };
 use gpui_kit::component::{
     ElementExt, Sizable,
@@ -138,7 +138,7 @@ pub struct WorkspacePanel {
     pub title: String,
     pub dirty: bool,
     pub active: bool,
-    agent: Option<AgentStatus>,
+    agent: Option<AgentKind>,
     agent_icon: Entity<AgentTabIcon>,
     focus: FocusHandle,
     pub font_size: f32,
@@ -604,13 +604,13 @@ impl WorkspacePanel {
         }
         cx.notify();
     }
-    pub fn set_agent(&mut self, status: Option<AgentStatus>, cx: &mut Context<Self>) {
+    pub fn set_agent(&mut self, status: Option<AgentKind>, cx: &mut Context<Self>) {
         if self.agent == status {
             return;
         }
         self.agent = status;
         self.agent_icon
-            .update(cx, |icon, cx| icon.set_status(status, cx));
+            .update(cx, |icon, cx| icon.set_kind(status, cx));
         cx.emit(PanelEvent::LayoutChanged);
         cx.notify();
     }

@@ -28,8 +28,6 @@ pub mod tabs;
 pub mod terminal;
 #[path = "../../src/tree.rs"]
 pub mod tree;
-#[path = "../../src/window_activity.rs"]
-pub mod window_activity;
 #[path = "../../src/workspace.rs"]
 pub mod workspace;
 #[path = "../../src/wsl_diagnostics.rs"]

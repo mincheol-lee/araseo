@@ -35,9 +35,7 @@ trust_level = "trusted"
     terminal.resize(40, 120);
     // CODEX_HOME is used only for the child application's documented isolated
     // configuration directory; the user's environment and credentials are untouched.
-    // Disable activity hooks only in this fixture: a fresh home otherwise shows
-    // the hook review modal after the composer has already rendered once.
-    terminal.write(format!("CODEX_HOME='{linux_root}/home' ARASEO_FIXTURE_API_KEY=fixture ARASEO_CODEX_HOOKS='hooks={{}}' codex --no-daemon --sandbox read-only --ask-for-approval never\r").as_bytes());
+    terminal.write(format!("CODEX_HOME='{linux_root}/home' ARASEO_FIXTURE_API_KEY=fixture codex --no-daemon --sandbox read-only --ask-for-approval never\r").as_bytes());
     (terminal, host_root)
 }
 pub fn text(terminal: &TerminalSession) -> String {
