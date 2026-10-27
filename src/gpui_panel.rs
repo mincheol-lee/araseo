@@ -18,7 +18,6 @@ use gpui_kit::component::{
     dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState},
     input::{EditorState, InputEvent},
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
-    text::{TextView, TextViewState},
 };
 use gpui_kit::{base::TestSupportExt, prelude::*, *};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -97,7 +96,7 @@ pub enum Content {
     File {
         document: Document,
         editor: Entity<EditorState>,
-        markdown: Option<Entity<TextViewState>>,
+        markdown: Option<Entity<crate::gpui_markdown::MarkdownPreview>>,
         source: bool,
     },
     Preview {
@@ -150,6 +149,8 @@ pub struct WorkspacePanel {
     subscriptions: Vec<Subscription>,
     _poll: Task<()>,
     refresh_tick: u16,
+    refresh_pending: bool,
+    io_pending: bool,
     brightness: i32,
     preview_bounds: Bounds<Pixels>,
     preview_viewport: Size<Pixels>,
@@ -224,7 +225,10 @@ impl WorkspacePanel {
                 cx.background_executor()
                     .timer(Duration::from_millis(33))
                     .await;
-                if this.update(cx, |this, cx| this.poll(cx)).is_err() {
+                if this
+                    .update_in(cx, |this, window, cx| this.poll(window, cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -251,6 +255,8 @@ impl WorkspacePanel {
             subscriptions: vec![],
             _poll: task,
             refresh_tick: 0,
+            refresh_pending: false,
+            io_pending: false,
             brightness: 120,
             preview_bounds: Bounds::default(),
             preview_viewport: Size::default(),
@@ -276,12 +282,19 @@ impl WorkspacePanel {
             Opened::File(mut document) => {
                 self.kind.restore_file(&mut document);
                 self.dirty = document.dirty;
-                let language = match self.path.extension().and_then(|s| s.to_str()).unwrap_or("") {
+                let language = match self
+                    .path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
                     "rs" => "rust",
                     "py" => "python",
                     "js" => "javascript",
                     "ts" => "typescript",
-                    "md" => "markdown",
+                    "md" | "markdown" | "mdown" => "markdown",
                     "toml" => "toml",
                     "json" => "json",
                     "sh" => "bash",
@@ -294,8 +307,9 @@ impl WorkspacePanel {
                         .soft_wrap(false)
                         .default_value(document.text.clone())
                 });
-                let markdown = (language == "markdown")
-                    .then(|| cx.new(|cx| TextViewState::markdown(&document.text, cx)));
+                let markdown = (language == "markdown").then(|| {
+                    cx.new(|cx| crate::gpui_markdown::MarkdownPreview::new(&document.text, cx))
+                });
                 self.subscriptions.push(cx.subscribe(
                     &editor,
                     |this, editor, event: &InputEvent, cx| match event {
@@ -425,30 +439,25 @@ impl WorkspacePanel {
         });
         cx.notify();
     }
-    fn poll(&mut self, cx: &mut Context<Self>) {
+    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(result) = self.loader.poll() {
-            // GPUI's async Context carries no Window. Finish at the next window
-            // update so editor and native input state initialize on the UI thread.
-            let entity = cx.entity();
-            cx.defer(move |cx| {
-                if let Some(window) = cx.windows().first().copied() {
-                    let _ = window.update(cx, |_, window, cx| {
-                        entity.update(cx, |this, cx| match result {
-                            Ok(opened) => this.finish(opened, window, cx),
-                            Err(error) => {
-                                this.content = Content::Error(error);
-                                cx.notify();
-                            }
-                        })
-                    });
+            match result {
+                Ok(opened) => self.finish(opened, window, cx),
+                Err(error) => {
+                    self.content = Content::Error(error);
+                    cx.notify();
                 }
-            });
+            }
         }
         if let Some(outcome) = self.io.poll() {
+            self.io_pending = false;
             match outcome.result {
                 Ok(saved) => {
                     if let Content::File {
-                        document, editor, ..
+                        document,
+                        editor,
+                        markdown,
+                        ..
                     } = &mut self.content
                     {
                         if document.host_path != outcome.host
@@ -462,17 +471,7 @@ impl WorkspacePanel {
                             document_io::Operation::Save(_) => document.accept_saved(&saved),
                             document_io::Operation::Reload => {
                                 document.accept_reloaded(saved);
-                                let text = document.text.clone();
-                                let editor = editor.clone();
-                                cx.defer(move |cx| {
-                                    if let Some(window) = cx.windows().first().copied() {
-                                        let _ = window.update(cx, |_, window, cx| {
-                                            editor.update(cx, |state, cx| {
-                                                state.set_value(text, window, cx)
-                                            })
-                                        });
-                                    }
-                                });
+                                sync_file_views(document, editor, markdown, window, cx);
                             }
                         }
                         self.dirty = document.dirty;
@@ -489,35 +488,35 @@ impl WorkspacePanel {
             cx.notify();
         }
         if let Some((probe, result)) = self.refresh.poll() {
+            self.refresh_pending = false;
             if let Content::File {
-                document, editor, ..
+                document,
+                editor,
+                markdown,
+                ..
             } = &mut self.content
             {
-                if probe.is_current(document) {
+                // Validation and all view changes occur in one window update.
+                // No deferred editor write can overwrite typing made meanwhile.
+                if !self.io_pending && probe.is_current(document) {
                     match result {
-                        Ok(Some(loaded)) => {
+                        Ok(Some(loaded)) if !document.dirty => {
                             document.accept_reloaded(loaded);
-                            let text = document.text.clone();
-                            let editor = editor.clone();
-                            cx.defer(move |cx| {
-                                if let Some(window) = cx.windows().first().copied() {
-                                    let _ = window.update(cx, |_, window, cx| {
-                                        editor.update(cx, |state, cx| {
-                                            state.set_value(text, window, cx)
-                                        })
-                                    });
-                                }
-                            });
+                            sync_file_views(document, editor, markdown, window, cx);
+                            self.dirty = false;
+                            self.conflict = false;
+                            cx.emit(ContentEvent::Changed);
+                            cx.notify();
                         }
-                        Err(error) => {
+                        Err(error) if !self.conflict => {
                             self.conflict = true;
                             cx.emit(ContentEvent::Message(error));
+                            cx.notify();
                         }
                         _ => {}
                     }
                 }
             }
-            cx.notify();
         }
         if let Some(result) = self.page_loader.poll() {
             match result {
@@ -546,22 +545,40 @@ impl WorkspacePanel {
             cx.notify();
         }
         self.refresh_tick = self.refresh_tick.wrapping_add(1);
-        if self.refresh_tick % 60 == 0 && self.active && !self.dirty {
-            if let Content::File { document, .. } = &self.content {
-                let probe = document_io::Probe::new(self.id, document);
-                self.refresh.request(move || probe.check());
-            }
+        // Check every open file even while a terminal or another tab is active.
+        // Inactive tabs use a slower cadence; unchanged probes never repaint.
+        let interval = if self.active { 30 } else { 90 };
+        if self.refresh_tick % interval == 0 && window.is_window_active() {
+            self.check_external_changes();
+        }
+        let refresh_error = self.refresh.take_error();
+        if refresh_error.is_some() {
+            self.refresh_pending = false;
+        }
+        let io_error = self.io.take_error();
+        if io_error.is_some() {
+            self.io_pending = false;
         }
         for error in [
             self.loader.take_error(),
-            self.io.take_error(),
-            self.refresh.take_error(),
+            io_error,
+            refresh_error,
             self.page_loader.take_error(),
         ]
         .into_iter()
         .flatten()
         {
             cx.emit(ContentEvent::Message(error));
+        }
+    }
+    pub fn check_external_changes(&mut self) {
+        if self.refresh_pending || self.io_pending {
+            return;
+        }
+        if let Content::File { document, .. } = &self.content {
+            let probe = document_io::Probe::new(self.id, document);
+            self.refresh_pending = true;
+            self.refresh.request(move || probe.check());
         }
     }
     pub fn save(&mut self, overwrite: bool, cx: &mut Context<Self>) {
@@ -573,6 +590,7 @@ impl WorkspacePanel {
             self.dirty = document.dirty;
             let document = document.save_snapshot();
             let id = self.id;
+            self.io_pending = true;
             self.io.request(move || {
                 document_io::run(id, document, document_io::Operation::Save(overwrite))
             });
@@ -582,6 +600,7 @@ impl WorkspacePanel {
         if let Content::File { document, .. } = &self.content {
             let document = document.save_snapshot();
             let id = self.id;
+            self.io_pending = true;
             self.io
                 .request(move || document_io::run(id, document, document_io::Operation::Reload));
         }
@@ -661,7 +680,33 @@ impl WorkspacePanel {
         }
     }
 }
-fn render_image(mut pixels: preview::ImagePixels) -> Arc<RenderImage> {
+/// Replace all representations together without generating an edit event.
+fn sync_file_views(
+    document: &Document,
+    editor: &Entity<EditorState>,
+    markdown: &Option<Entity<crate::gpui_markdown::MarkdownPreview>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    editor.update(cx, |state, cx| {
+        let old = state.value();
+        let selection = state.selected_range();
+        let start = crate::code_navigation::position(old.as_str(), selection.start);
+        let end = crate::code_navigation::position(old.as_str(), selection.end);
+        let scroll = state.scroll_offset();
+        state.set_value(document.text.clone(), window, cx);
+        state.set_selected_range(
+            crate::code_navigation::offset(&document.text, start)
+                ..crate::code_navigation::offset(&document.text, end),
+            cx,
+        );
+        state.set_scroll_offset(scroll, cx);
+    });
+    if let Some(markdown) = markdown {
+        markdown.update(cx, |state, cx| state.set_text(&document.text, cx));
+    }
+}
+pub(crate) fn render_image(mut pixels: preview::ImagePixels) -> Arc<RenderImage> {
     for pixel in pixels.rgba.chunks_exact_mut(4) {
         if pixels.premultiplied && pixel[3] > 0 {
             for channel in 0..3 {
@@ -700,6 +745,7 @@ impl BasePanel for WorkspacePanel {
             terminal.update(cx, |this, cx| this.set_visible(active, cx));
         }
         if active {
+            self.check_external_changes();
             self.focus_handle(cx).focus(window, cx);
             cx.emit(ContentEvent::Focused(self.id));
         }
@@ -817,7 +863,7 @@ impl Render for WorkspacePanel {
                         .size_full()
                         .overflow_y_scroll()
                         .p_4()
-                        .child(TextView::new(markdown.as_ref().unwrap()))
+                        .child(markdown.as_ref().unwrap().clone())
                         .into_any_element()
                 } else {
                     crate::gpui_editor::EditorSurface::new(editor, self.font_size, self.brightness)

@@ -36,6 +36,15 @@ source file open in the panes below.
   be collapsed. File rows show their relative folder and status. Open a
   side-by-side diff or discard a change after confirmation. Both diff columns
   fit the current pane width, wrapping long lines when the pane is resized.
+- Keep clean, open text files current when external tools (including Codex and
+  Claude Code) edit or atomically replace them. Source and Markdown preview
+  update together, including inactive tabs. Unsaved local edits are preserved;
+  conflicting external changes are reported for explicit reload or overwrite.
+- Render fenced `mermaid` diagrams in Markdown preview offline, including
+  flowcharts and sequence diagrams. No Node.js, browser, or network service is
+  required. Diagram layout and rasterization run in the background; unchanged
+  charts reuse their prepared images. Invalid or unsupported syntax shows the
+  original diagram text with an error while keeping the document readable.
 - Run independent WSL terminals in tabs. PTY and VT100 rendering support
   interactive programs, ANSI colors, Korean text, IME input, and selection.
   Codex and Claude Code tabs display static logos while their processes are
@@ -216,6 +225,10 @@ after exit. The agent fixture uses terminal-local process names without
 contacting either agent service. Each mode also checks that the native window
 has its app icon.
 
+Use `-Mode Markdown` to check offline Mermaid rendering, automatic preview
+updates after an external file replacement, and preview reflow at a narrow
+window width.
+
 Use `-Mode TerminalInput` to check native Tab/Shift+Tab, modified navigation,
 editing and function keys, Ctrl+W/Ctrl+S, and wheel direction in both normal and
 alternate screen buffers. This fixture records terminal input bytes without
@@ -282,6 +295,15 @@ record editor text or terminal output. Once the log reaches 1 MiB, the next
 launch moves it to `araseo.previous.log`. A native access violation may end the
 process without a final log entry; the last timestamp still helps narrow down
 what the app was doing.
+
+
+Mermaid previews use [mermaid-rs-renderer](https://github.com/1jehuang/mermaid-rs-renderer)
+0.3.1. Its syntax and layout are not identical to mermaid.js. To bound preview
+work and memory, each diagram is limited to 16 KiB, 256 lines, 128 graph nodes
+and 256 graph edges. A document prepares up to 32 diagrams, with at most
+8 megapixels of retained diagram images. Larger or unsupported diagrams keep
+their source and an explanatory message. The Source button always opens the
+original editable Markdown, including Mermaid fences.
 
 ## Support
 

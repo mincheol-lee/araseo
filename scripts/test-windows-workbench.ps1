@@ -2,7 +2,7 @@ param(
  [Parameter(Mandatory=$true)][string]$Executable,
  [Parameter(Mandatory=$true)][string]$OutputDirectory,
  [string]$Distro='Ubuntu',
- [ValidateSet('All','Terminal','TerminalInput','Resize','Git','Agent','Navigation')][string]$Mode='All'
+ [ValidateSet('All','Terminal','TerminalInput','Resize','Git','Agent','Navigation','Markdown')][string]$Mode='All'
 )
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Drawing
@@ -96,11 +96,15 @@ for name in ('alpha','beta'):
 '@
  Invoke-PrivatePython $gitFixture $workspace
 }
+if($Mode -eq 'Markdown'){
+ Invoke-PrivatePython 'import pathlib,sys; (pathlib.Path(sys.argv[1])/"README.md").write_text("# Mermaid preview\n\n```mermaid\nflowchart LR\nA[Start] --> B{Ready?}\nB -->|Yes| C[Done]\nB -->|No| A\n```\n",encoding="utf-8")' $workspace
+}
 $previousLocalAppData=$env:LOCALAPPDATA
 $env:LOCALAPPDATA=Join-Path $OutputDirectory 'settings'
 $process=$null
 function Start-Workbench {
- $script:process=Start-Process -FilePath ([IO.Path]::GetFullPath($Executable)) -ArgumentList @('--distro',('"'+$Distro+'"'),'--root',$workspace) -RedirectStandardOutput (Join-Path $OutputDirectory 'stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'stderr.log') -PassThru
+ $extraArguments=@();if($Mode-eq 'Markdown'){$extraArguments=@('--file',"$workspace/README.md")}
+ $script:process=Start-Process -FilePath ([IO.Path]::GetFullPath($Executable)) -ArgumentList (@('--distro',('"'+$Distro+'"'),'--root',$workspace)+$extraArguments) -RedirectStandardOutput (Join-Path $OutputDirectory 'stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'stderr.log') -PassThru
  $deadline=(Get-Date).AddSeconds(20)
  do{Start-Sleep -Milliseconds 100;$process.Refresh();if($process.HasExited){throw 'Araseo exited before showing its window'}}while($process.MainWindowHandle -eq [IntPtr]::Zero -and (Get-Date)-lt $deadline)
  if($process.MainWindowHandle -eq [IntPtr]::Zero){throw 'Araseo did not open a window'}
@@ -199,6 +203,32 @@ function Close-Workbench {
 }
 try {
  Start-Workbench
+ if($Mode -eq 'Markdown'){
+  $chartBounds=(Wait-Named 'Mermaid diagram').Current.BoundingRectangle
+  # Retained GPUI content can repaint before Windows UIA republishes its
+  # subtree. Compare the original diagram rectangle without forcing repaint
+  # or depending on a second accessibility snapshot.
+  function Capture-MarkdownChart([string]$name){
+   Assert-Foreground
+   $bitmap=New-Object Drawing.Bitmap ([int]$chartBounds.Width),([int]$chartBounds.Height)
+   $graphics=[Drawing.Graphics]::FromImage($bitmap)
+   $stream=New-Object IO.MemoryStream;$hash=[Security.Cryptography.SHA256]::Create()
+   try{$graphics.CopyFromScreen([int]$chartBounds.Left,[int]$chartBounds.Top,0,0,$bitmap.Size);$bitmap.Save((Join-Path $OutputDirectory $name),[Drawing.Imaging.ImageFormat]::Png);$bitmap.Save($stream,[Drawing.Imaging.ImageFormat]::Png);return [BitConverter]::ToString($hash.ComputeHash($stream.ToArray()))}finally{$hash.Dispose();$stream.Dispose();$graphics.Dispose();$bitmap.Dispose()}
+  }
+  $before=Capture-MarkdownChart 'mermaid-initial.png'
+  Capture 'markdown-initial.png'
+  Invoke-PrivatePython 'import pathlib,sys; p=pathlib.Path(sys.argv[1])/"README.md"; q=p.with_suffix(".replacement"); q.write_text("# Updated by external agent\n\n```mermaid\nflowchart TD\nX[External update] --> Y[Reloaded automatically]\nY --> Z[Complete]\n```\n",encoding="utf-8"); q.replace(p)' $workspace
+  $deadline=(Get-Date).AddSeconds(10)
+  do{Start-Sleep -Milliseconds 200;$after=Capture-MarkdownChart 'mermaid-updated.png'}while($after-eq $before -and (Get-Date)-lt $deadline)
+  if($after-eq $before){throw 'External file replacement did not update the open Mermaid preview'}
+  Capture 'markdown-updated.png'
+  [WorkbenchInput]::MoveWindow($handle,100,80,700,800,$true)|Out-Null
+  Start-Sleep -Milliseconds 500
+  Capture 'markdown-narrow.png'
+  Click-Client 340 50
+  Capture 'markdown-source-updated.png'
+  Write-Output 'Native offline Mermaid rendering, external replacement refresh, source toggle and narrow preview: passed'
+ }
  if($Mode -eq 'TerminalInput'){
   foreach($buffer in @('normal','alternate')){
    $resultPath="$workspace/input-$buffer.json"
