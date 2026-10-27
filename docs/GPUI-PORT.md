@@ -150,3 +150,32 @@ animation notifications. The native `test-windows-workbench.ps1 -Mode Agent`
 fixture uses terminal-local process names without contacting either agent
 service. Its icon screenshots should stay identical until the detected process
 changes or exits. This fixture no longer creates or consumes activity files.
+
+## External file refresh and Mermaid preview
+
+Every open text file checks its disk revision on a background worker while the
+window is active (about one second for visible tabs and three seconds for
+inactive tabs). Activating a file also requests a check. Only one probe per
+panel may be outstanding, including on a slow WSL filesystem. Unchanged files
+do not trigger UI notifications. Reload results are checked against the buffer
+version and disk revision, then applied to the document, editor, and Markdown
+preview within the same window update. Unsaved edits and deleted/unreadable
+files retain the current buffer. Reload preserves the logical selection and
+scroll offset; no deferred editor write can overwrite typing made meanwhile.
+
+Mermaid fenced blocks are prepared offline with mermaid-rs-renderer 0.3.1 and
+resvg. Source changes coalesce for 150 ms before the background job runs, and
+superseded generations cannot replace the preview. A native TextView Markdown
+extension displays the prepared images in their original block positions,
+including in block quotes/lists; other Markdown continues using GPUI Kit.
+Images fit the available preview width and preserve aspect ratio. Unchanged
+diagrams reuse prepared images, and input/image limits bound memory and layout
+work. Parse/render errors display their source and a message; diagram-provided
+image paths are not resolved. No browser, JavaScript runtime or network
+renderer is required.
+
+Regression tests cover external atomic replacement while a file tab is
+inactive, typing during a pending refresh, deleted files, source/preview
+synchronization, Mermaid diagram replacement and malformed diagram fallback.
+`test-windows-workbench.ps1 -Mode Markdown` checks native preview changes after
+external replacement and captures wide/narrow previews and the updated source.

@@ -128,7 +128,12 @@ mod tests {
         path
     }
     fn panel(cx: &mut TestAppContext) -> (gpui::AnyWindowHandle, Entity<WorkspacePanel>, PathBuf) {
-        let path = file();
+        open_file_panel(cx, file())
+    }
+    fn open_file_panel(
+        cx: &mut TestAppContext,
+        path: PathBuf,
+    ) -> (gpui::AnyWindowHandle, Entity<WorkspacePanel>, PathBuf) {
         let document = Document::open(path.clone(), path.clone()).unwrap();
         cx.update(gpui_kit::init);
         let (handle, panel) = cx.update(|cx| {
@@ -163,6 +168,194 @@ mod tests {
             .unwrap()
         });
         (handle, panel, path)
+    }
+    fn wait_for(cx: &mut TestAppContext, mut ready: impl FnMut(&mut TestAppContext) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(35));
+            cx.run_until_parked();
+            if ready(cx) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background UI operation timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    #[gpui_kit::test]
+    fn external_changes_refresh_an_inactive_file_without_closing_it(cx: &mut TestAppContext) {
+        let (handle, panel, path) = panel(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.activate_window();
+            assert!(!panel.read(cx).active);
+            let Content::File { editor, .. } = &panel.read(cx).content else {
+                panic!()
+            };
+            editor
+                .clone()
+                .update(cx, |state, cx| state.set_selected_range(2..4, cx));
+        })
+        .unwrap();
+        // Agent-style atomic replacement, rather than an in-place editor write.
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, "updated externally by agent\n").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        wait_for(cx, |cx| {
+            cx.update(|cx| {
+                let Content::File {
+                    document, editor, ..
+                } = &panel.read(cx).content
+                else {
+                    panic!()
+                };
+                document.text == "updated externally by agent\n"
+                    && editor.read(cx).value() == document.text
+            })
+        });
+        cx.update(|cx| {
+            let Content::File {
+                document, editor, ..
+            } = &panel.read(cx).content
+            else {
+                panic!()
+            };
+            assert!(!document.dirty);
+            assert!(!panel.read(cx).dirty);
+            assert_eq!(editor.read(cx).selected_range(), 2..4);
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+    #[gpui_kit::test]
+    fn external_refresh_keeps_typing_and_deleted_file_buffers(cx: &mut TestAppContext) {
+        let (handle, panel, path) = panel(cx);
+        std::fs::write(&path, "agent changes on disk\n").unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            panel.update(cx, |panel, _| panel.check_external_changes());
+            panel.focus_handle(cx).focus(window, cx);
+            window.render_frame(cx);
+            window.input("local typing", cx);
+        })
+        .unwrap();
+        for _ in 0..120 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(35));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        cx.update(|cx| {
+            let Content::File {
+                document, editor, ..
+            } = &panel.read(cx).content
+            else {
+                panic!()
+            };
+            assert!(document.text.contains("local typing"));
+            assert!(document.dirty);
+            assert_eq!(editor.read(cx).value(), document.text);
+        });
+        std::fs::remove_file(&path).unwrap();
+        cx.update(|cx| panel.update(cx, |panel, _| panel.check_external_changes()));
+        for _ in 0..20 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(35));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        cx.update(|cx| {
+            let Content::File {
+                document, editor, ..
+            } = &panel.read(cx).content
+            else {
+                panic!()
+            };
+            assert!(document.text.contains("local typing"));
+            assert_eq!(editor.read(cx).value(), document.text);
+        });
+    }
+    #[gpui_kit::test]
+    fn ordinary_markdown_renders_without_waiting_for_a_diagram_worker(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let preview = cx.new(|cx| {
+                araseo::gpui_markdown::MarkdownPreview::new(
+                    "# Plain Markdown\n\nImmediate preview",
+                    cx,
+                )
+            });
+            assert!(
+                preview
+                    .read(cx)
+                    .rendered_text(cx)
+                    .contains("Immediate preview")
+            );
+        });
+    }
+    #[gpui_kit::test]
+    fn markdown_reload_updates_source_preview_and_mermaid_after_external_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let original = file();
+        let path = original.with_extension("md");
+        std::fs::rename(original, &path).unwrap();
+        std::fs::write(
+            &path,
+            "# Before\n\n```mermaid\nflowchart LR\nA --> B\n```\n",
+        )
+        .unwrap();
+        let (handle, panel, path) = open_file_panel(cx, path);
+        wait_for(cx, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.activate_window();
+                window.render_frame(cx);
+                window.try_find("mermaid-diagram").is_some()
+            })
+            .unwrap()
+        });
+        let replacement =
+            "# After external edit\n\n```mermaid\nflowchart TD\nA[New] --> B[Chart]\n```\n";
+        std::fs::write(&path, replacement).unwrap();
+        wait_for(cx, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let Content::File {
+                    document,
+                    editor,
+                    markdown,
+                    ..
+                } = &panel.read(cx).content
+                else {
+                    panic!()
+                };
+                document.text == replacement
+                    && editor.read(cx).value() == replacement
+                    && markdown
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .rendered_text(cx)
+                        .contains("After external edit")
+                    && window.try_find("mermaid-diagram").is_some()
+            })
+            .unwrap()
+        });
+        // Invalid diagram syntax keeps the rest of the document readable and
+        // displays the original source with an error instead of a blank pane.
+        std::fs::write(
+            &path,
+            "# Still readable\n\n```mermaid\nnot a diagram\n```\n",
+        )
+        .unwrap();
+        wait_for(cx, |cx| {
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find("mermaid-error").is_some()
+            })
+            .unwrap()
+        });
+        std::fs::remove_file(path).unwrap();
     }
     #[gpui_kit::test]
     fn production_editor_handles_unicode_undo_and_redo(cx: &mut TestAppContext) {

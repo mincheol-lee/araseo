@@ -60,3 +60,6 @@ pub mod codex_fixture;
 
 #[path = "../../src/terminal_paint.rs"]
 pub mod terminal_paint;
+
+#[path = "../../src/mermaid.rs"]
+pub mod mermaid;

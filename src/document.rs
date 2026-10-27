@@ -176,7 +176,7 @@ impl Document {
         }
 
         let refreshed = Self::open(self.linux_path.clone(), self.host_path.clone())?;
-        *self = refreshed;
+        self.accept_reloaded(refreshed);
         Ok(ExternalRefresh::Reloaded)
     }
 
@@ -337,6 +337,7 @@ mod tests {
         fs::write(&path, "before").unwrap();
 
         let mut document = Document::open(PathBuf::from("/sample.txt"), path.clone()).unwrap();
+        let version = document.edit_version();
         fs::write(&path, "after external edit").unwrap();
 
         assert_eq!(
@@ -344,6 +345,7 @@ mod tests {
             ExternalRefresh::Reloaded
         );
         assert_eq!(document.text, "after external edit");
+        assert!(document.edit_version() > version);
         assert!(!document.dirty);
         assert_eq!(
             document.refresh_from_disk().unwrap(),
