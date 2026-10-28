@@ -63,3 +63,8 @@ pub mod terminal_paint;
 
 #[path = "../../src/mermaid.rs"]
 pub mod mermaid;
+
+#[path = "../../src/terminal_host.rs"]
+pub mod terminal_host;
+#[path = "../../src/terminal_lifecycle.rs"]
+pub mod terminal_lifecycle;

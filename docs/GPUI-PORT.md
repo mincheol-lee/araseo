@@ -179,3 +179,37 @@ inactive, typing during a pending refresh, deleted files, source/preview
 synchronization, Mermaid diagram replacement and malformed diagram fallback.
 `test-windows-workbench.ps1 -Mode Markdown` checks native preview changes after
 external replacement and captures wide/narrow previews and the updated source.
+
+## Windows terminal process ownership
+
+The Windows terminal host is a private mode of the same executable, handled
+before GPUI/log initialization. It pins the IDE owner with a process handle and
+creation time, waits for owner exit or a per-terminal stop event, and owns a
+kill-on-close Job Object. Only the host and its children enter that job; the
+main IDE and unrelated GUI programs do not. WSL inherits terminal stdio directly,
+so the host adds no terminal byte forwarding, polling or per-frame work.
+
+On close, the host gives its terminal-owned Linux processes SIGHUP and a two
+second grace period, followed by TERM/KILL for unresponsive descendants. pidfds
+pin Linux identities against PID reuse. A per-terminal inherited environment
+token identifies owned children even after they detach or their parent exits.
+The one-shot helper runs only for close/recovery. The WSL root additionally uses
+`setpriv --pdeathsig KILL`: if the Windows bridge or private host fails, closing
+the Linux PTY master hangs up the foreground program. No Claude/Codex hooks or
+saved agent configuration changes are involved.
+
+At the first terminal open in each distribution, recovery discovers marked
+sessions and strictly recognized pre-fix `script -qfec` sessions, then checks
+Windows owner liveness/creation time before cleanup. Legacy owners with a reused
+or inaccessible live Windows PID are kept conservatively. Processes of other
+Linux users and unrelated terminal sessions are excluded. Python 3.9+ and a
+pidfd-capable kernel enable full tree cleanup/recovery; otherwise the native
+job and PTY hangup backstop remain available.
+
+The headless harness exercises the production Python cleanup code with idle,
+detached and signal-resistant subprocesses, stale PID records and peer sessions.
+`scripts/test-windows-terminal-lifecycle.ps1` uses the production Rust modules
+through `harness/src/bin/terminal_lifecycle_probe.rs` (GUI subsystem, as in the
+application) to check normal drop latency, IDE force-kill, WSL proxy termination,
+PTY resize, private-host failure, legacy recovery and early-exit races without
+administrator rights or live agent services.

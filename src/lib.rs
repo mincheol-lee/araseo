@@ -26,8 +26,10 @@ pub mod session;
 pub mod shortcuts;
 pub mod tabs;
 pub mod terminal;
+pub mod terminal_host;
 pub mod terminal_input;
 pub mod terminal_layout;
+pub mod terminal_lifecycle;
 pub mod terminal_paint;
 #[cfg(any(windows, test))]
 pub mod terminal_resize;

@@ -281,6 +281,18 @@ for immediate termination. The snapshot refreshes after the action. No admin
 privileges are needed. This feature requires Python 3.9+ and pidfd support in
 that WSL distribution; diagnostics still work without them.
 
+Windows terminal closure sends a hangup to owned Linux commands, allows a
+short shutdown grace period, then terminates remaining owned processes. A
+private Windows lifetime host also handles an IDE crash or force-kill without
+waiting on the UI thread. Terminal I/O passes directly to WSL. No CLI hooks or administrator permissions
+are required; idle hosts wait on kernel handles instead of polling.
+
+Araseo uses Ubuntu's `script` and `setpriv` tools. Python 3.9+ with pidfd support
+(Linux 5.3+) enables precise descendant cleanup and recovery of abandoned
+sessions when opening the first terminal in a distribution. Without this
+optional facility, the PTY hangup backstop still terminates ordinary foreground
+commands. Live owners and other terminal sessions are excluded from recovery.
+
 For crash investigation, Araseo writes a small local log to
 `%LOCALAPPDATA%\araseo\logs\araseo.log` on Windows (or
 `$XDG_STATE_HOME/araseo/logs/araseo.log` on Linux, defaulting to

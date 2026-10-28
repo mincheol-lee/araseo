@@ -280,10 +280,17 @@ impl OutputSignal {
 #[derive(Default)]
 struct SpawnCleanup {
     pipe: Option<std::process::Child>,
+    #[cfg(windows)]
+    stop: Option<crate::terminal_host::StopEvent>,
     pty: Option<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 impl Drop for SpawnCleanup {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.stop.is_some() {
+            self.stop.take(); // Signal host; cleanup proceeds without a UI wait.
+            self.pipe.take();
+        }
         if let Some(child) = &mut self.pipe {
             let _ = child.kill();
             let _ = child.wait();
@@ -304,6 +311,8 @@ pub struct TerminalSession {
     requested_size: (u16, u16),
     _pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     _pipe_child: Option<std::process::Child>,
+    #[cfg(windows)]
+    stop: Option<crate::terminal_host::StopEvent>,
     #[cfg(target_os = "windows")]
     windows_resize: WindowsPtyResize,
 }
@@ -439,8 +448,15 @@ impl TerminalSession {
 
     #[cfg(target_os = "windows")]
     fn spawn_windows(distro: &str, linux_root: &Path) -> Result<Self> {
+        crate::terminal_lifecycle::recover(distro);
         let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
-        let tty_path_file = format!("/tmp/araseo-pty-{}-{terminal_id}", std::process::id());
+        let created = crate::terminal_host::current_birth()?;
+        let token = format!("{}.{created}.{terminal_id}", std::process::id());
+        let stop = crate::terminal_host::StopEvent::new(&token)?;
+        let tty_path_file = format!(
+            "/tmp/araseo-pty-{}-{terminal_id}-{created}",
+            std::process::id()
+        );
         let shell = terminal_shell_command();
         let shell_command = format!(
             "stty rows 24 cols 80; tty > {tty_path_file}; \
@@ -448,14 +464,24 @@ impl TerminalSession {
              araseo_status=$?; rm -f {tty_path_file}; exit $araseo_status",
             shell_quote(shell)
         );
-        let mut command = std::process::Command::new(r"C:\Windows\System32\wsl.exe");
-        command.creation_flags(CREATE_NO_WINDOW);
+        let mut command = stop.command(created)?;
         command
-            .args(["-d", distro, "--cd"])
+            .arg(distro)
+            .arg(&token)
+            .arg("--cd")
             .arg(linux_root)
-            .args(["--exec", "/usr/bin/script", "-qfec"])
+            .args(["--exec", "/usr/bin/env"])
+            .arg(format!("ARASEO_TERMINAL_SESSION={token}"))
+            .args([
+                "/usr/bin/setpriv",
+                "--pdeathsig",
+                "KILL",
+                "/bin/bash",
+                "-c",
+                "test \"$PPID\" -ne 1 || exit 1; exec /usr/bin/script -qfec \"$1\" /dev/null",
+                "araseo-pty",
+            ])
             .arg(shell_command)
-            .arg("/dev/null")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -463,6 +489,7 @@ impl TerminalSession {
         let mut cleanup = SpawnCleanup {
             pipe: Some(command.spawn().context("failed to start WSL shell")?),
             pty: None,
+            stop: Some(stop),
         };
         let child = cleanup.pipe.as_mut().unwrap();
         let stdout = child.stdout.take().context("WSL stdout is unavailable")?;
@@ -486,6 +513,7 @@ impl TerminalSession {
             requested_size: (24, 80),
             _pty_child: None,
             _pipe_child: cleanup.pipe.take(),
+            stop: cleanup.stop.take(),
             windows_resize,
         })
     }
@@ -805,6 +833,11 @@ fn report_mouse_scroll(screen: &mut vt100::Screen, writer: &mut impl Write, inpu
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.stop.is_some() {
+            self.stop.take();
+            self._pipe_child.take(); // Host owns cleanup/reaping; never wait on UI.
+        }
         if let Some(child) = self._pty_child.as_mut() {
             let _ = child.kill();
         }
