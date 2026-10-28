@@ -20,7 +20,7 @@ vt100 = "0.16"
 mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Kernel"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Kernel", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
 
 [patch.crates-io]
 vt100 = { path = "../vendor/vt100" }

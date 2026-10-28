@@ -4,6 +4,8 @@ use araseo::{diagnostics_log, gpui_app, workspace};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    araseo::terminal_host::run_if_requested();
     diagnostics_log::init();
     let result = (|| {
         let (distro, root, initial) = parse_args()?;
